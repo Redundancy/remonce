@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Remonse - Commands</title>
+    <link rel="stylesheet" href="/ui/bootstrap.min.css">
+    <link rel="stylesheet" href="/ui/style.css">
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg border-bottom mb-4" style="background-color: #1e1f22;">
+        <div class="container">
+            <a class="navbar-brand text-light" href="/ui/commands">Remonse @ {{hostname}}</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+                    <li class="nav-item">
+                        <a class="nav-link active" href="/ui/commands">Commands</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/ui/sign">Sign</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/ui/execute">Execute</a>
+                    </li>
+                </ul>
+                <div class="navbar-text text-secondary small">
+                    {{subject}}
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container">
+        <h2 class="mb-4">Available Commands</h2>
+        <div id="commands-list" class="row g-4">
+            <div class="col-12 text-center text-muted">Loading commands...</div>
+        </div>
+    </div>
+
+    <script src="/ui/bootstrap.bundle.min.js"></script>
+    <script src="/ui/signing.js"></script>
+    <script>
+        // Init logic for commands page
+        document.addEventListener('DOMContentLoaded', () => {
+            loadCommands();
+        });
+    </script>
+</body>
+
+</html>

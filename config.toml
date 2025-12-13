@@ -1,0 +1,31 @@
+# Configuration for the Remonse local server
+
+# The base URL of the OIDC provider (Vault)
+# This should match the 'issuer' URL from the Terraform outputs.
+issuer_url = "http://127.0.0.1:8200/v1/identity/oidc/provider/vaultprovider"
+
+# The OIDC client ID for this application.
+# This should match the 'oidc_client_id' from the Terraform outputs.
+client_id = "d9PGD527zNs9TmlyRuGGrG612mramnPp"
+
+# Explicit redirect URI to avoid cookie domain mismatch (localhost vs 127.0.0.1)
+redirect_uri = "http://localhost:8080/oidc/callback"
+
+tsa_ca_path = "./bin/DigiCertTrustedG4RSA4096SHA256TimeStampingCA.crt.pem"
+
+[[commands]]
+name = "test"
+description = "A basic test command to verify connectivity."
+opa_rule = "data.remonse.authz.decision"
+
+[[commands]]
+name = "fail"
+description = "A command designed to fail for testing error handling."
+opa_rule = "data.remonse.authz.decision"
+
+[[commands]]
+name = "ping-test"
+description = "Pings localhost 10 times to test execution streaming."
+opa_rule = "data.remonse.authz.decision"
+executable = "ping"
+args = ["-n", "10", "127.0.0.1"]
