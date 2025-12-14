@@ -25,10 +25,12 @@ When the Agent receives a request, it performs the following strict verification
     - **Nonce Binding**: The Agent calculates the SHA-256 hash of the Public Key used to sign the command and verifies that this hash matches the `nonce` claim in the ID Token.
     - **Why this is safe**: This cryptographically binds the ephemeral command signing key to the User's Identity. Even if the JWT is intercepted, it cannot be used by an attacker unless they *also* possess the corresponding private key used to sign the command.
     - **Delegation/Sharing**: This model explicitly supports *delegated execution*. An "Approver" can sign a command and share the full artifact (Command + Signature + JWT) with a "Runner" (e.g., a CI/CD job or another user). The Runner can trigger the execution on the Agent, but the Agent will log and authorize the action based on the *Approver's* identity (the one in the JWT), ensuring accountability without sharing private credentials.
-4.  **Authorization (OPA)**:
-    - If all cryptographic checks pass, the Agent queries OPA.
     - Input includes: `command` payload, `jwt` (raw), and `timestamp`.
     - OPA evaluates the policy (e.g., `data.remonse.authz.decision`) to Allow/Deny.
+5.  **Payload Constraint Verification**:
+    - **Max Validity**: Ensures the token is not older than the configured `max_validity` (default 3 days).
+    - **Target Machine**: If specified, ensures the current hostname matches the allowlist in the token.
+    - **Time Window**: Enforces `not_before` and `not_after` constraints if present.
 
 ## Threat Model
 

@@ -119,6 +119,7 @@ async fn execute_handler(
     let log_audit = |decision: &'static str,
                      reason: String,
                      user: String,
+                     signed_at: Option<String>,
                      command: Option<serde_json::Value>| {
         #[derive(Serialize)]
         struct AuditLog {
@@ -129,6 +130,8 @@ async fn execute_handler(
             #[serde(skip_serializing_if = "Option::is_none")]
             command: Option<serde_json::Value>,
             user: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            signed_at: Option<String>, // NEW
             source_ip: String,
             agent_host: String,
             decision: &'static str,
@@ -136,11 +139,6 @@ async fn execute_handler(
         }
 
         let now = time::OffsetDateTime::now_utc();
-        // Simple approximate ISO8601/RFC3339 if format description is tricky without imports
-        // But time crate needs a format description.
-        // Let's assume standard formatting is typically available or I can construct it.
-        // Or for now, rely on `timestamp_token` generation logic?
-        // Let's use `now.to_string()`? No, it might be human readable.
         // Use `time::format_description::well_known::Rfc3339`
         let timestamp = now
             .format(&time::format_description::well_known::Rfc3339)
@@ -153,6 +151,7 @@ async fn execute_handler(
             event_type: "command_execution",
             command,
             user,
+            signed_at,
             source_ip: addr.ip().to_string(),
             agent_host: state.hostname.clone(),
             decision,
@@ -183,6 +182,7 @@ async fn execute_handler(
                 "deny",
                 format!("Verification failed: {}", e),
                 "unauthenticated".into(),
+                None, // No signed_at for invalid signature
                 Some(req.command.clone()),
             );
             return Err(ErrorResponse {
@@ -196,6 +196,8 @@ async fn execute_handler(
         .timestamp
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown_time".to_string());
+    
+    let signed_at_str = Some(gen_time_str.clone());
 
     // 4. OPA Authorization
     let command_name = match req.command.get("command").and_then(|v| v.as_str()) {
@@ -205,6 +207,7 @@ async fn execute_handler(
                 "deny",
                 "Invalid command format: Missing 'command' field".into(),
                 authenticated_user,
+                signed_at_str,
                 Some(req.command.clone()),
             );
             return Err(ErrorResponse {
@@ -230,6 +233,7 @@ async fn execute_handler(
                     command_name
                 ),
                 authenticated_user,
+                signed_at_str,
                 Some(req.command.clone()),
             );
             return Err(ErrorResponse {
@@ -237,6 +241,100 @@ async fn execute_handler(
             });
         }
     };
+
+    // 4b. Verify Validity and Constraints
+    let now = time::OffsetDateTime::now_utc();
+    
+    // Check 1: Max Validity
+    let max_validity = cmd_config
+        .max_validity
+        .and_then(|d| time::Duration::try_from(d).ok())
+        .unwrap_or(time::Duration::days(3));
+
+    let age = now - authorized_user.timestamp;
+    if age > max_validity {
+        log_audit(
+            "deny",
+            format!("Command signature expired (max validity: {}, age: {})", max_validity, age),
+            authenticated_user.clone(),
+            signed_at_str.clone(),
+            Some(req.command.clone()),
+        );
+        return Err(ErrorResponse {
+            error: format!("Command Signature Expired (age: {} > max: {})", age, max_validity),
+        });
+    }
+
+    // Parse constraints from command payload
+    let target_machines = req.command.get("target_machines")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
+
+    let not_before = req.command.get("not_before")
+        .and_then(|v| v.as_str())
+        .and_then(|s| time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok());
+
+    let not_after = req.command.get("not_after")
+        .and_then(|v| v.as_str())
+        .and_then(|s| time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok());
+
+    // Check 2: Target Machine (Mandatory)
+    let targets = target_machines.ok_or_else(|| {
+        log_audit(
+            "deny",
+            "Missing mandatory 'target_machines' field".to_string(),
+            authenticated_user.clone(),
+            signed_at_str.clone(),
+            Some(req.command.clone()),
+        );
+        ErrorResponse {
+            error: "Missing Target Restriction".into(),
+        }
+    })?;
+
+    if !targets.contains(&state.hostname) {
+        log_audit(
+            "deny",
+            format!("Hostname '{}' not in target list '{:?}'", state.hostname, targets),
+            authenticated_user.clone(),
+            signed_at_str.clone(),
+            Some(req.command.clone()),
+        );
+        return Err(ErrorResponse {
+            error: format!("Target Machine Mismatch ({} not in {:?})", state.hostname, targets),
+        });
+    }
+
+    // Check 3: Time Constraints
+    if let Some(nbf) = not_before {
+        if now < nbf {
+            log_audit(
+                "deny",
+                format!("Command not yet valid (nbf: {}, now: {})", nbf, now),
+                authenticated_user.clone(),
+                signed_at_str.clone(),
+                Some(req.command.clone()),
+            );
+            return Err(ErrorResponse {
+                error: format!("Command Not Yet Valid (Starts at {})", nbf),
+            });
+        }
+    }
+
+    if let Some(exp) = not_after {
+        if now > exp {
+            log_audit(
+                "deny",
+                format!("Command expired (not_after: {}, now: {})", exp, now),
+                authenticated_user.clone(),
+                signed_at_str.clone(),
+                Some(req.command.clone()),
+            );
+            return Err(ErrorResponse {
+                error: format!("Command Expired (Expired at {})", exp),
+            });
+        }
+    }
 
     // Call OPA
     let decision = crate::opa::check_authorization(
@@ -254,6 +352,7 @@ async fn execute_handler(
             "error",
             format!("OPA evaluation failed: {}", e),
             authenticated_user.clone(),
+            signed_at_str.clone(),
             Some(req.command.clone()),
         );
         ErrorResponse {
@@ -262,12 +361,13 @@ async fn execute_handler(
     })?;
 
     if !decision.allow {
-        log_audit(
-            "deny",
-            decision.reason.clone(),
-            authenticated_user,
-            Some(req.command.clone()),
-        );
+            log_audit(
+                "deny",
+                decision.reason.clone(),
+                authenticated_user,
+                signed_at_str,
+                Some(req.command.clone()),
+            );
         // Do not leak reason to client
         return Err(ErrorResponse {
             error: "Authorization Denied".into(),
@@ -303,6 +403,7 @@ async fn execute_handler(
                 "error",
                 format!("Failed to create logs dir: {}", e),
                 authenticated_user.clone(),
+                signed_at_str.clone(),
                 Some(req.command.clone()),
             );
             ErrorResponse {
@@ -316,6 +417,7 @@ async fn execute_handler(
             "error",
             format!("Failed to create log file: {}", e),
             authenticated_user.clone(),
+            signed_at_str.clone(),
             Some(req.command.clone()),
         );
         ErrorResponse {
@@ -351,6 +453,7 @@ async fn execute_handler(
                 "error",
                 format!("Failed to spawn command: {}", e),
                 authenticated_user.clone(),
+                signed_at_str.clone(),
                 Some(req.command.clone()),
             );
             ErrorResponse {
@@ -412,6 +515,7 @@ async fn execute_handler(
         "allow",
         "Command Started".to_string(),
         authenticated_user.clone(),
+        signed_at_str,
         Some(req.command.clone()),
     );
 

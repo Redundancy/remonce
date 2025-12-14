@@ -43,6 +43,22 @@ From a usability standpoint, the system offers a **Secure UI** with a modern dar
 
 ---
 
+## Configuration
+
+The system is configured via `config.toml`. Key options include:
+
+-   `[oidc]`: Identity Provider settings.
+-   `[timestamp_authority]`: TSA URL and CA.
+-   `[[commands]]`: Whitelisted commands.
+    -   `max_validity`: Maximum duration a token is valid for (e.g., "1h", "3d"). Defaults to "3d" if not specified.
+
+### Command Constraints
+Signed tokens can embed strict constraints enforced by the Agent. These are inputs at generation time:
+-   **Target Machines**: Restrict execution to specific hostnames.
+-   **Not Before / Not After**: Absolute time windows for execution.
+
+---
+
 ## Documentation
 
 *   [**Getting Started (Dev Guide)**](DEVELOPMENT.md): Spin up the environment locally.

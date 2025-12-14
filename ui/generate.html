@@ -42,8 +42,43 @@
         <h2 class="mb-4">Generate Command Token</h2>
         <p class="text-muted">Select a command to generate a shareable or self-executable token.</p>
 
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card border-0 shadow-sm bg-dark text-light">
+                    <div class="card-body">
+                        <h5 class="card-title text-info">Step 1: Configure Token Constraints</h5>
+                        <p class="small text-muted mb-3">These settings apply to <strong>both</strong> registered and
+                            custom commands generated below.</p>
+                        <div class="row g-3">
+                            <div class="col-md-12">
+                                <label for="target-machines" class="form-label small text-secondary">Target Machines
+                                    (comma separated)</label>
+                                <input type="text"
+                                    class="form-control form-control-sm bg-dark text-light border-secondary"
+                                    id="target-machines" value="{{hostname}}" placeholder="e.g. host1, host2">
+                            </div>
+                            <div class="col-md-6">
+                                <label for="not-before" class="form-label small text-secondary">Not Before</label>
+                                <input type="datetime-local"
+                                    class="form-control form-control-sm bg-dark text-light border-secondary"
+                                    id="not-before">
+                            </div>
+                            <div class="col-md-6">
+                                <label for="not-after" class="form-label small text-secondary">Not After</label>
+                                <input type="datetime-local"
+                                    class="form-control form-control-sm bg-dark text-light border-secondary"
+                                    id="not-after">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-3 text-light">Step 2: Generate Command</h4>
         <div id="commands-list-generate" class="row g-4">
-            <div class="col-12 text-center text-muted">Loading commands...</div>
+            <!-- JavaScript will populate this, including Custom Command card -->
+            <div class="col-12 text-center text-muted">Loading available commands...</div>
         </div>
 
         <!-- Modal for Token Output -->

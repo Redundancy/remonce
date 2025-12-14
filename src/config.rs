@@ -122,6 +122,11 @@ pub struct CommandConfig {
     /// The working directory for command execution.
     /// Defaults to the agent's current working directory if not specified.
     pub cwd: Option<String>,
+
+    /// Maximum validity duration for a signed command (e.g., "3d", "1h").
+    /// Defaults to 3 days if not specified.
+    #[serde(default, with = "humantime_serde")]
+    pub max_validity: Option<std::time::Duration>,
 }
 
 impl Config {

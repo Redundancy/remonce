@@ -19,6 +19,7 @@ ca_path = "./bin/DigiCertTrustedG4RSA4096SHA256TimeStampingCA.crt.pem"
 name = "test"
 description = "A basic test command to verify connectivity."
 opa_rule = "data.remonse.authz.decision"
+max_validity = "1d" # Optional: Override default 3 day validity (e.g. 1h, 30m)
 
 [[commands]]
 name = "fail"

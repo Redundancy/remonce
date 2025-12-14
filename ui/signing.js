@@ -129,7 +129,6 @@ async function loadCommands() {
                         <h5 class="card-title text-primary">${cmd.name}</h5>
                         ${desc}
                         <div class="mt-auto pt-3 d-flex justify-content-between align-items-center">
-                             <small class="text-secondary" style="font-size: 0.75rem;">${cmd.opa_rule}</small>
                              <a href="/ui/generate" class="btn btn-sm btn-outline-primary">Go to Generate</a>
                         </div>
                     </div>
@@ -162,17 +161,52 @@ async function loadCommandsForGenerate() {
         }
 
         let html = '';
+
+        // 1. Add Custom Command Card (as the first option)
+        html += `<div class="col-md-6 col-lg-4">
+            <div class="card h-100 shadow-sm border-warning bg-dark text-light">
+                <div class="card-body d-flex flex-column">
+                    <h5 class="card-title text-warning">Custom Command</h5>
+                     <p class="card-text text-muted small">Generate a token for a defined command (args etc) that is not in the registry.</p>
+                    <div class="mt-auto pt-3">
+                         <input type="text" id="custom-command-name" 
+                            class="form-control form-control-sm bg-dark text-light border-secondary mb-2" 
+                            placeholder="e.g. backup-db">
+                        <button class="btn btn-sm btn-outline-warning w-100" onclick="generateCustomToken()">Generate Custom</button>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+
+        // 2. Add Registered Commands
         commands.forEach(cmd => {
             const desc = cmd.description ? `<p class="card-text text-muted small">${cmd.description}</p>` : '';
+            let validityStr = cmd.max_validity || '3d';
+            // Normalize "3days" to "3d" if desired, or simpler: just remove "(default)" to match explicit ones if they are similar
+            // If API returns "3days", we can maybe shorten it or leave it. 
+            // The user complaint is one says "3days" and other says "3d (default)".
+            // Let's standardise to just the value, and maybe (default) if it is missing.
+            // If cmd.max_validity is "3days", show "3days". If missing, show "3days (default)"? 
+            // Or force everything to short form?
+            // Simplest fix: If default is "3days" (from backend logic usually), we can just set default here to "3d" and drop "(default)" text.
+            // But if the backend sends "3days" for the explicit one, we might want to just show "3d" for default without text.
+
+            validityStr = validityStr.replace('days', 'd').replace('day', 'd'); // simple normalization
+            const valLabel = cmd.max_validity ? validityStr : `${validityStr} (default)`;
+
+            const validity = `<span class="badge bg-secondary mb-2" title="Max Validity">${valLabel}</span>`;
+
             // Instead of link, using a button to open modal
             // We encode the command name in data attribute
             html += `<div class="col-md-6 col-lg-4">
                 <div class="card h-100 shadow-sm border-secondary">
                     <div class="card-body d-flex flex-column">
-                        <h5 class="card-title text-primary">${cmd.name}</h5>
+                        <div class="d-flex justify-content-between align-items-start">
+                            <h5 class="card-title text-primary">${cmd.name}</h5>
+                            ${validity}
+                        </div>
                         ${desc}
                         <div class="mt-auto pt-3 d-flex justify-content-between align-items-center">
-                             <small class="text-secondary" style="font-size: 0.75rem;">${cmd.opa_rule}</small>
                              <button class="btn btn-sm btn-outline-success" onclick="generateToken('${cmd.name}')">Generate Command</button>
                         </div>
                     </div>
@@ -185,12 +219,60 @@ async function loadCommandsForGenerate() {
     }
 }
 
+// Helper to get constraints
+function getConstraints() {
+    const targets = document.getElementById('target-machines').value.trim();
+    const notBefore = document.getElementById('not-before').value;
+    const notAfter = document.getElementById('not-after').value;
+
+    const constraints = {};
+    if (targets) {
+        constraints.target_machines = targets.split(',').map(s => s.trim()).filter(s => s);
+    }
+    if (notBefore) {
+        constraints.not_before = new Date(notBefore).toISOString();
+    }
+    if (notAfter) {
+        // Ensure we include the full minute by setting seconds to 59
+        const d = new Date(notAfter);
+        d.setSeconds(59);
+        d.setMilliseconds(999);
+        constraints.not_after = d.toISOString();
+    }
+    return constraints;
+}
+
 function generateToken(commandName) {
     const executionId = crypto.randomUUID();
-    const commandPayload = { command: commandName, id: executionId };
+    const constraints = getConstraints();
 
+    const commandPayload = {
+        command: commandName,
+        id: executionId,
+        ...constraints
+    };
+
+    renderTokenModal(commandPayload);
+}
+
+function generateCustomToken() {
+    const commandName = document.getElementById('custom-command-name').value.trim();
+    if (!commandName) {
+        alert('Please enter a command name');
+        return;
+    }
+
+    if (/\s/.test(commandName)) {
+        alert('Command names cannot contain spaces. Correct format: "backup-db", not "backup db"');
+        return;
+    }
+
+    generateToken(commandName);
+}
+
+function renderTokenModal(payload) {
     // Create Command Token: Base64 encoded JSON
-    const jsonStr = JSON.stringify(commandPayload);
+    const jsonStr = JSON.stringify(payload);
     const token = btoa(jsonStr);
 
     document.getElementById('generated-token').value = token;
@@ -235,6 +317,25 @@ function handleInspectToken() {
         document.getElementById('detail-command').innerText = payload.command;
         document.getElementById('detail-id').innerText = payload.id;
 
+        // Format constraints
+        let constraintsHtml = '';
+        if (payload.target_machines && payload.target_machines.length > 0) {
+            constraintsHtml += `<div><strong>Targets:</strong> ${payload.target_machines.join(', ')}</div>`;
+        }
+        if (payload.not_before) {
+            constraintsHtml += `<div><strong>Not Before:</strong> ${new Date(payload.not_before).toLocaleString()}</div>`;
+        }
+        if (payload.not_after) {
+            constraintsHtml += `<div><strong>Not After:</strong> ${new Date(payload.not_after).toLocaleString()}</div>`;
+        }
+
+        const constraintsContainer = document.getElementById('detail-constraints');
+        if (constraintsHtml) {
+            constraintsContainer.innerHTML = constraintsHtml;
+        } else {
+            constraintsContainer.innerHTML = '<span class="text-muted">None</span>';
+        }
+
         // Store payload for signing
         window.currentPayload = payload;
 
@@ -252,7 +353,21 @@ async function handleSignToken() {
     signBtn.disabled = true;
     signBtn.innerText = 'Signing...';
 
-    const payloadString = JSON.stringify(window.currentPayload);
+    // Canonicalize JSON (sort keys) so signature matches Rust's sorted expectation
+    const canonicalize = (obj) => {
+        if (Array.isArray(obj)) {
+            return obj.map(canonicalize);
+        } else if (typeof obj === 'object' && obj !== null) {
+            const sorted = {};
+            Object.keys(obj).sort().forEach(key => {
+                sorted[key] = canonicalize(obj[key]);
+            });
+            return sorted;
+        }
+        return obj;
+    };
+
+    const payloadString = JSON.stringify(canonicalize(window.currentPayload));
 
     try {
         // 1. Sign
