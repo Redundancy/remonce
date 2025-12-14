@@ -152,8 +152,11 @@ pub async fn run() -> Result<(), AppError> {
         .route("/api/commands", get(get_commands_handler))
         .route("/ui/commands", get(commands_page_handler))
         .route("/ui/sign", get(sign_page_handler))
+        .route("/ui/generate", get(generate_page_handler))
+        .route("/ui/inspect", get(inspect_page_handler))
+        .route("/ui/monitor", get(monitor_page_handler))   // [NEW]
         .route("/ui/execute", get(execute_page_handler))
-        .route("/profile", get(commands_page_handler)) // Default to commands page
+        .route("/profile", get(generate_page_handler)) // Default to generate page
         .nest_service("/ui", ServeDir::new("ui"))
         .with_state(app_state)
         .layer(session_layer)
@@ -188,6 +191,29 @@ async fn sign_page_handler(
     session: Session,
 ) -> Result<Html<String>, AppError> {
     render_page(session, "ui/sign.html", &state.hostname).await
+}
+
+// [NEW] Generate page handler
+async fn generate_page_handler(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Html<String>, AppError> {
+    render_page(session, "ui/generate.html", &state.hostname).await
+}
+
+// [NEW] Inspect page handler
+async fn inspect_page_handler(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Html<String>, AppError> {
+    render_page(session, "ui/inspect.html", &state.hostname).await
+}
+
+async fn monitor_page_handler(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Html<String>, AppError> {
+    render_page(session, "ui/monitor.html", &state.hostname).await
 }
 
 /// Execute page handler

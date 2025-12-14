@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Remonse - Commands</title>
+    <title>Remonse - Home</title>
     <link rel="stylesheet" href="/ui/bootstrap.min.css">
     <link rel="stylesheet" href="/ui/style.css">
 </head>
@@ -19,13 +19,16 @@
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav me-auto mb-2 mb-lg-0">
                     <li class="nav-item">
-                        <a class="nav-link active" href="/ui/commands">Commands</a>
+                        <a class="nav-link" href="/ui/generate">Generate</a>
                     </li>
                     <li class="nav-item">
-                        <a class="nav-link" href="/ui/sign">Sign</a>
+                        <a class="nav-link" href="/ui/inspect">Inspect & Sign</a>
                     </li>
                     <li class="nav-item">
                         <a class="nav-link" href="/ui/execute">Execute</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/ui/monitor">Monitor</a>
                     </li>
                 </ul>
                 <div class="navbar-text text-secondary small">
@@ -36,20 +39,70 @@
     </nav>
 
     <div class="container">
-        <h2 class="mb-4">Available Commands</h2>
-        <div id="commands-list" class="row g-4">
-            <div class="col-12 text-center text-muted">Loading commands...</div>
+        <div class="text-center py-5">
+            <h1 class="display-4 fw-bold text-primary mb-3">Welcome to Remonse</h1>
+            <p class="lead text-muted mb-5">Secure, signed command execution for your infrastructure.</p>
         </div>
+
+        <div class="row g-4 justify-content-center">
+            <!-- Step 1: Generate -->
+            <div class="col-md-4">
+                <div class="card h-100 border-secondary shadow-sm">
+                    <div class="card-body text-center d-flex flex-column">
+                        <div class="display-6 text-success mb-3">1</div>
+                        <h4 class="card-title">Generate Command</h4>
+                        <p class="card-text text-muted my-3">
+                            Select a command from the allowed list and generate a unique, single-use <strong>Command
+                                Token</strong>.
+                        </p>
+                        <a href="/ui/generate" class="btn btn-outline-success stretched-link mt-auto">Go to Generate</a>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 2: Inspect & Sign -->
+            <div class="col-md-4">
+                <div class="card h-100 border-secondary shadow-sm">
+                    <div class="card-body text-center d-flex flex-column">
+                        <div class="display-6 text-warning mb-3">2</div>
+                        <h4 class="card-title">Inspect & Sign</h4>
+                        <p class="card-text text-muted my-3">
+                            Review the details of a Command Token. If approved, cryptographically sign it to create an
+                            <strong>Execution Token</strong>.
+                        </p>
+                        <a href="/ui/inspect" class="btn btn-outline-warning stretched-link mt-auto">Go to Inspect</a>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 3: Execute -->
+            <div class="col-md-4">
+                <div class="card h-100 border-secondary shadow-sm">
+                    <div class="card-body text-center d-flex flex-column">
+                        <div class="display-6 text-danger mb-3">3</div>
+                        <h4 class="card-title">Execute & Monitor</h4>
+                        <p class="card-text text-muted my-3">
+                            Submit a Signed Execution Token to run the command and monitor its output in real-time.
+                        </p>
+                        <a href="/ui/execute" class="btn btn-outline-danger stretched-link mt-auto">Go to Execute</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row mt-5">
+            <div class="col-12 text-center text-muted small">
+                <p>Remonse uses OpenID Connect for identity and OPA for authorization policy.</p>
+            </div>
+        </div>
+
+        <footer class="mt-5 mb-3 text-center text-muted small">
+            Built with love ❤️, and AI 🤖
+        </footer>
     </div>
 
     <script src="/ui/bootstrap.bundle.min.js"></script>
     <script src="/ui/signing.js"></script>
-    <script>
-        // Init logic for commands page
-        document.addEventListener('DOMContentLoaded', () => {
-            loadCommands();
-        });
-    </script>
 </body>
 
 </html>

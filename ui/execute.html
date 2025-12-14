@@ -19,13 +19,16 @@
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav me-auto mb-2 mb-lg-0">
                     <li class="nav-item">
-                        <a class="nav-link" href="/ui/commands">Commands</a>
+                        <a class="nav-link" href="/ui/generate">Generate</a>
                     </li>
                     <li class="nav-item">
-                        <a class="nav-link" href="/ui/sign">Sign</a>
+                        <a class="nav-link" href="/ui/inspect">Inspect & Sign</a>
                     </li>
                     <li class="nav-item">
                         <a class="nav-link active" href="/ui/execute">Execute</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/ui/monitor">Monitor</a>
                     </li>
                 </ul>
                 <div class="navbar-text text-secondary small">
@@ -36,63 +39,40 @@
     </nav>
 
     <div class="container">
-        <h2 class="mb-4">Execution Monitor</h2>
+        <h2 class="mb-4">Execute Command</h2>
 
-        <!-- Manual ID Input -->
-        <div class="card mb-4 shadow-sm">
-            <div class="card-body">
-                <form id="monitor-form" class="row g-3 align-items-end">
-                    <div class="col-md-9">
-                        <label for="execution-id-input" class="form-label">Execution ID</label>
-                        <input type="text" class="form-control" id="execution-id-input"
-                            placeholder="e.g. 550e8400-e29b-41d4-a716-446655440000">
+        <!-- Input Section -->
+        <div id="execution-input-area" class="row justify-content-center mb-4">
+            <div class="col-md-8 col-lg-6">
+                <div class="card shadow-sm border-danger">
+                    <div class="card-body">
+                        <p class="text-muted small">Paste a signed token from yourself or another user to execute it.
+                        </p>
+                        <div class="mb-3">
+                            <label for="signed-token-input" class="form-label">Signed Token</label>
+                            <textarea id="signed-token-input" class="form-control" rows="3"
+                                placeholder="Paste Base64 signed token here..."></textarea>
+                        </div>
+                        <button id="execute-token-btn" class="btn btn-danger w-100">
+                            Execute
+                        </button>
                     </div>
-                    <div class="col-md-3">
-                        <button type="submit" class="btn btn-primary w-100">Monitor</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-
-        <div class="card mb-3">
-            <div class="card-header d-flex justify-content-between align-items-center">
-                <span class="fw-bold">Status</span>
-                <span id="status-area" class="badge bg-secondary">Waiting...</span>
-            </div>
-            <div class="card-body p-0">
-                <div id="agent-result-area" style="display:none;">
-                    <pre id="agent-output" class="m-0"
-                        style="height: 400px; overflow-y: auto; border: none; border-radius: 0;"></pre>
                 </div>
             </div>
         </div>
 
-    </div>
+        <!-- Monitoring Section -->
+        <footer class="mt-5 mb-3 text-center text-muted small">
+            Built with love ❤️, and AI 🤖
+        </footer>
 
-    <script src="/ui/bootstrap.bundle.min.js"></script>
-    <script src="/ui/signing.js"></script>
-    <script>
-        document.addEventListener('DOMContentLoaded', () => {
-            const urlParams = new URLSearchParams(window.location.search);
-            const id = urlParams.get('id');
-
-            // Pre-fill input if ID exists
-            const input = document.getElementById('execution-id-input');
-            if (id) {
-                input.value = id;
-                startStreaming(id);
-            }
-
-            // Handle manual form submission
-            document.getElementById('monitor-form').addEventListener('submit', (e) => {
-                e.preventDefault();
-                const manualId = input.value.trim();
-                if (manualId) {
-                    window.location.href = `/ui/execute?id=${manualId}`;
-                }
+        <script src="/ui/bootstrap.bundle.min.js"></script>
+        <script src="/ui/signing.js"></script>
+        <script>
+            document.addEventListener('DOMContentLoaded', () => {
+                // Auto-execute if signed_token is present is handled in signing.js
             });
-        });
-    </script>
+        </script>
 </body>
 
 </html>
