@@ -12,8 +12,7 @@ Making it easy to execute a controlled menu of actions on a remote machine, or e
 
 ## Why Remonse?
 
-Managing remote access is hard. VPNs are brittle, SSH keys get lost or stolen, and audit logs are often scattered.
-Remonse flips the model: **Don't trust the network, trust the identity.**
+Remonse is built to be an easily configured, lightweight system that lowers the operational burden on teams while meeting their diverse needs using standard, well-documented tools. It aims to support every option that enhances security and flexibility, starting with sensible, secure defaults to encourage adoption across varied environments. We believe that if security is hard, users will drift towards insecurity, so we prioritize a friction-free path to being secure.
 
 *   **Zero Persistent Credentials**: No SSH keys or long-lived secrets on your servers.
 *   **Identity First**: Users authenticate with their corporate identity (OIDC).
@@ -37,7 +36,7 @@ Once verified, the Agent consults the **Open Policy Agent (OPA)** to determine i
 
 ## Capabilities
 
-Remonse is designed for the rigorous demands of modern operations. It ensures **Cryptographic Non-Repudiation** by leveraging RFC 3161 Timestamping Authorities, making every action legally auditable. Access control is highly flexible and **Attribute-Based**, allowing policies to be defined on any user claim, membership (e.g., `webapp-users`), or context.
+Remonse supports **Cryptographic Non-Repudiation** by leveraging RFC 3161 Timestamping Authorities to create verifiable audit trails. Access control is **Attribute-Based**, allowing policies to be defined on any user claim, membership (e.g., `webapp-users`), or context.
 
 From a usability standpoint, the system offers a **Secure UI** with a modern dark mode for ease of use, while the underlying **Real-time Monitoring** ensures operators have immediate visibility into execution results. **TLS Support** is available for securing communications, offering both file-based and (experimental) ACME automated certificate management. Built in **Rust**, the agent is a lightweight, cross-platform binary that brings performance and safety to both Linux and Windows environments.
 
