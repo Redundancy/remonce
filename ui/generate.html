@@ -1,122 +1,68 @@
-<!DOCTYPE html>
-<html lang="en" data-bs-theme="dark">
+<h2 class="mb-4">Generate Command Token</h2>
+<p class="text-muted">Select a command to generate a shareable or self-executable token.</p>
 
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Remonse - Generate Command</title>
-    <link rel="stylesheet" href="/ui/bootstrap.min.css">
-    <link rel="stylesheet" href="/ui/style.css">
-</head>
-
-<body>
-    <nav class="navbar navbar-expand-lg border-bottom mb-4" style="background-color: #1e1f22;">
-        <div class="container">
-            <a class="navbar-brand text-light" href="/ui/commands">Remonse @ {{hostname}}</a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
-                <span class="navbar-toggler-icon"></span>
-            </button>
-            <div class="collapse navbar-collapse" id="navbarNav">
-                <ul class="navbar-nav me-auto mb-2 mb-lg-0">
-                    <li class="nav-item">
-                        <a class="nav-link active" href="/ui/generate">Generate</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="/ui/inspect">Inspect & Sign</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="/ui/execute">Execute</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="/ui/monitor">Monitor</a>
-                    </li>
-                </ul>
-                <div class="navbar-text text-secondary small">
-                    {{subject}}
-                </div>
-            </div>
-        </div>
-    </nav>
-
-    <div class="container">
-        <h2 class="mb-4">Generate Command Token</h2>
-        <p class="text-muted">Select a command to generate a shareable or self-executable token.</p>
-
-        <div class="row mb-4">
-            <div class="col-12">
-                <div class="card border-0 shadow-sm bg-dark text-light">
-                    <div class="card-body">
-                        <h5 class="card-title text-info">Step 1: Configure Token Constraints</h5>
-                        <p class="small text-muted mb-3">These settings apply to <strong>both</strong> registered and
-                            custom commands generated below.</p>
-                        <div class="row g-3">
-                            <div class="col-md-12">
-                                <label for="target-machines" class="form-label small text-secondary">Target Machines
-                                    (comma separated)</label>
-                                <input type="text"
-                                    class="form-control form-control-sm bg-dark text-light border-secondary"
-                                    id="target-machines" value="{{hostname}}" placeholder="e.g. host1, host2">
-                            </div>
-                            <div class="col-md-6">
-                                <label for="not-before" class="form-label small text-secondary">Not Before</label>
-                                <input type="datetime-local"
-                                    class="form-control form-control-sm bg-dark text-light border-secondary"
-                                    id="not-before">
-                            </div>
-                            <div class="col-md-6">
-                                <label for="not-after" class="form-label small text-secondary">Not After</label>
-                                <input type="datetime-local"
-                                    class="form-control form-control-sm bg-dark text-light border-secondary"
-                                    id="not-after">
-                            </div>
-                        </div>
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card border-0 shadow-sm bg-dark text-light">
+            <div class="card-body">
+                <h5 class="card-title text-info">Step 1: Configure Token Constraints</h5>
+                <p class="small text-muted mb-3">These settings apply to <strong>both</strong> registered and
+                    custom commands generated below.</p>
+                <div class="row g-3">
+                    <div class="col-md-12">
+                        <label for="target-machines" class="form-label small text-secondary">Target Machines
+                            (comma separated)</label>
+                        <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary"
+                            id="target-machines" value="{{hostname}}" placeholder="e.g. host1, host2">
                     </div>
-                </div>
-            </div>
-        </div>
-
-        <h4 class="mb-3 text-light">Step 2: Generate Command</h4>
-        <div id="commands-list-generate" class="row g-4">
-            <!-- JavaScript will populate this, including Custom Command card -->
-            <div class="col-12 text-center text-muted">Loading available commands...</div>
-        </div>
-
-        <!-- Modal for Token Output -->
-        <div class="modal fade" id="tokenModal" tabindex="-1" aria-hidden="true">
-            <div class="modal-dialog modal-lg">
-                <div class="modal-content">
-                    <div class="modal-header">
-                        <h5 class="modal-title">Command Token Generated</h5>
-                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    <div class="col-md-6">
+                        <label for="not-before" class="form-label small text-secondary">Not Before</label>
+                        <input type="datetime-local"
+                            class="form-control form-control-sm bg-dark text-light border-secondary" id="not-before">
                     </div>
-                    <div class="modal-body">
-                        <p class="small text-muted">Copy this token and use it in the Inspect & Sign page, or share it
-                            with someone who can sign it.</p>
-                        <textarea id="generated-token" class="form-control" rows="5" readonly
-                            style="font-family: monospace; font-size: 0.9rem; background-color: #0d1117; color: #c9d1d9; border: 1px solid #30363d;"></textarea>
-                    </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-                        <button type="button" class="btn btn-primary" id="copy-token-btn">Copy to Clipboard</button>
-                        <a href="/ui/inspect" class="btn btn-outline-info" id="go-to-inspect-btn">Go to Inspect</a>
+                    <div class="col-md-6">
+                        <label for="not-after" class="form-label small text-secondary">Not After</label>
+                        <input type="datetime-local"
+                            class="form-control form-control-sm bg-dark text-light border-secondary" id="not-after">
                     </div>
                 </div>
             </div>
         </div>
     </div>
+</div>
+
+<h4 class="mb-3 text-light">Step 2: Generate Command</h4>
+<div id="commands-list-generate" class="row g-4">
+    <!-- JavaScript will populate this, including Custom Command card -->
+    <div class="col-12 text-center text-muted">Loading available commands...</div>
+</div>
+
+<!-- Modal for Token Output -->
+<div class="modal fade" id="tokenModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Command Token Generated</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p class="small text-muted">Copy this token and use it in the Inspect & Sign page, or share it
+                    with someone who can sign it.</p>
+                <textarea id="generated-token" class="form-control" rows="5" readonly
+                    style="font-family: monospace; font-size: 0.9rem; background-color: #0d1117; color: #c9d1d9; border: 1px solid #30363d;"></textarea>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-primary" id="copy-token-btn">Copy to Clipboard</button>
+                <a href="/ui/inspect" class="btn btn-outline-info" id="go-to-inspect-btn">Go to Inspect</a>
+            </div>
+        </div>
     </div>
+</div>
 
-    <footer class="mt-5 mb-3 text-center text-muted small">
-        Built with love ❤️, and AI 🤖
-    </footer>
-
-    <script src="/ui/bootstrap.bundle.min.js"></script>
-    <script src="/ui/signing.js"></script>
-    <script>
-        document.addEventListener('DOMContentLoaded', () => {
-            loadCommandsForGenerate();
-        });
-    </script>
-</body>
-
-</html>
+<script>
+    document.addEventListener('DOMContentLoaded', () => {
+        loadCommandsForGenerate();
+        // refreshFiles removed
+    });
+</script>

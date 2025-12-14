@@ -79,6 +79,8 @@ document.addEventListener('DOMContentLoaded', () => {
 function initMonitorPage() {
     const urlParams = new URLSearchParams(window.location.search);
     const id = urlParams.get('id');
+    const fileName = urlParams.get('file_name');
+    const filePath = urlParams.get('file_path');
 
     // Handle manual entry
     const startBtn = document.getElementById('start-monitor-btn');
@@ -93,11 +95,31 @@ function initMonitorPage() {
     }
 
     if (id) {
-        // Hide input, show monitor
         const inputArea = document.getElementById('monitor-input-area');
         if (inputArea) inputArea.style.display = 'none';
-        startStreaming(id);
+        startStreaming({ type: 'execution', id: id });
+    } else if (fileName || filePath) {
+        const inputArea = document.getElementById('monitor-input-area');
+        if (inputArea) inputArea.style.display = 'none';
+
+        // Show tail controls for files
+        const tailControls = document.getElementById('tail-controls');
+        if (tailControls) tailControls.style.display = 'flex';
+
+        const tailLines = urlParams.get('tail_lines');
+        startStreaming({
+            type: 'file',
+            name: fileName,
+            path: filePath,
+            tailLines: tailLines
+        });
     }
+}
+
+function reloadStream(lines) {
+    const urlParams = new URLSearchParams(window.location.search);
+    urlParams.set('tail_lines', lines);
+    window.location.search = urlParams.toString();
 }
 
 async function loadCommands() {
@@ -556,31 +578,71 @@ async function handleSignAndExecute() {
 }
 
 // Function to start streaming logs (called by execute.html)
-function startStreaming(executionId) {
+function startStreaming(target) {
     const agentOutput = document.getElementById('agent-output');
     const statusArea = document.getElementById('status-area');
     const agentArea = document.getElementById('agent-result-area');
+    const spinner = document.getElementById('loading-spinner');
 
     agentArea.style.display = 'block';
-    statusArea.innerText = `Streaming logs for Execution ID: ${executionId}`;
+    if (spinner) spinner.style.display = 'inline-block';
 
-    const wsUrl = `ws://127.0.0.1:10022/stream/${executionId}`;
+    // Clear previous usage if needed (optional, or append)
+    agentOutput.innerHTML = '';
+
+    let wsUrl = '';
+
+    if (typeof target === 'string') {
+        // Legacy support if passed string ID directly
+        wsUrl = `ws://127.0.0.1:10022/stream/${target}`;
+        statusArea.innerText = `Streaming logs for Execution ID: ${target}`;
+    } else if (target.type === 'execution') {
+        wsUrl = `ws://127.0.0.1:10022/stream/${target.id}`;
+        statusArea.innerText = `Streaming logs for Execution ID: ${target.id}`;
+    } else if (target.type === 'file') {
+        const tokenMeta = document.querySelector('meta[name="remonse-token"]');
+        const token = tokenMeta ? tokenMeta.content : '';
+        if (!token) {
+            alert('Authentication token missing. Please refresh.');
+            return;
+        }
+
+        const params = new URLSearchParams();
+        params.append('token', token);
+        if (target.name) params.append('name', target.name);
+        if (target.path) params.append('path', target.path);
+        if (target.tailLines) params.append('tail_lines', target.tailLines);
+
+        wsUrl = `ws://127.0.0.1:10022/api/files/stream?${params.toString()}`;
+
+        const label = target.name || target.path;
+        statusArea.innerText = `Streaming file: ${label}`;
+    }
+
     const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
         const info = document.createElement('div');
         info.textContent = `[Connected to stream]`;
         info.style.color = "#339af0";
+        // Ensure container preserves whitespace and font
+        agentOutput.style.whiteSpace = "pre-wrap";
+        agentOutput.style.fontFamily = "var(--bs-font-monospace)";
         agentOutput.appendChild(info);
+        statusArea.innerText = "Connected";
+        if (spinner) spinner.style.display = 'none';
     };
 
     ws.onmessage = (event) => {
-        const logLine = document.createElement('pre');
-        logLine.style.margin = "0";
-        logLine.style.padding = "0"; // compact
-        logLine.style.border = "none";
-        logLine.textContent = event.data;
-        agentOutput.appendChild(logLine);
+        // Attempt to keep scroll at bottom
+        const atBottom = agentOutput.scrollHeight - agentOutput.scrollTop === agentOutput.clientHeight;
+
+        // Use span instead of pre to avoid block-level breaks between chunks
+        const logSpan = document.createElement('span');
+        logSpan.textContent = event.data;
+        agentOutput.appendChild(logSpan);
+
+        // Auto-scroll
         agentOutput.scrollTop = agentOutput.scrollHeight;
     };
 
@@ -589,7 +651,8 @@ function startStreaming(executionId) {
         info.textContent = `[Stream finished]`;
         info.style.color = "gray";
         agentOutput.appendChild(info);
-        statusArea.innerText = "Execution Finished";
+        statusArea.innerText = "Disconnected";
+        if (spinner) spinner.style.display = 'none';
     };
 
     ws.onerror = (e) => {
@@ -597,5 +660,110 @@ function startStreaming(executionId) {
         info.textContent = `[Connection Error]`;
         info.style.color = "red";
         agentOutput.appendChild(info);
+        statusArea.innerText = "Error";
+        if (spinner) spinner.style.display = 'none';
     };
+}
+
+async function refreshFiles() {
+    const list = document.getElementById('files-list-container');
+    if (!list) return;
+
+    list.innerHTML = 'Loading files...';
+    try {
+        const res = await fetch('http://127.0.0.1:10022/api/files');
+        if (!res.ok) throw new Error(`Agent returned ${res.status}`);
+        const files = await res.json();
+
+        if (files.length === 0) {
+            list.innerHTML = '<div class="col-12 text-muted">No files defined in configuration.</div>';
+            return;
+        }
+
+        // Group by name
+        const groups = {};
+        files.forEach(f => {
+            const key = f.name || f.path; // Use path as key if no name (unique items)
+            if (!groups[key]) groups[key] = { name: f.name, desc: f.description, paths: [] };
+            groups[key].paths.push(f.path);
+        });
+
+        let html = '';
+        Object.keys(groups).sort().forEach(key => {
+            const g = groups[key];
+            const isMulti = g.paths.length > 1;
+            const displayName = g.name || g.paths[0]; // If named, use name. If not, use path.
+            const desc = g.desc ? `<p class="mb-2 text-muted small">${g.desc}</p>` : '';
+
+            let content = '';
+            if (isMulti) {
+                // Dropdown for multiple files
+                const options = g.paths.map(p => {
+                    // Show basename for readability, hover for full path
+                    const basename = p.split(/[\\/]/).pop();
+                    return `<option value="${p}" title="${p}">${basename}</option>`;
+                }).join('');
+
+                content = `
+                    <div class="mb-2">
+                         <label class="form-label text-secondary small">Select File (${g.paths.length}):</label>
+                         <select id="select-${key}" class="form-select form-select-sm bg-dark text-light border-secondary">
+                             ${options}
+                         </select>
+                    </div>
+                    <button class="btn btn-sm btn-outline-info w-100" 
+                        onclick="viewSelectedFile('select-${key}')">
+                        Read Selected
+                    </button>
+                `;
+            } else {
+                // Single file
+                const path = g.paths[0];
+                const subText = g.name ? `<small class="text-secondary d-block text-truncate mb-2" title="${path}">${path}</small>` : '';
+                content = `
+                    ${subText}
+                    <button class="btn btn-sm btn-outline-info w-100" 
+                        onclick="viewFile(null, '${path.replace(/\\/g, '\\\\')}')">
+                        Read File
+                    </button>
+                `;
+            }
+
+            html += `<div class="col-md-6 col-lg-4">
+                <div class="card bg-dark border-secondary h-100 shadow-sm">
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between align-items-start mb-2">
+                             <h6 class="card-title text-info text-truncate mb-0" title="${displayName}">${displayName}</h6>
+                        </div>
+                        ${desc}
+                        <div class="mt-3">
+                            ${content}
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        });
+        list.innerHTML = html;
+
+    } catch (e) {
+        list.innerHTML = `<div class="col-12 text-danger">Failed to load files: ${e.message}. Is the agent running?</div>`;
+    }
+}
+
+function viewSelectedFile(selectId) {
+    const select = document.getElementById(selectId);
+    if (select && select.value) {
+        viewFile(null, select.value);
+    }
+}
+
+function viewFile(name, path) {
+    const params = new URLSearchParams();
+    if (name) params.append('file_name', name);
+    else if (path) params.append('file_path', path);
+
+    // Default to tailing 1000 lines
+    params.append('tail_lines', '1000');
+
+    window.location.href = `/ui/monitor?${params.toString()}`;
 }

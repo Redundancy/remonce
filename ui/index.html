@@ -1,0 +1,70 @@
+<div class="text-center py-5">
+    <h1 class="display-4 fw-bold text-primary mb-3">Welcome to Remonse</h1>
+    <p class="lead text-muted mb-5">Secure, signed command execution for your infrastructure.</p>
+</div>
+
+<div class="row g-4 justify-content-center mb-4">
+    <!-- Step 1: Generate -->
+    <div class="col-md-4">
+        <div class="card h-100 border-secondary shadow-sm">
+            <div class="card-body text-center d-flex flex-column">
+                <div class="display-6 text-success mb-3">1</div>
+                <h4 class="card-title">Generate</h4>
+                <p class="card-text text-muted my-3 small">
+                    Generate a unique <strong>Command Token</strong>.
+                </p>
+                <a href="/ui/generate" class="btn btn-outline-success stretched-link mt-auto">Go</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Step 2: Inspect & Sign -->
+    <div class="col-md-4">
+        <div class="card h-100 border-secondary shadow-sm">
+            <div class="card-body text-center d-flex flex-column">
+                <div class="display-6 text-warning mb-3">2</div>
+                <h4 class="card-title">Inspect & Sign</h4>
+                <p class="card-text text-muted my-3 small">
+                    Review and sign to create an <strong>Execution Token</strong>.
+                </p>
+                <a href="/ui/inspect" class="btn btn-outline-warning stretched-link mt-auto">Go</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Step 3: Execute -->
+    <div class="col-md-4">
+        <div class="card h-100 border-secondary shadow-sm">
+            <div class="card-body text-center d-flex flex-column">
+                <div class="display-6 text-danger mb-3">3</div>
+                <h4 class="card-title">Execute</h4>
+                <p class="card-text text-muted my-3 small">
+                    Run the command and monitor output.
+                </p>
+                <a href="/ui/execute" class="btn btn-outline-danger stretched-link mt-auto">Go</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-4 justify-content-center">
+    <!-- Files -->
+    <div class="col-md-4">
+        <div class="card h-100 border-secondary shadow-sm">
+            <div class="card-body text-center d-flex flex-column">
+                <div class="display-6 text-info mb-3"><i class="bi bi-folder"></i>📂</div>
+                <h4 class="card-title">Files</h4>
+                <p class="card-text text-muted my-3 small">
+                    Browse and read accessible files/logs.
+                </p>
+                <a href="/ui/files" class="btn btn-outline-info stretched-link mt-auto">Go</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mt-5">
+    <div class="col-12 text-center text-muted small">
+        <p>Remonse uses OpenID Connect for identity and OPA for authorization policy.</p>
+    </div>
+</div>

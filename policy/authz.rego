@@ -46,6 +46,13 @@ allow if {
     user_groups[_] == "webapp-users"
 }
 
+# Action: Read File
+# Allow if the user is in the 'webapp-users' group
+allow if {
+    input.action == "read_file"
+    user_groups[_] == "webapp-users"
+}
+
 # Command: test
 allow if {
     input.command.command == "test"

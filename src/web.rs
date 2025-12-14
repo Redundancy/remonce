@@ -150,14 +150,9 @@ pub async fn run() -> Result<(), AppError> {
         .route("/oidc/callback", get(callback_handler))
         .route("/api/sign", post(sign_handler))
         .route("/api/commands", get(get_commands_handler))
-        .route("/ui/commands", get(commands_page_handler))
-        .route("/ui/sign", get(sign_page_handler))
-        .route("/ui/generate", get(generate_page_handler))
-        .route("/ui/inspect", get(inspect_page_handler))
-        .route("/ui/monitor", get(monitor_page_handler))   // [NEW]
-        .route("/ui/execute", get(execute_page_handler))
-        .route("/profile", get(generate_page_handler)) // Default to generate page
-        .nest_service("/ui", ServeDir::new("ui"))
+        .route("/ui", get(index_page_handler))
+        .route("/ui/{page}", get(ui_handler))
+        .nest_service("/static", ServeDir::new("ui/static"))
         .with_state(app_state)
         .layer(session_layer)
         .layer(
@@ -177,72 +172,63 @@ pub async fn run() -> Result<(), AppError> {
     Ok(())
 }
 
-/// Commands page handler
-async fn commands_page_handler(
+/// Index page handler (root /ui)
+async fn index_page_handler(
     State(state): State<AppState>,
     session: Session,
 ) -> Result<Html<String>, AppError> {
-    render_page(session, "ui/commands.html", &state.hostname).await
+    render_template(session, "index", &state.hostname).await
 }
 
-/// Sign page handler
-async fn sign_page_handler(
+/// Generic UI handler for /ui/:page
+async fn ui_handler(
     State(state): State<AppState>,
     session: Session,
+    axum::extract::Path(page): axum::extract::Path<String>,
 ) -> Result<Html<String>, AppError> {
-    render_page(session, "ui/sign.html", &state.hostname).await
+    // Basic validation to prevent traversal
+    if !page.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+         return Err(AppError::Internal("Invalid page name".into()));
+    }
+    render_template(session, &page, &state.hostname).await
 }
 
-// [NEW] Generate page handler
-async fn generate_page_handler(
-    State(state): State<AppState>,
+/// Helper to render pages using Header/Footer partials
+async fn render_template(
     session: Session,
-) -> Result<Html<String>, AppError> {
-    render_page(session, "ui/generate.html", &state.hostname).await
-}
-
-// [NEW] Inspect page handler
-async fn inspect_page_handler(
-    State(state): State<AppState>,
-    session: Session,
-) -> Result<Html<String>, AppError> {
-    render_page(session, "ui/inspect.html", &state.hostname).await
-}
-
-async fn monitor_page_handler(
-    State(state): State<AppState>,
-    session: Session,
-) -> Result<Html<String>, AppError> {
-    render_page(session, "ui/monitor.html", &state.hostname).await
-}
-
-/// Execute page handler
-async fn execute_page_handler(
-    State(state): State<AppState>,
-    session: Session,
-) -> Result<Html<String>, AppError> {
-    render_page(session, "ui/execute.html", &state.hostname).await
-}
-
-/// Helper to render pages with user info injected
-async fn render_page(
-    session: Session,
-    template_path: &str,
+    template_name: &str,
     hostname: &str,
 ) -> Result<Html<String>, AppError> {
     let profile: UserProfile = session.get(SESSION_KEY).await?.unwrap_or_default();
 
     if profile.subject.is_empty() {
+        // Redirect to home if not logged in, or show friendly message?
+        // Using simple message for now as per previous logic
         return Ok(Html(
             "<h1>Not Logged In</h1><p><a href='/'>Home</a></p>".to_string(),
         ));
     }
 
-    let template = std::fs::read_to_string(template_path).map_err(|e| {
-        AppError::Internal(format!("Failed to load template {}: {e}", template_path))
+    // Load Partials
+    let header = std::fs::read_to_string("ui/header.html").map_err(|e| {
+        AppError::Internal(format!("Failed to load header: {e}"))
+    })?;
+    
+    let footer = std::fs::read_to_string("ui/footer.html").map_err(|e| {
+        AppError::Internal(format!("Failed to load footer: {e}"))
     })?;
 
-    let body = template
+    // Load Content
+    let content_path = format!("ui/{}.html", template_name);
+    let content = std::fs::read_to_string(&content_path).map_err(|e| {
+         AppError::Internal(format!("Page not found ({}): {}", template_name, e))
+    })?;
+
+    // Combine
+    let full_body = format!("{}{}{}", header, content, footer);
+
+    // Replace Variables
+    let body = full_body
         .replace("{{subject}}", &profile.subject)
         .replace("{{id_token}}", &profile.id_token)
         .replace("{{public_key}}", &profile.public_key_pem)
@@ -437,7 +423,7 @@ async fn callback_handler(
     };
     session.insert(SESSION_KEY, user_profile).await?;
 
-    Ok(Redirect::to("/profile"))
+    Ok(Redirect::to("/ui"))
 }
 
 #[derive(Deserialize)]

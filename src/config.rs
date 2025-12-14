@@ -28,6 +28,10 @@ pub struct Config {
     /// Used for authorization decisions (e.g., "http://localhost:8181").
     #[serde(default = "default_opa_url")]
     pub opa_url: String,
+
+    /// List of allowed files for read-only access.
+    #[serde(default)]
+    pub files: Vec<FileConfig>,
 }
 
 fn default_logs_dir() -> String {
@@ -40,6 +44,18 @@ fn default_listen_address() -> String {
 
 fn default_opa_url() -> String {
     "http://localhost:8181".to_string()
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct FileConfig {
+    /// The allowed path, supports glob patterns (e.g., "/var/log/*.log").
+    pub path: String,
+
+    /// An optional alias for the file or glob pattern.
+    pub name: Option<String>,
+
+    /// Optional description for the UI.
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

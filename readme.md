@@ -57,6 +57,13 @@ Signed tokens can embed strict constraints enforced by the Agent. These are inpu
 -   **Target Machines**: Restrict execution to specific hostnames.
 -   **Not Before / Not After**: Absolute time windows for execution.
 
+### File Access
+Read-only access to files can be configured via `[[files]]` entries.
+-   `path`: The absolute path or glob pattern (e.g., `/var/log/*.log`).
+-   `name`: Optional alias for easier reference (e.g., `app-logs`).
+-   OPA Action: `read_file`.
+-   OPA Input: `input.file.name` or `input.file.path`.
+
 ---
 
 ## Documentation

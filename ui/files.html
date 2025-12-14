@@ -1,0 +1,22 @@
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h2 class="text-light m-0">Files & Logs</h2>
+            <button class="btn btn-sm btn-outline-secondary" onclick="refreshFiles()">Refresh</button>
+        </div>
+
+        <div id="files-list-container" class="row g-3">
+            <div class="col-12 text-muted">Loading files...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Auto-load files when this specific page content is loaded
+    // Since we are using a simple refactor, we can assume signing.js is loaded in footer
+    document.addEventListener('DOMContentLoaded', () => {
+        if (typeof refreshFiles === 'function') {
+            refreshFiles();
+        }
+    });
+</script>

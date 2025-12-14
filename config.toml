@@ -7,13 +7,13 @@ issuer_url = "http://127.0.0.1:8200/v1/identity/oidc/provider/vaultprovider"
 
 # The OIDC client ID for this application.
 # This should match the 'oidc_client_id' from the Terraform outputs.
-client_id = "d9PGD527zNs9TmlyRuGGrG612mramnPp"
+client_id = "xAoXyxo5QuLi3zxz17OR82L2vW258SEP"
 
 # Explicit redirect URI to avoid cookie domain mismatch (localhost vs 127.0.0.1)
 redirect_uri = "http://localhost:8080/oidc/callback"
 
-[timestamp_authority]
-ca_path = "./bin/DigiCertTrustedG4RSA4096SHA256TimeStampingCA.crt.pem"
+#[timestamp_authority]
+#ca_path = "./bin/DigiCertTrustedG4RSA4096SHA256TimeStampingCA.crt.pem"
 
 [[commands]]
 name = "test"
@@ -32,3 +32,12 @@ description = "Pings localhost 10 times to test execution streaming."
 opa_rule = "data.remonse.authz.decision"
 executable = "ping"
 args = ["-n", "10", "127.0.0.1"]
+
+[[files]]
+path = "logs/*.log"
+name = "execution-logs"
+description = "Access to execution logs"
+
+[[files]]
+path = "config.toml"
+description = "Server configuration file"

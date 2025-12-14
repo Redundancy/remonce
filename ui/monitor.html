@@ -1,81 +1,35 @@
-<!DOCTYPE html>
-<html lang="en" data-bs-theme="dark">
+<h2 class="mb-4">Execution Monitor</h2>
 
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Remonse - Monitor Execution</title>
-    <link rel="stylesheet" href="/ui/bootstrap.min.css">
-    <link rel="stylesheet" href="/ui/style.css">
-</head>
-
-<body>
-    <nav class="navbar navbar-expand-lg border-bottom mb-4" style="background-color: #1e1f22;">
-        <div class="container">
-            <a class="navbar-brand text-light" href="/ui/commands">Remonse @ {{hostname}}</a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
-                <span class="navbar-toggler-icon"></span>
-            </button>
-            <div class="collapse navbar-collapse" id="navbarNav">
-                <ul class="navbar-nav me-auto mb-2 mb-lg-0">
-                    <li class="nav-item">
-                        <a class="nav-link" href="/ui/generate">Generate</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="/ui/inspect">Inspect & Sign</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="/ui/execute">Execute</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link active" href="/ui/monitor">Monitor</a>
-                    </li>
-                </ul>
-                <div class="navbar-text text-secondary small">
-                    {{subject}}
-                </div>
-            </div>
+<!-- Input Section (only shown if no ID provided) -->
+<div id="monitor-input-area" class="row justify-content-center mb-4">
+    <div class="col-md-8 col-lg-6">
+        <div class="input-group">
+            <input type="text" id="execution-id-input" class="form-control" placeholder="Enter Execution ID (UUID)">
+            <button class="btn btn-primary" type="button" id="start-monitor-btn">Monitor</button>
         </div>
-    </nav>
+        <div class="form-text">Enter the ID of a running or completed command to view its logs.</div>
+    </div>
+</div>
 
-    <div class="container">
-        <h2 class="mb-4">Execution Monitor</h2>
-
-        <!-- Input Section (only shown if no ID provided) -->
-        <div id="monitor-input-area" class="row justify-content-center mb-4">
-            <div class="col-md-8 col-lg-6">
-                <div class="input-group">
-                    <input type="text" id="execution-id-input" class="form-control"
-                        placeholder="Enter Execution ID (UUID)">
-                    <button class="btn btn-primary" type="button" id="start-monitor-btn">Monitor</button>
-                </div>
-                <div class="form-text">Enter the ID of a running or completed command to view its logs.</div>
-            </div>
+<!-- Monitoring Section -->
+<div id="agent-result-area" class="alert alert-dark p-0 overflow-hidden"
+    style="display:none; border: 1px solid #30363d;">
+    <div class="bg-dark p-2 border-bottom border-secondary d-flex justify-content-between align-items-center">
+        <div class="d-flex align-items-center gap-2">
+            <span id="status-area" class="fw-bold text-light">Status: Connecting...</span>
+            <span class="spinner-border spinner-border-sm text-primary" role="status" id="loading-spinner"
+                style="display:none;"></span>
         </div>
-
-        <!-- Monitoring Section -->
-        <div id="agent-result-area" class="alert alert-dark p-0 overflow-hidden"
-            style="display:none; border: 1px solid #30363d;">
-            <div class="bg-dark p-2 border-bottom border-secondary d-flex justify-content-between align-items-center">
-                <span id="status-area" class="fw-bold text-light">Status: Connectng...</span>
-                <span class="spinner-border spinner-border-sm text-primary" role="status" id="loading-spinner"
-                    style="display:none;"></span>
-            </div>
-            <div id="agent-output" style="height: 500px; overflow-y: auto; scroll-behavior: smooth;"></div>
+        <div id="tail-controls" style="display:none;">
+            <button class="btn btn-xs btn-outline-info" onclick="reloadStream(1000)">Tail 1000</button>
+            <button class="btn btn-xs btn-outline-warning" onclick="reloadStream(-1)">Load All</button>
         </div>
     </div>
+    <div id="agent-output" style="height: 500px; overflow-y: auto; scroll-behavior: smooth;"></div>
+</div>
 
-    <footer class="mt-5 mb-3 text-center text-muted small">
-        Built with love ❤️, and AI 🤖
-    </footer>
-
-    <script src="/ui/bootstrap.bundle.min.js"></script>
-    <script src="/ui/signing.js"></script>
-    <script>
-        document.addEventListener('DOMContentLoaded', () => {
-            initMonitorPage();
-        });
-    </script>
-</body>
-
-</html>
+<script>
+    document.addEventListener('DOMContentLoaded', () => {
+        initMonitorPage();
+    });
+</script>

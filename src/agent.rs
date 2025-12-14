@@ -1,22 +1,23 @@
 use axum::{
     Router,
     extract::{
-        ConnectInfo, Json, Path, State,
+        ConnectInfo, Json, Path, State, Query,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use tokio::net::TcpListener;
 // Removed unused imports
 use crate::config::Config;
 use crate::web::OidcMetadata;
+use crate::files;
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
@@ -89,6 +90,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/execute", post(execute_handler))
         .route("/stream/{id}", get(stream_logs_handler))
+        .route("/api/files", get(list_files_handler))
+        .route("/api/files/stream", get(stream_file_handler))
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -116,53 +119,22 @@ async fn execute_handler(
     Json(req): Json<crate::security::ExecutionRequest>,
 ) -> Result<Json<ExecutionResponse>, ErrorResponse> {
     // Helper to log audit events on exit
+    // Helper to log audit events on exit
     let log_audit = |decision: &'static str,
                      reason: String,
                      user: String,
                      signed_at: Option<String>,
                      command: Option<serde_json::Value>| {
-        #[derive(Serialize)]
-        struct AuditLog {
-            timestamp: String,
-            level: &'static str,
-            target: &'static str,
-            event_type: &'static str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            command: Option<serde_json::Value>,
-            user: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            signed_at: Option<String>, // NEW
-            source_ip: String,
-            agent_host: String,
-            decision: &'static str,
-            reason: String,
-        }
-
-        let now = time::OffsetDateTime::now_utc();
-        // Use `time::format_description::well_known::Rfc3339`
-        let timestamp = now
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| "unknown_time".to_string());
-
-        let audit = AuditLog {
-            timestamp,
-            level: "INFO",
-            target: "audit",
-            event_type: "command_execution",
-            command,
-            user,
-            signed_at,
-            source_ip: addr.ip().to_string(),
-            agent_host: state.hostname.clone(),
+        crate::audit::log_audit(
             decision,
             reason,
-        };
-
-        if let Ok(json) = serde_json::to_string(&audit) {
-            println!("{}", json);
-        } else {
-            tracing::error!("Failed to serialize audit log");
-        }
+            user,
+            addr.ip().to_string(),
+            state.hostname.clone(),
+            signed_at,
+            command,
+            None,
+        );
     };
 
     tracing::info!("Verifying request for command execution");
@@ -532,60 +504,234 @@ async fn stream_logs_handler(
     State(state): State<AgentState>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, id, state.config.logs_dir))
+    let log_path = PathBuf::from(&state.config.logs_dir).join(format!("{}.log", id));
+    // Default to tailing logs as they are written
+    ws.on_upgrade(move |socket| tail_file(socket, log_path, None))
 }
 
-async fn handle_socket(mut socket: WebSocket, id: String, logs_dir: String) {
-    let log_path = PathBuf::from(logs_dir).join(format!("{}.log", id));
+async fn list_files_handler(State(state): State<AgentState>) -> Json<Vec<files::FileMetadata>> {
+    Json(files::list_available_files(&state.config.files))
+}
 
-    // Wait for file to exist (it might be creating)
+#[derive(Deserialize)]
+struct StreamFileParams {
+    token: String,
+    name: Option<String>,
+    path: Option<String>,
+    #[serde(default = "default_tail_lines")]
+    tail_lines: Option<usize>,
+}
+
+fn default_tail_lines() -> Option<usize> {
+    Some(1000)
+}
+
+async fn stream_file_handler(
+    State(state): State<AgentState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(params): Query<StreamFileParams>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // Helper for audit logging
+    // Helper for audit logging
+    let log_audit = |decision: &'static str,
+                     reason: String,
+                     user: String,
+                     file_info: Option<serde_json::Value>| {
+        crate::audit::log_audit(
+            decision,
+            reason,
+            user,
+            addr.ip().to_string(),
+            state.hostname.clone(),
+            None,
+            None,
+            file_info,
+        );
+    };
+
+    // 1. Verify Token & OPA
+    // Note: We are doing this before upgrade to return HTTP error if auth fails.
+    /* 
+       Optimization: We could reuse security::VerifierConfig logic if we refactored security.rs 
+       to expose a simple "verify_jwt(token)" function. 
+       For now, manual verification is fine.
+    */
+    
+    // We need the key.
+    let header = match jsonwebtoken::decode_header(&params.token) {
+        Ok(h) => h,
+        Err(_) => {
+            log_audit("deny", "Invalid Token Header".into(), "unknown".into(), None);
+            return (axum::http::StatusCode::UNAUTHORIZED, "Invalid Token Header").into_response();
+        }
+    };
+    
+    // Logic similar to web callback, but here we just need to verify signature against JWKS.
+    let kid = match header.kid {
+        Some(k) => k,
+        None => {
+             log_audit("deny", "Missing KID".into(), "unknown".into(), None);
+             return (axum::http::StatusCode::UNAUTHORIZED, "Missing KID").into_response();
+        }
+    };
+    
+    let jwk = match state.jwks.find(&kid) {
+        Some(j) => j,
+        None => {
+            log_audit("deny", "Unknown Key".into(), "unknown".into(), None);
+            return (axum::http::StatusCode::UNAUTHORIZED, "Unknown Key").into_response();
+        }
+    };
+    
+    let decoding_key = match jsonwebtoken::DecodingKey::from_jwk(jwk) {
+        Ok(k) => k,
+        Err(_) => {
+            log_audit("deny", "Key Error".into(), "unknown".into(), None);
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Key Error").into_response();
+        }
+    };
+    
+    let mut validation = jsonwebtoken::Validation::new(header.alg);
+    validation.set_audience(&[&state.config.oidc.client_id]);
+    validation.set_issuer(&[&state.config.oidc.issuer_url]);
+    
+    let token_data = match jsonwebtoken::decode::<serde_json::Value>(&params.token, &decoding_key, &validation) {
+         Ok(t) => t,
+         Err(_) => {
+             log_audit("deny", "Invalid Token Signature".into(), "unknown".into(), None);
+             return (axum::http::StatusCode::UNAUTHORIZED, "Invalid Token").into_response();
+         }
+    };
+
+    let user = token_data.claims.get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // 2. Resolve File
+    let identifier = if let Some(name) = &params.name {
+        files::FileIdentifier::Name(name.clone())
+    } else if let Some(path) = &params.path {
+        files::FileIdentifier::Path(path.clone())
+    } else {
+        log_audit("deny", "Missing name or path".into(), user.clone(), None);
+        return (axum::http::StatusCode::BAD_REQUEST, "Missing name or path").into_response();
+    };
+
+    let file_info_json = match &identifier {
+        files::FileIdentifier::Name(n) => serde_json::json!({ "name": n }),
+        files::FileIdentifier::Path(p) => serde_json::json!({ "path": p }),
+    };
+
+    let file_path = match files::resolve_file_path(&state.config.files, &identifier) {
+        Some(p) => p,
+        None => {
+             log_audit("deny", "File Access Denied (Not Allowed)".into(), user.clone(), Some(file_info_json));
+             return (axum::http::StatusCode::FORBIDDEN, "File Access Denied").into_response();
+        }
+    };
+
+    // 3. Check OPA
+    let check_input = serde_json::json!({
+        "input": {
+            "action": "read_file",
+            "file": file_info_json,
+            "jwt": params.token
+        }
+    });
+    
+    let opa_url = format!("{}/v1/data/remonse/authz/decision", state.config.opa_url);
+    let opa_res: serde_json::Value = match state.http_client.post(&opa_url).json(&check_input).send().await {
+        Ok(r) => r.json().await.unwrap_or(serde_json::json!({})),
+        Err(e) => {
+            log_audit("error", format!("OPA Error: {}", e), user.clone(), Some(file_info_json));
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "OPA Error").into_response();
+        }
+    };
+
+    let allowed = opa_res.pointer("/result/allow").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !allowed {
+         log_audit("deny", "OPA Denied".into(), user.clone(), Some(file_info_json));
+         return (axum::http::StatusCode::FORBIDDEN, "OPA Denied").into_response();
+    }
+
+    log_audit("allow", "File Stream Started".into(), user.clone(), Some(file_info_json));
+
+    // 4. Stream/Tail
+    ws.on_upgrade(move |socket| tail_file(socket, file_path, params.tail_lines))
+}
+
+async fn tail_file(mut socket: WebSocket, path: PathBuf, tail_lines: Option<usize>) {
+    // Wait for file to exist? (Only if it's potentially created soon, like logs. For generic files, maybe we error if not found?)
+    // Reusing log logic which waits.
     let mut attempts = 0;
-    while !log_path.exists() && attempts < 10 {
+    while !path.exists() && attempts < 10 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         attempts += 1;
     }
 
-    if !log_path.exists() {
-        let _ = socket
-            .send(Message::Text("Log file not found".into()))
-            .await;
+    if !path.exists() {
+        let _ = socket.send(Message::Text("File not found".into())).await;
         return;
     }
 
-    let mut file = match tokio::fs::File::open(&log_path).await {
+    let mut file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(_) => {
-            let _ = socket
-                .send(Message::Text("Failed to open log file".into()))
-                .await;
+            let _ = socket.send(Message::Text("Failed to open file".into())).await;
             return;
         }
     };
+    
+    // Seek logic for tailing
+    if let Some(n) = tail_lines {
+        // This is complex for variable length lines.
+        // Simplified: read valid utf8 from end?
+        // Or just read whole file and take last N lines if file is small?
+        // For strict correctness on huge files, we need to seek from end.
+        // Let's implement a simple buffer approach: Read entire file (if manageable) or last X bytes.
+        // Given complexity, maybe just read from start if not excessively large, or seek to file_len - (avg_line_len * N)?
+        
+        // Strategy: 
+        // 1. Get file size.
+        // 2. If small (< 1MB), read all, take last N lines.
+        // 3. If large, seek to end - (N * 200 bytes?), read, split lines, take last N.
+        
+        let metadata = file.metadata().await.unwrap();
+        let len = metadata.len();
+        
+        // Arbitrary buffer size estimate: 200 chars per line?
+        let est_bytes = (n as u64) * 200;
+        let start_pos = if len > est_bytes { len - est_bytes } else { 0 };
+        
+        use std::io::SeekFrom;
+        if let Err(_) = file.seek(SeekFrom::Start(start_pos)).await {
+            // ignore error, read from start
+        }
+        
+        // We might start in middle of line.
+        // Since we are just streaming text, send it? Clients might see partial first line.
+        // If we want clean lines, we should read and find first newline.
+        // Leaving as simple byte stream for now, client handles display.
+        // Wait, current logic sends chunks.
+    }
 
     let mut buf = [0u8; 1024];
     loop {
         let n = match file.read(&mut buf).await {
             Ok(n) => n,
-            Err(_) => {
-                break;
-            } // stop on error
+            Err(_) => break,
         };
 
         if n > 0 {
             let s = String::from_utf8_lossy(&buf[..n]);
-            if socket
-                .send(Message::Text(s.to_string().into()))
-                .await
-                .is_err()
-            {
-                break; // client disconnected
+            if socket.send(Message::Text(s.to_string().into())).await.is_err() {
+                break;
             }
         } else {
-            // EOF reached? Wait for more data (tail)
-            // But how do we know if process finished?
-            // For now, just keep polling until client disconnects or timeout.
-            // We'll sleep briefly.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+             // EOF. Wait.
+             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 }
