@@ -30,9 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hash = Sha256::digest(input_data);
     println!("Input Hash (SHA256): {}", hex::encode(hash));
 
-    println!("Requesting timestamp from: {}", config.tsa_url);
+    println!("Requesting timestamp from: {}", config.timestamp_authority.url);
     // request_timestamp expects raw data, it hashes it internally
-    let token_bytes = tsa::request_timestamp(&client, &config.tsa_url, input_data).await?;
+    let token_bytes = tsa::request_timestamp(&client, &config.timestamp_authority.url, input_data).await?;
 
     let golden_dir = Path::new("golden");
     if !golden_dir.exists() {
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Verifying generated token (self-test)...");
 
     // Load trust anchors
-    let trusted_roots = tsa::load_trust_anchors(config.tsa_ca_path.as_deref());
+    let trusted_roots = tsa::load_trust_anchors(config.timestamp_authority.ca_path.as_deref());
 
     // verify_timestamp expects raw data and checks its hash against msgImprint
     match tsa::verify_timestamp(&token_bytes, input_data, &trusted_roots) {

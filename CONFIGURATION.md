@@ -5,12 +5,27 @@ This document identifies the configuration options available for the Remonse age
 ## Configuration File (`config.toml`)
 
 The agent is configured via a `config.toml` file located in the current working directory.
+    
+### General Settings
+
+Basic network and storage configuration.
+
+```toml
+# Interface and port to bind the web server to.
+# Default: "127.0.0.1:8080"
+listen_address = "127.0.0.1:8080"
+
+# Directory where execution logs will be stored.
+# Default: "logs"
+logs_dir = "logs"
+```
 
 ### Identity (OIDC)
 
 These settings connect the agent to your OIDC provider (Vault, Keycloak, etc.).
 
 ```toml
+[oidc]
 # Base URL of the OIDC provider's issuer.
 # Must match the 'iss' claim in your JWTs.
 issuer_url = "http://127.0.0.1:8200/v1/identity/oidc/provider/vaultprovider"
@@ -38,14 +53,15 @@ opa_url = "http://127.0.0.1:8181"
 To ensure non-repudiation of executed commands, the agent verifies RFC 3161 Timestamp Tokens.
 
 ```toml
+[timestamp_authority]
 # (Optional) URL of the Time Stamping Authority.
 # Used if the agent needs to request timestamps itself (future feature).
-tsa_url = "http://timestamp.digicert.com"
+url = "http://timestamp.digicert.com"
 
 # (Optional) Path to a file containing trusted CA certificates for TSA verification.
 # PEM format.
 # If omitted, the agent uses the operating system's native trust store.
-tsa_ca_path = "./tsa_chain.pem"
+ca_path = "./tsa_chain.pem"
 ```
 
 > [!IMPORTANT]
@@ -56,7 +72,7 @@ tsa_ca_path = "./tsa_chain.pem"
 > **Resolution:**
 > 1. Download the intermediate CA certificate (e.g., "DigiCert Trusted G4 TimeStamping RSA4096 SHA256 2025 CA1").
 > 2. Save it to a file (e.g., `tsa_chain.pem`).
-> 3. Set `tsa_ca_path = "./tsa_chain.pem"` in your `config.toml`.
+> 3. Set `ca_path = "./tsa_chain.pem"` under `[timestamp_authority]` in your `config.toml`.
 > 4. Alternatively, install the certificate into your OS system trust store.
 
 ### Commands

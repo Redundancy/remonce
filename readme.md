@@ -1,6 +1,4 @@
-# Remonse
-
-**Remote Monitoring and Secure Execution**
+# Remonse - *Remote Monitoring and Secure Execution*
 
 > **Secure, Identity-Aware, JIT Command Execution.**
 
@@ -47,7 +45,7 @@ From a usability standpoint, the system offers a **Secure UI** with a modern dar
 
 ## Documentation
 
-*   [**Getting Started (Dev Guide)**](DEVELOPMENT.md): Spin up the environment locally in minutes.
+*   [**Getting Started (Dev Guide)**](DEVELOPMENT.md): Spin up the environment locally.
 *   [**Architecture Deep Dive**](ARCHITECTURE.md): The cryptographic protocols and design decisions.
 *   [**Security Model**](SECURITY.md): How we secure the chain of trust.
 *   [**Production Readiness**](PRODUCTION_READINESS.md): Roadmap to going live.

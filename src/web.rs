@@ -102,7 +102,7 @@ pub async fn run() -> Result<(), AppError> {
 
     // Create shared HTTP client and AppState
     let http_client = Client::new();
-    let discovery_url = format!("{}/.well-known/openid-configuration", config.issuer_url);
+    let discovery_url = format!("{}/.well-known/openid-configuration", config.oidc.issuer_url);
     let discovery_response_text = http_client.get(&discovery_url).send().await?.text().await?;
 
     tracing::info!("Discovery URL: {}", discovery_url);
@@ -291,7 +291,7 @@ async fn login_handler(
     auth_url
         .query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair("client_id", &state.config.client_id)
+        .append_pair("client_id", &state.config.oidc.client_id)
         .append_pair("redirect_uri", &state.config.get_redirect_uri())
         .append_pair("scope", "openid groups user_profile")
         .append_pair("state", &oidc_state)
@@ -364,7 +364,7 @@ async fn callback_handler(
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", &state.config.get_redirect_uri()),
-            ("client_id", &state.config.client_id),
+            ("client_id", &state.config.oidc.client_id),
             ("code_verifier", &flow_state.pkce_verifier),
         ])
         .send()
@@ -382,8 +382,8 @@ async fn callback_handler(
         .find(&kid)
         .ok_or(AppError::Auth("No matching JWK found for token".into()))?;
     let mut validation = jsonwebtoken::Validation::new(header.alg);
-    validation.set_audience(&[&state.config.client_id]);
-    validation.set_issuer(&[&state.config.issuer_url]);
+    validation.set_audience(&[&state.config.oidc.client_id]);
+    validation.set_issuer(&[&state.config.oidc.issuer_url]);
 
     let token_data = jsonwebtoken::decode::<Claims>(
         &token_response.id_token,
@@ -481,7 +481,7 @@ async fn sign_handler(
 
     let timestamp_token_bytes = crate::tsa::request_timestamp(
         &state.http_client,
-        &state.config.tsa_url,
+        &state.config.timestamp_authority.url,
         &data_to_timestamp,
     )
     .await

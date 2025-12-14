@@ -1,5 +1,6 @@
 # Configuration for the Remonse local server
 
+[oidc]
 # The base URL of the OIDC provider (Vault)
 # This should match the 'issuer' URL from the Terraform outputs.
 issuer_url = "http://127.0.0.1:8200/v1/identity/oidc/provider/vaultprovider"
@@ -11,7 +12,8 @@ client_id = "d9PGD527zNs9TmlyRuGGrG612mramnPp"
 # Explicit redirect URI to avoid cookie domain mismatch (localhost vs 127.0.0.1)
 redirect_uri = "http://localhost:8080/oidc/callback"
 
-tsa_ca_path = "./bin/DigiCertTrustedG4RSA4096SHA256TimeStampingCA.crt.pem"
+[timestamp_authority]
+ca_path = "./bin/DigiCertTrustedG4RSA4096SHA256TimeStampingCA.crt.pem"
 
 [[commands]]
 name = "test"

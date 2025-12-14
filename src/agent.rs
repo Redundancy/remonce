@@ -58,7 +58,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let http_client = Client::new();
 
     // 2. Fetch OIDC Metadata and Keys (Agent needs to verify JWTs)
-    let discovery_url = format!("{}/.well-known/openid-configuration", config.issuer_url);
+    let discovery_url = format!("{}/.well-known/openid-configuration", config.oidc.issuer_url);
     let discovery: OidcMetadata = http_client.get(&discovery_url).send().await?.json().await?;
     let jwks = http_client
         .get(&discovery.jwks_uri)
@@ -68,7 +68,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // 3. Load TSA Trusted Roots
-    let trusted_roots = crate::tsa::load_trust_anchors(config.tsa_ca_path.as_deref());
+    let trusted_roots = crate::tsa::load_trust_anchors(config.timestamp_authority.ca_path.as_deref());
     tracing::info!("Loaded {} trusted TSA roots", trusted_roots.len());
 
     let hostname = hostname::get()
@@ -170,8 +170,8 @@ async fn execute_handler(
 
     // 1. Verify Request via Security Module
     let verifier_config = crate::security::VerifierConfig {
-        client_id: state.config.client_id.clone(),
-        issuer_url: state.config.issuer_url.clone(),
+        client_id: state.config.oidc.client_id.clone(),
+        issuer_url: state.config.oidc.issuer_url.clone(),
         jwks: state.jwks.clone(),
         trusted_roots: state.trusted_roots.clone(),
     };

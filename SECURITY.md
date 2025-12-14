@@ -2,7 +2,7 @@
 
 ## Overview
 
-Zitre is a remote command execution system designed with a security-first approach ("Zero Trust Remote Execution"). It ensures that any command executed on a target machine is individually authenticated, authorized, and time-bound.
+Remonse is a remote command execution system designed with a security-first approach ("Zero Trust Remote Execution"). It ensures that any command executed on a target machine is individually authenticated, authorized, and time-bound.
 
 The core security model relies on:
 1.  **OIDC Authentication**: Users authenticate via an OIDC provider (HashiCorp Vault).
@@ -19,6 +19,7 @@ When the Agent receives a request, it performs the following strict verification
     - The Agent validates the RFC 3161 Timestamp Token.
     - It ensures the timestamp was issued for the specific signature + ID token provided.
     - **Note**: Currently, the TSA signature itself is NOT strictly verified (see [PRODUCTION_READINESS.md](./PRODUCTION_READINESS.md)).
+    - **Implementation Note**: The system uses a custom TSA verification implementation. We planned to migrate to `sigstore-tsa`, but deferred it due to Windows build constraints (`aws-lc-rs` requires CMake). This should be revisited when the build environment allows or `sigstore` dependencies become more flexible.
 3.  **Identity Verification (JWT)**:
     - The ID Token (OIDC) is validated (signature, issuer, audience).
     - **Critical**: The JWT expiry (`exp`) is checked against the **Timestamp**, not the current wall-clock time. This allows valid commands to be executed even if the short-lived generic OIDC token has since expired, provided the command was signed and timestamped *during* the token's validity window.
