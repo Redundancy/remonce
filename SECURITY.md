@@ -18,18 +18,40 @@ When the Agent receives a request, it performs the following strict verification
 2.  **Timestamp Verification**:
     - The Agent validates the RFC 3161 Timestamp Token.
     - It ensures the timestamp was issued for the specific signature + ID token provided.
-    - **Note**: Currently, the TSA signature itself is NOT strictly verified (see [PRODUCTION_READINESS.md](./PRODUCTION_READINESS.md)).
-    - **Implementation Note**: The system uses a custom TSA verification implementation. We planned to migrate to `sigstore-tsa`, but deferred it due to Windows build constraints (`aws-lc-rs` requires CMake). This should be revisited when the build environment allows or `sigstore` dependencies become more flexible.
-3.  **Identity Verification (JWT)**:
+    - **Verified**: The TSA signature is verified against trusted roots (full chain validation).
+    - **Implementation Note**: The system uses a custom TSA verification implementation intended to be compliant with RFC 3161 and RFC 5652. This may later be migrated to another library or implementation, but the current implementation is intended to be simple and self-contained without requiring cmake. 
+3.  **Identity Verification (JWT) & Nonce Binding**:
     - The ID Token (OIDC) is validated (signature, issuer, audience).
-    - **Critical**: The JWT expiry (`exp`) is checked against the **Timestamp**, not the current wall-clock time. This allows valid commands to be executed even if the short-lived generic OIDC token has since expired, provided the command was signed and timestamped *during* the token's validity window.
-4.  **Nonce Binding**:
-    - The Agent calculates the SHA-256 hash of the Public Key used to sign the command.
-    - It verifies that this hash matches the `nonce` claim in the ID Token. This cryptographically binds the ephemeral command signing key to the User's Identity.
-5.  **Authorization (OPA)**:
+    - **Nonce Binding**: The Agent calculates the SHA-256 hash of the Public Key used to sign the command and verifies that this hash matches the `nonce` claim in the ID Token.
+    - **Why this is safe**: This cryptographically binds the ephemeral command signing key to the User's Identity. Even if the JWT is intercepted, it cannot be used by an attacker unless they *also* possess the corresponding private key used to sign the command.
+    - **Delegation/Sharing**: This model explicitly supports *delegated execution*. An "Approver" can sign a command and share the full artifact (Command + Signature + JWT) with a "Runner" (e.g., a CI/CD job or another user). The Runner can trigger the execution on the Agent, but the Agent will log and authorize the action based on the *Approver's* identity (the one in the JWT), ensuring accountability without sharing private credentials.
+4.  **Authorization (OPA)**:
     - If all cryptographic checks pass, the Agent queries OPA.
     - Input includes: `command` payload, `jwt` (raw), and `timestamp`.
     - OPA evaluates the policy (e.g., `data.remonse.authz.decision`) to Allow/Deny.
+
+## Threat Model
+
+1.  **Compromised Command Payload**
+    *   *Attack*: Attacker modifies the command payload (e.g., changing the `command` field) after it was signed.
+    *   *Mitigation*: **ECDSA Signature**. The signature covers the entire payload. Any modification invalidates it.
+    *   *Note*: The payload `command` field is an **alias** (e.g., `backup-db`), not a raw shell command. The actual executable logic is defined and controlled on the Agent side. This prevents an attacker from injecting arbitrary code (like `rm -rf /`) even if they could forge a signature, as they are restricted to pre-defined allowed aliases.
+
+2.  **Replay Attacks (Long-term)**
+    *   *Attack*: Attacker captures a valid {Command + Signature + JWT} bundle and tries to execute it weeks later.
+    *   *Mitigation*: **Timestamp Authority (TSA)**. The agent verifies the timestamp token. If the timestamp is too old (policy configurable, or if the signing key/cert is expired/revoked), it is rejected. Also, the OIDC token has a short expiry, though our specialized logic allows expired JWTs *if* the timestamp proves it was signed *during* the valid window.
+
+3.  **Key Compromise (Ephemeral User Keys)**
+    *   *Attack*: Attacker steals the user's private signing key.
+    *   *Mitigation*: **Short-lived Keys & Tokens**. Keys are ephemeral (per session/command). The OIDC ID token bound to that key has a short lifespan (e.g., 5-15 mins). Once the ID token expires, the key is useless for *new* command generation unless the attacker can also re-authenticate to Vault to get a *new* ID token for that key.
+
+4.  **Man-in-the-Middle (MitM)**
+    *   *Attack*: Interception of traffic between Client and Agent.
+    *   *Mitigation*: **TLS (Planned)**. All communication should occur over HTTPS. *Note: Current implementation status (HTTP vs HTTPS) will be clarified as a prerequisite.*
+
+5.  **Malicious Approver (Insider Threat)**
+    *   *Attack*: A valid user with approval rights tries to run a malicious command.
+    *   *Mitigation*: **OPA Policy & Audit Trails**. OPA policies can restrict *what* commands can be run (allowlisting). Even if authorized, the immutable Audit Log records the exact command and identity of the signer.
 
 ## Audit Logging
 

@@ -1,3 +1,10 @@
+//! generate_golden
+//! 
+//! # Purpose
+//! This binary is a utility to generate a "Golden" Timestamp Token (TSA Token) for testing and verification purposes.
+//! It sends a known, fixed input ("golden-test-input-v1") to the configured Timestamp Authority (TSA)
+//! and saves the resulting token to `golden/token.der`. This allows for offline testing of the
+//! `tsa::verify_timestamp` logic without needing a live network connection or a valid OIDC session.
 use remonse::config;
 use remonse::tsa;
 use sha2::{Digest, Sha256};
