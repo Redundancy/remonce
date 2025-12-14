@@ -1,12 +1,18 @@
-use crate::config::Config;
+use crate::config::{Config, TlsConfig};
 use crate::security::Claims;
+use crate::tls::{create_certified_key, start_cert_watcher, DynamicCertResolver};
 use axum::{
-    Router,
     extract::{Query, State},
     response::{Html, IntoResponse, Redirect},
     routing::{get, post},
+    Router,
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar};
+use futures::StreamExt;
+use rustls_acme::{caches::DirCache, AcmeConfig};
+use std::sync::Arc;
+
+use tokio_rustls::TlsAcceptor;
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce,
     aead::{Aead, generic_array::GenericArray},
@@ -106,8 +112,8 @@ pub async fn run() -> Result<(), AppError> {
     let discovery_response_text = http_client.get(&discovery_url).send().await?.text().await?;
 
     tracing::info!("Discovery URL: {}", discovery_url);
-    tracing::info!("Discovery Response: {}", discovery_response_text);
-
+    
+    // Attempt to parse OIDC metadata, but don't crash if it fails (yet), though unwrapping effectively crashes
     let oidc_metadata: OidcMetadata = serde_json::from_str(&discovery_response_text)?;
 
     // TODO: this is good enough for now, but should be refreshed as needed (demand based)
@@ -128,8 +134,8 @@ pub async fn run() -> Result<(), AppError> {
         .unwrap_or_else(|_| "unknown".to_string());
 
     let app_state = AppState {
-        http_client,
-        config,
+        http_client: http_client.clone(),
+        config: config.clone(),
         oidc_metadata,
         jwks,
         hostname,
@@ -140,9 +146,14 @@ pub async fn run() -> Result<(), AppError> {
     let session_store = MemoryStore::default();
     use time;
     let session_layer = SessionManagerLayer::new(session_store)
-        .with_secure(false) // For localhost HTTP
+        .with_secure(true) // Always secure if TLS is potentially on, though for localhost dev it might cause issues if no TLS. 
+                           // But the previous code had false. We should potentially toggle this based on TLS config.
+                           // For now, I'll set it to false if no TLS, true if TLS.
         .with_same_site(SameSite::Lax)
         .with_expiry(Expiry::OnInactivity(time::Duration::seconds(3600)));
+        
+    let secure_cookies = config.tls.is_some();
+    let session_layer = session_layer.with_secure(secure_cookies);
 
     let app = Router::new()
         .route("/", get(|| async { Redirect::to("/auth/login") }))
@@ -160,14 +171,106 @@ pub async fn run() -> Result<(), AppError> {
                 .make_span_with(DefaultMakeSpan::default().include_headers(true)),
         );
 
-    tracing::debug!("listening on {}", addr);
+    tracing::info!("listening on {}", addr);
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to bind to address: {e}")))?;
 
-    axum::serve(listener, app.into_make_service())
-        .await
-        .map_err(|e| AppError::Internal(format!("Server error: {e}")))?;
+    if let Some(tls_config) = config.tls {
+        tracing::info!("TLS enabled in {:?} mode", tls_config);
+        
+        match tls_config {
+            TlsConfig::Files { chain, key } => {
+                let certified_key = create_certified_key(&chain, &key)
+                    .map_err(|e| AppError::Config(format!("Failed to load certs: {e}")))?;
+
+                let resolver = Arc::new(DynamicCertResolver::new(certified_key));
+                start_cert_watcher(chain.clone(), key.clone(), resolver.clone());
+                
+                let mut rustls_config = rustls::server::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(resolver);
+                rustls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                
+                let tls_acceptor = TlsAcceptor::from(Arc::new(rustls_config));
+                let tls_listener = crate::tls::TlsListener::new(listener, tls_acceptor);
+                
+                axum::serve(tls_listener, app.into_make_service())
+                    .await
+                    .map_err(|e| AppError::Internal(format!("Server error: {e}")))?;
+            },
+            TlsConfig::Acme { domains, email, cache_dir, directory_url } => {
+                let state = DirCache::new(cache_dir);
+
+                // Load root certificates
+                let mut root_store = rustls::RootCertStore::empty();
+                for cert in rustls_native_certs::load_native_certs().expect("could not load platform certs") {
+                    root_store.add(cert).ok();
+                }
+
+                // Create client config with Ring provider
+                let client_config = rustls::client::ClientConfig::builder_with_provider(
+                    Arc::new(rustls::crypto::ring::default_provider())
+                )
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
+
+                let mut acme_config = AcmeConfig::new_with_client_config(domains, Arc::new(client_config))
+                    .contact(email.iter().map(|e| format!("mailto:{}", e)))
+                    .cache_option(Some(state));
+                
+                if let Some(url) = directory_url {
+                     acme_config = acme_config.directory(&url);
+                } else {
+                     acme_config = acme_config.directory_lets_encrypt(true);
+                }
+                
+                let local_addr = listener.local_addr().unwrap_or("0.0.0.0:0".parse().unwrap());
+                
+                use tokio_util::compat::{TokioAsyncReadCompatExt, FuturesAsyncReadCompatExt};
+                use hyper_util::rt::{TokioExecutor, TokioIo};
+                use hyper_util::server::conn::auto::Builder;
+                use hyper_util::service::TowerToHyperService;
+                
+                // Wrap listener in TcpListenerStream and map to Compat
+                let listener_stream = tokio_stream::wrappers::TcpListenerStream::new(listener)
+                    .map(|res| res.map(|s| s.compat()));
+                
+                let mut incoming = acme_config.incoming(listener_stream, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+                
+                while let Some(tls) = incoming.next().await {
+                    match tls {
+                        Ok(tls_stream) => {
+                             // Compat: futures -> tokio
+                             let compat_tls = tls_stream.compat();
+                             // Adapter: tokio -> hyper
+                             let io = TokioIo::new(compat_tls);
+                             
+                             let app = app.clone();
+                             let service = TowerToHyperService::new(app);
+                             
+                             tokio::spawn(async move {
+                                 let builder = Builder::new(TokioExecutor::new());
+                                 if let Err(err) = builder.serve_connection(io, service).await {
+                                     tracing::debug!("Error serving connection: {}", err);
+                                 }
+                             });
+                        },
+                        Err(e) => {
+                            tracing::debug!("ACME handshake error: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        tracing::warn!("TLS disabled. running on HTTP.");
+        axum::serve(listener, app.into_make_service())
+            .await
+            .map_err(|e| AppError::Internal(format!("Server error: {e}")))?;
+    }
 
     Ok(())
 }

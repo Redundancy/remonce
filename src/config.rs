@@ -11,6 +11,9 @@ pub struct Config {
     #[serde(default = "default_listen_address")]
     pub listen_address: String,
 
+    /// TLS Configuration (optional).
+    pub tls: Option<TlsConfig>,
+
     /// Configuration for the RFC 3161 Timestamp Authority (TSA).
     #[serde(default)]
     pub timestamp_authority: TsaConfig,
@@ -143,6 +146,26 @@ pub struct CommandConfig {
     /// Defaults to 3 days if not specified.
     #[serde(default, with = "humantime_serde")]
     pub max_validity: Option<std::time::Duration>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TlsConfig {
+    /// Use local certificate files.
+    Files {
+        chain: String,
+        key: String,
+    },
+    /// Use ACME (Let's Encrypt or other).
+    Acme {
+        domains: Vec<String>,
+        email: Option<String>,
+        /// Directory to cache certificates.
+        cache_dir: String,
+        /// ACME Directory URL (e.g., https://acme-staging-v02.api.letsencrypt.org/directory).
+        /// If not provided, defaults to Let's Encrypt Production.
+        directory_url: Option<String>,
+    },
 }
 
 impl Config {

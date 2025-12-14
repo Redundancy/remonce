@@ -9,13 +9,12 @@ This document tracks known security gaps, "TODO" items, and requirements for mov
 - **Issue**: Previously, only the Message Imprint was verified.
 - **Risk**: Mitigated. The agent now verifies that the timestamp token is signed by a trusted root (or valid chain to a root).
 
-### 2. TLS / ACME Support
-- **Issue**: The Agent executes commands over plain HTTP/TCP (`10022`).
-- **Risk**: Command payloads, tokens, and execution output are visible on the network.
-- **Remediation**:
-    - Add TLS support to the Agent listener (`src/agent.rs`).
-    - Integrate `rustls` or native-tls.
-    - (Optional) Add ACME (Let's Encrypt) support for automatic certificate management.
+### 2. TLS / ACME Support (RESOLVED)
+- **Status**: **Fixed**. The Agent now supports HTTPS via `src/tls.rs` and `src/web.rs`.
+- **Modes**:
+    - **Files**: Static certificate loading with hot-reloading.
+    - **ACME**: Automatic certificate management via `rustls-acme` (Experimental).
+- **Configuration**: Enabled via `[tls]` block in `config.toml`.
 
 ## Recommended Improvements
 

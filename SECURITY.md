@@ -49,7 +49,7 @@ When the Agent receives a request, it performs the following strict verification
 
 4.  **Man-in-the-Middle (MitM)**
     *   *Attack*: Interception of traffic between Client and Agent.
-    *   *Mitigation*: **TLS (Planned)**. All communication should occur over HTTPS. *Note: Current implementation status (HTTP vs HTTPS) will be clarified as a prerequisite.*
+    *   *Mitigation*: **TLS (Implemented)**. All communication can be secured via HTTPS using either static certificates or automated ACME (Let's Encrypt). Configuration is handled via `config.toml` (`[tls]` section).
 
 5.  **Malicious Approver (Insider Threat)**
     *   *Attack*: A valid user with approval rights tries to run a malicious command.

@@ -11,14 +11,25 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 base64 = "0.22"
-x509-parser = "0.15"
+x509-parser = "0.18.0"
+
 
 # Web server framework
 axum = { version = "0.8.7", features = ["ws"] }
-axum-extra = { version = "0.10", features = ["cookie"] }
-tower = { version = "0.4", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+axum-extra = { version = "0.12.2", features = ["cookie"] }
 tower-http = { version = "0.6.8", features = ["cors", "fs", "trace"] }
 tower-sessions = "0.14.0"
+
+# TLS and File Watching
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+rustls-pemfile = "2.1"
+rustls-acme = { version = "0.14.1", default-features = false, features = ["axum", "ring", "tokio"] }
+notify = "8.2.0"
+futures = "0.3"
 
 # OIDC and Crypto
 url = "2.5"
@@ -26,9 +37,8 @@ sha2 = "0.10"
 p256 = { version = "0.13", features = ["ecdsa-core", "pem"] }
 rsa = { version = "0.9", features = ["sha2"] }
 spki = "0.7"
-ecdsa = { version = "0.16", features = ["signing", "verifying"] }
 chacha20poly1305 = "0.10"
-jsonwebtoken = { version = "9.3", features = ["use_pem"] }
+jsonwebtoken = { version = "10.2.0", default-features = false, features = ["use_pem", "rust_crypto"] }
 rand = "0.8.5"
 hex = "0.4"
 toml = "0.9.8"
@@ -60,3 +70,6 @@ path = "src/main.rs"
 [[bin]]
 name = "generate-golden"
 path = "cmd/generate_golden.rs"
+
+[dev-dependencies]
+rcgen = "0.14.6"

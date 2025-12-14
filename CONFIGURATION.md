@@ -20,6 +20,35 @@ listen_address = "127.0.0.1:8080"
 logs_dir = "logs"
 ```
 
+### TLS Configuration
+
+Secure the web server with HTTPS. Supports both static files and automatic ACME (Let's Encrypt).
+
+#### Mode: Files
+Uses local certificate files with hot-reloading support. This is ideal if you want to manage certificates with external tools like **Vault Agent** or **Certbot**.
+
+```toml
+[tls]
+mode = "files"
+chain = "./certs/fullchain.pem"
+key = "./certs/privkey.pem"
+```
+
+#### Mode: ACME
+Automatically manages certificates via ACME protocol.
+
+> [!WARNING]
+> **Experimental Feature**: ACME support is currently **untested**. Use with caution in production environments.
+
+```toml
+[tls]
+mode = "acme"
+domains = ["example.com", "www.example.com"]
+email = "admin@example.com" # Optional contact email
+cache_dir = "./certs"
+# directory_url = "..." # Optional: defaults to Let's Encrypt Production
+```
+
 ### Identity (OIDC)
 
 These settings connect the agent to your OIDC provider (Vault, Keycloak, etc.).

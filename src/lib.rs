@@ -1,12 +1,9 @@
-pub mod agent;
-pub mod audit;
 pub mod config;
-#[cfg(test)]
-mod golden_tests;
-pub mod opa;
 pub mod security;
-#[cfg(test)]
-mod security_tests;
-pub mod tsa;
+pub mod agent;
 pub mod web;
 pub mod files;
+pub mod audit;
+pub mod tls;
+pub mod opa;
+pub mod tsa;

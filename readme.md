@@ -39,7 +39,7 @@ Once verified, the Agent consults the **Open Policy Agent (OPA)** to determine i
 
 Remonse is designed for the rigorous demands of modern operations. It ensures **Cryptographic Non-Repudiation** by leveraging RFC 3161 Timestamping Authorities, making every action legally auditable. Access control is highly flexible and **Attribute-Based**, allowing policies to be defined on any user claim, membership (e.g., `webapp-users`), or context.
 
-From a usability standpoint, the system offers a **Secure UI** with a modern dark mode for ease of use, while the underlying **Real-time Monitoring** ensures operators have immediate visibility into execution results. Built in **Rust**, the agent is a lightweight, cross-platform binary that brings performance and safety to both Linux and Windows environments.
+From a usability standpoint, the system offers a **Secure UI** with a modern dark mode for ease of use, while the underlying **Real-time Monitoring** ensures operators have immediate visibility into execution results. **TLS Support** is available for securing communications, offering both file-based and (experimental) ACME automated certificate management. Built in **Rust**, the agent is a lightweight, cross-platform binary that brings performance and safety to both Linux and Windows environments.
 
 ---
 
