@@ -116,7 +116,3 @@ opa_rule = "data.remonse.authz.decision" # The OPA rule to query for authorizati
 executable = "ping"
 args = ["-n", "4", "127.0.0.1"]
 ```
-
-## Environment Variables
-
-Configuration can also be overridden by environment variables (prefixed with `remonse_` is planned, but currently `config.toml` is the primary source).

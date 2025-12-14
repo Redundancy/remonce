@@ -45,9 +45,12 @@ From a usability standpoint, the system offers a **Secure UI** with a modern dar
 
 ## Configuration
 
-The system is configured via `config.toml`. Key options include:
+The system is configured via `config.toml`. A complete reference is available in [CONFIGURATION.md](CONFIGURATION.md).
+
+Key options include:
 
 -   `[oidc]`: Identity Provider settings.
+-   `[tls]`: HTTPS configuration (Files or manual ACME).
 -   `[timestamp_authority]`: TSA URL and CA.
 -   `[[commands]]`: Whitelisted commands.
     -   `max_validity`: Maximum duration a token is valid for (e.g., "1h", "3d"). Defaults to "3d" if not specified.
