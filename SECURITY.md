@@ -55,6 +55,11 @@ When the Agent receives a request, it performs the following strict verification
     *   *Attack*: A valid user with approval rights tries to run a malicious command.
     *   *Mitigation*: **OPA Policy & Audit Trails**. OPA policies can restrict *what* commands can be run (allowlisting). Even if authorized, the immutable Audit Log records the exact command and identity of the signer.
 
+6.  **Shared Token Exposure**
+    *   *Attack*: When delegating execution, the recipient of a signed artifact gains access to the approver's JWT claims (email, groups, etc.).
+    *   *Scope*: This risk is **limited to systems using the same OIDC clientID**. The JWT cannot be used to authenticate to unrelated services.
+    *   *Mitigation*: **Dedicated ClientID** (strongly recommended), **short-lived JWTs**, **nonce binding** (JWT unusable for new commands without private key), **command allowlisting**, and **claim minimization** (request only necessary claims from IdP).
+
 ## Audit Logging
 
 Every execution attempt (Allowed or Denied) generates a structured audit log entry.
@@ -66,3 +71,67 @@ Every execution attempt (Allowed or Denied) generates a structured audit log ent
 - **User Keys**: Ephemeral ECDSA keys are generated client-side (in the browser or CLI) for each session or command.
 - **Identity Keys**: Managed by the OIDC Provider (Vault).
 - **TSA Keys**: Managed by the Timestamp Authority.
+
+## JWT Exposure Considerations
+
+When using the **delegation model** (where an Approver signs a command for a Runner to execute), the full JWT is visible to the recipient. This section outlines the risks and mitigations.
+
+### What Is Exposed
+
+The execution artifact includes the raw OIDC ID Token, which may contain:
+-   User identity (`sub`, `email`, `name`)
+-   Group memberships or roles
+-   Token metadata (`iat`, `exp`, `aud`)
+
+### Risk Scoping
+
+> [!IMPORTANT]
+> **Use a dedicated OIDC clientID for Remonse.** The JWT's `aud` (audience) claim limits its validity to services using that clientID. A dedicated clientID ensures the token cannot be replayed against other applications in your organization.
+
+### Claim Minimization Best Practices
+
+Reduce information exposure by configuring your IdP to issue minimal claims:
+
+-   **Prefer `roles` over `groups`**: Roles expose less organizational structure than group names.
+-   **Request minimal scopes**: Only request claims needed for OPA policy decisions.
+-   **Avoid PII if possible**: If your policy doesn't need `email` or `name`, don't request them.
+
+### Existing Mitigations
+
+| Mitigation | Effect |
+|------------|--------|
+| Short-lived JWTs | Token expires in minutes, limiting reuse window |
+| Nonce binding | JWT is cryptographically bound to the ephemeral key—unusable for new commands |
+| TSA timestamping | Proves command was signed during valid window, enabling post-hoc audit |
+| Command allowlisting | Even with a valid token, only pre-approved commands can execute |
+
+## Comparison with OpenPubkey
+
+Remonse uses the same core mechanism as [OpenPubkey](https://github.com/openpubkey/openpubkey): binding an ephemeral public key to an OIDC identity via the JWT `nonce` field.
+
+### Shared Security Properties
+
+-   **Ephemeral keys**: Generated per session, reducing key compromise window
+-   **Nonce binding**: IdP implicitly attests to key ownership
+-   **Proof-of-possession**: Upgrades bearer tokens to proof-of-possession
+-   **No IdP changes required**: Works with standard OIDC providers
+
+### Remonse's Additional Security
+
+| Feature | Benefit |
+|---------|---------|
+| **RFC 3161 TSA** | Cryptographic non-repudiation and time-bounding |
+| **OPA Integration** | Fine-grained, policy-as-code authorization |
+| **Command Allowlisting** | Restricts execution to pre-defined aliases |
+
+### OpenPubkey's MFA Cosigner
+
+OpenPubkey optionally supports an **MFA Cosigner**—an independent party that provides a second attestation, eliminating the IdP as a single point of compromise. This is not currently implemented in Remonse but could be a future enhancement for high-security environments.
+
+### Privacy Considerations
+
+Both Remonse and OpenPubkey expose JWT claims when sharing signed artifacts. Mitigate this through:
+-   **Dedicated clientID** (limits token scope)
+-   **Claim minimization** (reduce exposed PII)
+-   **Roles over groups** (less organizational exposure)
+

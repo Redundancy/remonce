@@ -22,7 +22,7 @@ A fundamental building block of this system is to enable users to sign a command
 
 ### The Chosen Approach: OIDC + Ephemeral Keys
 
-Similar to concepts like [zkLogin](https://docs.sui.io/concepts/cryptography/zklogin), we leverage the **nonce** of an OIDC ID Token to bind a public key to an identity.
+This architecture uses the same core mechanism as [OpenPubkey](https://github.com/openpubkey/openpubkey): leveraging the **nonce** of an OIDC ID Token to bind an ephemeral public key to an identity.
 
 1.  **Ephemeral Key Generation**: The client generates a random key pair for the session.
 2.  **Identity Binding**: The client authenticates with the IdP (Vault/OIDC), putting the hash of the Public Key into the JWT `nonce`.
@@ -31,6 +31,28 @@ Similar to concepts like [zkLogin](https://docs.sui.io/concepts/cryptography/zkl
     -   The **Signature** validates the command was signed by the Private Key.
     -   The **JWT** (signed by IdP) validates that the Public Key (in `nonce`) belongs to the User (in `sub`).
     -   The **IdP** (via JWKS) is trusted by the Agent.
+
+### Comparison with OpenPubkey
+
+OpenPubkey is an open-source protocol that augments OIDC with proof-of-possession—precisely what Remonse does. Both systems share the same foundational mechanism:
+
+| Aspect | Remonse & OpenPubkey |
+|--------|---------------------|
+| Core Binding | Embed public key hash in OIDC `nonce` |
+| Key Lifecycle | Ephemeral keys (per-session/command) |
+| IdP Role | Transforms IdP into implicit CA |
+| No IdP Changes | Works with unmodified OIDC providers |
+
+**Key Differences:**
+
+| Aspect | Remonse | OpenPubkey |
+|--------|---------|------------|
+| **Use Case** | Remote command execution | General identity signing |
+| **Timestamping** | RFC 3161 TSA for non-repudiation | Not standard |
+| **Policy Engine** | Built-in OPA integration | Application-specific |
+| **MFA Cosigner** | Not implemented | Optional (reduces single IdP trust) |
+
+Remonse extends the OpenPubkey concept with **integrated authorization** (OPA) and **cryptographic timestamping** (TSA), making it purpose-built for auditable command execution rather than general-purpose signing.
 
 ### Time-Bounding & Non-Repudiation
 
