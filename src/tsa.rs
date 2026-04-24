@@ -24,10 +24,45 @@ const TIMESTAMPING_EKU_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 
 const OID_SIGNED_DATA: &[u32] = &[1, 2, 840, 113549, 1, 7, 2];
 const OID_TST_INFO_CONTENT_TYPE: &[u32] = &[1, 2, 840, 113549, 1, 9, 16, 1, 4];
 const OID_SHA256: &[u32] = &[2, 16, 840, 1, 101, 3, 4, 2, 1];
-const OID_RSA_ENCRYPTION_STR: &str = "1.2.840.113549.1.1.1";
-const OID_EC_PUBLIC_KEY_STR: &str = "1.2.840.10045.2.1";
 const OID_CONTENT_TYPE: &[u32] = &[1, 2, 840, 113549, 1, 9, 3];
 const OID_MESSAGE_DIGEST: &[u32] = &[1, 2, 840, 113549, 1, 9, 4];
+
+// Digest OIDs (used when signer_info.signature_algorithm is plain rsaEncryption
+// and we need to dispatch on signer_info.digest_algorithm instead).
+const OID_SHA256_STR: &str = "2.16.840.1.101.3.4.2.1";
+const OID_SHA384_STR: &str = "2.16.840.1.101.3.4.2.2";
+const OID_SHA512_STR: &str = "2.16.840.1.101.3.4.2.3";
+
+// Signature algorithm OIDs for the SignerInfo `signature_algorithm` field.
+// Full list here: RFC 4055 (RSA), RFC 5758 (ECDSA), RFC 8017 (PSS).
+const OID_RSA_ENCRYPTION_STR: &str = "1.2.840.113549.1.1.1";
+const OID_RSA_SHA256_STR: &str = "1.2.840.113549.1.1.11";
+const OID_RSA_SHA384_STR: &str = "1.2.840.113549.1.1.12";
+const OID_RSA_SHA512_STR: &str = "1.2.840.113549.1.1.13";
+const OID_ECDSA_SHA256_STR: &str = "1.2.840.10045.4.3.2";
+const OID_ECDSA_SHA384_STR: &str = "1.2.840.10045.4.3.3";
+const OID_ECDSA_SHA512_STR: &str = "1.2.840.10045.4.3.4";
+
+/// Supported hash algorithms for signature verification, derived either from
+/// a combined RSA signature-algorithm OID or from the SignerInfo's
+/// `digest_algorithm` field.
+#[derive(Debug, Clone, Copy)]
+enum SigHash {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl SigHash {
+    fn digest(&self, msg: &[u8]) -> Vec<u8> {
+        use sha2::{Sha384, Sha512};
+        match self {
+            SigHash::Sha256 => Sha256::digest(msg).to_vec(),
+            SigHash::Sha384 => Sha384::digest(msg).to_vec(),
+            SigHash::Sha512 => Sha512::digest(msg).to_vec(),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TsaError {
@@ -451,58 +486,92 @@ fn verify_cms_signature(
         tst_info_bytes.to_vec()
     };
 
-    // Dispatch based on SubjectPublicKeyInfo algorithm OID
-    let spki_oid_str = signer_cert
-        .tbs_certificate
-        .subject_pki
-        .algorithm
-        .algorithm
-        .to_string();
+    // Dispatch on SignerInfo.signature_algorithm (authoritative — tells us
+    // both which key type AND which hash). Fall back to digest_algorithm only
+    // when the signature algorithm is the "plain" rsaEncryption OID.
+    let sig_alg_oid = signer_info.signature_algorithm.algorithm.to_string();
+    let digest_alg_oid = signer_info.digest_algorithm.algorithm.to_string();
 
-    if spki_oid_str == OID_RSA_ENCRYPTION_STR {
-        verify_signature_rsa(spki, &data_to_verify_sig, signer_info.signature.as_ref())
-            .map_err(|e| TsaError::Verification(format!("RSA Verification failed: {}", e)))?;
-    } else if spki_oid_str == OID_EC_PUBLIC_KEY_STR {
-        verify_signature_p256(spki, &data_to_verify_sig, signer_info.signature.as_ref())
-            .map_err(|e| TsaError::Verification(format!("P-256 Verification failed: {}", e)))?;
-    } else {
-        return Err(TsaError::Verification(format!(
-            "Unsupported PublicKey Algorithm OID: {}",
-            spki_oid_str
-        )));
-    }
+    match sig_alg_oid.as_str() {
+        OID_RSA_SHA256_STR => {
+            verify_signature_rsa(spki, &data_to_verify_sig, signer_info.signature.as_ref(), SigHash::Sha256)
+        }
+        OID_RSA_SHA384_STR => {
+            verify_signature_rsa(spki, &data_to_verify_sig, signer_info.signature.as_ref(), SigHash::Sha384)
+        }
+        OID_RSA_SHA512_STR => {
+            verify_signature_rsa(spki, &data_to_verify_sig, signer_info.signature.as_ref(), SigHash::Sha512)
+        }
+        OID_RSA_ENCRYPTION_STR => {
+            // Plain rsaEncryption — hash is whatever digest_algorithm says.
+            let hash = parse_digest_oid(&digest_alg_oid)?;
+            verify_signature_rsa(spki, &data_to_verify_sig, signer_info.signature.as_ref(), hash)
+        }
+        OID_ECDSA_SHA256_STR | OID_ECDSA_SHA384_STR | OID_ECDSA_SHA512_STR => {
+            // p256::ecdsa::Verifier binds P-256 to SHA-256; non-256 hashes on
+            // a P-256 key are ill-formed and will fail the verify call.
+            verify_signature_p256(spki, &data_to_verify_sig, signer_info.signature.as_ref())
+        }
+        _ => Err(TsaError::Verification(format!(
+            "Unsupported SignerInfo signature algorithm OID: {}",
+            sig_alg_oid
+        ))),
+    }?;
 
     // Verify Trust Chain (EKU, validity window, signature, path) via rustls-webpki.
     verify_trust_chain(signer_cert_der, &certs_der, trusted_roots, gen_time)?;
     Ok(())
 }
 
-fn verify_signature_p256(spki: &[u8], msg: &[u8], signature_bytes: &[u8]) -> Result<(), String> {
+fn parse_digest_oid(oid: &str) -> Result<SigHash, TsaError> {
+    match oid {
+        OID_SHA256_STR => Ok(SigHash::Sha256),
+        OID_SHA384_STR => Ok(SigHash::Sha384),
+        OID_SHA512_STR => Ok(SigHash::Sha512),
+        other => Err(TsaError::Verification(format!(
+            "Unsupported SignerInfo digest algorithm OID: {}",
+            other
+        ))),
+    }
+}
+
+fn verify_signature_p256(spki: &[u8], msg: &[u8], signature_bytes: &[u8]) -> Result<(), TsaError> {
     let verifying_key = VerifyingKey::from_sec1_bytes(spki)
-        .map_err(|e| format!("Invalid P-256 SPKI (SEC1): {}", e))?;
+        .map_err(|e| TsaError::Verification(format!("Invalid P-256 SPKI (SEC1): {}", e)))?;
 
     use p256::ecdsa::signature::Verifier;
     let signature = Signature::from_der(signature_bytes)
-        .map_err(|e| format!("Invalid DER signature: {}", e))?;
+        .map_err(|e| TsaError::Verification(format!("Invalid DER signature: {}", e)))?;
 
     verifying_key
         .verify(msg, &signature)
-        .map_err(|_| "Invalid signature".to_string())
+        .map_err(|_| TsaError::Verification("P-256 signature verification failed".into()))
 }
 
-fn verify_signature_rsa(spki: &[u8], msg: &[u8], signature_bytes: &[u8]) -> Result<(), String> {
+fn verify_signature_rsa(
+    spki: &[u8],
+    msg: &[u8],
+    signature_bytes: &[u8],
+    hash_alg: SigHash,
+) -> Result<(), TsaError> {
     use rsa::pkcs1::DecodeRsaPublicKey;
     use rsa::{Pkcs1v15Sign, RsaPublicKey};
+    use sha2::{Sha384, Sha512};
 
-    let public_key =
-        RsaPublicKey::from_pkcs1_der(spki).map_err(|e| format!("Invalid RSA SPKI: {}", e))?;
+    let public_key = RsaPublicKey::from_pkcs1_der(spki)
+        .map_err(|e| TsaError::Verification(format!("Invalid RSA SPKI: {}", e)))?;
 
-    // Hash the message (SHA-256 assumed for now, usually matches digestAlgorithm)
-    let hash = Sha256::digest(msg);
+    let hash = hash_alg.digest(msg);
+
+    let scheme = match hash_alg {
+        SigHash::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
+        SigHash::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
+        SigHash::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
+    };
 
     public_key
-        .verify(Pkcs1v15Sign::new::<Sha256>(), &hash, signature_bytes)
-        .map_err(|e| format!("RSA Verification failed: {}", e))
+        .verify(scheme, &hash, signature_bytes)
+        .map_err(|e| TsaError::Verification(format!("RSA verification failed: {}", e)))
 }
 
 /// Verify the end-entity TSA signer cert chains to a trusted root, was valid
