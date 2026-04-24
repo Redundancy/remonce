@@ -6,16 +6,12 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use axum_extra::extract::cookie::{Cookie, CookieJar};
 
-use chacha20poly1305::{
-    ChaCha20Poly1305, KeyInit, Nonce,
-    aead::{Aead, generic_array::GenericArray},
-};
 use p256::{
     ecdsa::{SigningKey, signature::Signer},
     pkcs8::EncodePublicKey,
 };
+use p256::elliptic_curve::generic_array::GenericArray;
 use rand::{RngCore, rngs::OsRng};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -77,12 +73,17 @@ pub struct AppState {
 }
 
 /// Data stored in the session during the OIDC login flow.
+///
+/// `signing_key_hex` is the raw P-256 scalar (hex-encoded for JSON session
+/// serialization). The web tier is loopback-only and uses an in-memory session
+/// store, so the key never leaves this process; there is no cross-host exposure
+/// to encrypt against.
 #[derive(Serialize, Deserialize)]
 struct OidcFlowState {
     pkce_verifier: String,
     state: String,
     ephemeral_public_key_pem: String,
-    encrypted_private_key_hex: String,
+    signing_key_hex: String,
 }
 
 /// Data stored in the session after a user has logged in.
@@ -90,7 +91,7 @@ struct OidcFlowState {
 struct UserProfile {
     subject: String,
     id_token: String,
-    encrypted_private_key_hex: String,
+    signing_key_hex: String,
     public_key_pem: String,
 }
 
@@ -269,60 +270,41 @@ async fn render_template(
 async fn login_handler(
     State(state): State<AppState>,
     session: Session,
-    jar: CookieJar,
-) -> Result<(CookieJar, Redirect), AppError> {
-    // 1. Generate ephemeral keypair for signing
+) -> Result<Redirect, AppError> {
+    // 1. Generate ephemeral keypair for signing. Lives entirely in the
+    //    server-side session; we are loopback-only so there is no cross-host
+    //    exposure to encrypt against.
     let signing_key = SigningKey::random(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
+    let signing_key_hex = hex::encode(signing_key.to_bytes());
 
-    // 2. Symmetrically encrypt the private key
-    let mut symmetric_key_bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut symmetric_key_bytes);
-    let cipher = ChaCha20Poly1305::new(&symmetric_key_bytes.into());
-
-    let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let encrypted_private_key = cipher
-        .encrypt(nonce, signing_key.to_bytes().as_slice())
-        .map_err(|e| AppError::Internal(format!("Failed to encrypt private key: {e}")))?;
-
-    // Combine nonce and ciphertext for storage
-    let encrypted_private_key_hex =
-        hex::encode([nonce.as_slice(), &encrypted_private_key].concat());
-
-    // 3. Hash public key to create the OIDC nonce
+    // 2. Hash public key to create the OIDC nonce (binds the IdP-issued JWT
+    //    to this specific ephemeral key — the core OIDC+ephemeral pattern).
     let public_key_pem = verifying_key
         .to_public_key_pem(spki::der::pem::LineEnding::LF)
         .map_err(|e| AppError::Internal(format!("Failed to encode public key to PEM: {e}")))?;
     let oidc_nonce = hex::encode(Sha256::digest(public_key_pem.as_bytes()));
 
-    // 4. Generate OIDC state and PKCE
-    let mut state_bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut state_bytes);
-    let oidc_state = hex::encode(state_bytes);
+    // 3. Generate OIDC state and PKCE
+    let oidc_state = {
+        let mut state_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut state_bytes);
+        hex::encode(state_bytes)
+    };
 
     let (pkce_challenge, pkce_verifier) = pkce::generate_pkce_challenge();
 
-    // 5. Store all cryptographic material in the session
+    // 4. Store flow state in session.
     let flow_state = OidcFlowState {
         pkce_verifier,
         state: oidc_state.clone(),
         ephemeral_public_key_pem: public_key_pem,
-        encrypted_private_key_hex,
+        signing_key_hex,
     };
     session.insert(SESSION_KEY, flow_state).await?;
     tracing::info!("Login: Session state inserted. Redirecting to auth provider.");
 
-    let cookie = Cookie::build(("remonse_key", hex::encode(symmetric_key_bytes)))
-        .path("/")
-        .http_only(true)
-        .same_site(axum_extra::extract::cookie::SameSite::Lax)
-        .build();
-    let jar = jar.add(cookie);
-
-    // 6. Build the redirect URL
+    // 5. Build the redirect URL.
     let mut auth_url: url::Url = state
         .oidc_metadata
         .authorization_endpoint
@@ -339,7 +321,7 @@ async fn login_handler(
         .append_pair("code_challenge", &pkce_challenge)
         .append_pair("code_challenge_method", "S256");
 
-    Ok((jar, Redirect::to(auth_url.as_ref())))
+    Ok(Redirect::to(auth_url.as_ref()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,7 +428,7 @@ async fn callback_handler(
     let user_profile = UserProfile {
         subject: token_data.claims.sub,
         id_token: token_response.id_token,
-        encrypted_private_key_hex: flow_state.encrypted_private_key_hex,
+        signing_key_hex: flow_state.signing_key_hex,
         public_key_pem: flow_state.ephemeral_public_key_pem,
     };
     session.insert(SESSION_KEY, user_profile).await?;
@@ -466,27 +448,15 @@ struct CosignRequest {
     approver: crate::security::ApproverBundle,
 }
 
-/// Decrypt the session's ephemeral signing key using the per-request cookie key.
-fn load_signing_key(profile: &UserProfile, jar: &CookieJar) -> Result<SigningKey, AppError> {
-    let symmetric_key_hex = jar
-        .get("remonse_key")
-        .map(|c| c.value().to_string())
-        .ok_or(AppError::Auth("Missing decryption key cookie".into()))?;
-    let symmetric_key_bytes = hex::decode(symmetric_key_hex)
-        .map_err(|_| AppError::Auth("Invalid decryption key format".into()))?;
-
-    let encrypted_data = hex::decode(&profile.encrypted_private_key_hex)
-        .map_err(|_| AppError::Internal("Invalid encrypted key format".into()))?;
-    if encrypted_data.len() < 12 {
-        return Err(AppError::Internal("Encrypted key too short".into()));
-    }
-    let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&symmetric_key_bytes));
-    let signing_key_bytes = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| AppError::Auth("Failed to decrypt private key. Invalid key?".into()))?;
-    SigningKey::from_bytes(GenericArray::from_slice(&signing_key_bytes))
+/// Load the session's ephemeral signing key.
+///
+/// The key is stored raw in the server-side session (see `OidcFlowState`
+/// and `UserProfile`). The web tier is loopback-only so there is no
+/// cross-host exposure to encrypt at rest against.
+fn load_signing_key(profile: &UserProfile) -> Result<SigningKey, AppError> {
+    let bytes = hex::decode(&profile.signing_key_hex)
+        .map_err(|_| AppError::Internal("Invalid signing key hex".into()))?;
+    SigningKey::from_bytes(GenericArray::from_slice(&bytes))
         .map_err(|_| AppError::Internal("Invalid signing key bytes".into()))
 }
 
@@ -497,7 +467,6 @@ fn load_signing_key(profile: &UserProfile, jar: &CookieJar) -> Result<SigningKey
 async fn sign_handler(
     State(state): State<AppState>,
     session: Session,
-    jar: CookieJar,
     axum::Json(req): axum::Json<SignRequest>,
 ) -> Result<axum::Json<crate::security::ExecutionBundle>, AppError> {
     let profile: UserProfile = session
@@ -505,7 +474,7 @@ async fn sign_handler(
         .await?
         .ok_or(AppError::Auth("Not logged in".into()))?;
 
-    let signing_key = load_signing_key(&profile, &jar)?;
+    let signing_key = load_signing_key(&profile)?;
 
     let canonical =
         crate::security::canonical_approver_payload(&req.command, &req.operator_requires);
@@ -541,7 +510,6 @@ async fn sign_handler(
 async fn cosign_handler(
     State(state): State<AppState>,
     session: Session,
-    jar: CookieJar,
     axum::Json(req): axum::Json<CosignRequest>,
 ) -> Result<axum::Json<crate::security::ExecutionBundle>, AppError> {
     let profile: UserProfile = session
@@ -549,7 +517,7 @@ async fn cosign_handler(
         .await?
         .ok_or(AppError::Auth("Not logged in".into()))?;
 
-    let signing_key = load_signing_key(&profile, &jar)?;
+    let signing_key = load_signing_key(&profile)?;
 
     let mut payload = req.approver.signature.as_bytes().to_vec();
     payload.extend_from_slice(profile.public_key_pem.as_bytes());
