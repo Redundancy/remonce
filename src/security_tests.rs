@@ -1,12 +1,15 @@
 #[cfg(test)]
 mod tests {
-    use crate::security::{ExecutionRequest, ValidationError, VerifierConfig, verify_execution};
+    use crate::security::{
+        ApproverBundle, ClaimPredicate, ExecutionBundle, OperatorConstraint, OperatorCosign,
+        ValidationError, VerifierConfig, canonical_approver_payload, verify_execution,
+    };
     use crate::tsa::{MessageImprint, TSTInfo};
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use chrono;
     use jsonwebtoken::jwk::{Jwk, JwkSet};
-    use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer};
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
     use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
     use rand::rngs::OsRng;
     use rasn::prelude::*;
@@ -19,14 +22,14 @@ mod tests {
     };
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    use std::time::Duration as StdDuration;
     use time::{Duration, OffsetDateTime};
 
-    // --- Helpers ---
+    // --- Key helpers ---
 
     struct TestKeys {
         signing_key: SigningKey,
         kid: String,
-        jwk_set: JwkSet,
         public_key_pem: String,
     }
 
@@ -35,34 +38,33 @@ mod tests {
         signing_key: SigningKey,
     }
 
-    fn setup_keys() -> TestKeys {
+    fn setup_keys(kid: &str) -> TestKeys {
         let signing_key = SigningKey::random(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
-        let kid = "test-key-1".to_string();
 
         let public_key_pem = verifying_key
             .to_public_key_pem(p256::pkcs8::LineEnding::LF)
             .unwrap();
 
-        let public_key_jwk = serde_json::json!({
+        TestKeys {
+            signing_key,
+            kid: kid.to_string(),
+            public_key_pem,
+        }
+    }
+
+    fn keys_to_jwk(keys: &TestKeys) -> Jwk {
+        let verifying_key = keys.signing_key.verifying_key();
+        let j = serde_json::json!({
             "kty": "EC",
             "crv": "P-256",
             "x": URL_SAFE_NO_PAD.encode(verifying_key.to_encoded_point(false).x().unwrap()),
             "y": URL_SAFE_NO_PAD.encode(verifying_key.to_encoded_point(false).y().unwrap()),
-            "kid": kid,
+            "kid": keys.kid,
             "use": "sig",
             "alg": "ES256"
         });
-
-        let jwk: Jwk = serde_json::from_value(public_key_jwk).expect("Failed to create JWK");
-        let jwk_set = JwkSet { keys: vec![jwk] };
-
-        TestKeys {
-            signing_key,
-            kid,
-            jwk_set,
-            public_key_pem,
-        }
+        serde_json::from_value(j).expect("Failed to create JWK")
     }
 
     fn create_valid_jwt(
@@ -72,6 +74,7 @@ mod tests {
         subject: &str,
         nonce: &str,
         expiry: OffsetDateTime,
+        extra_claims: serde_json::Value,
     ) -> String {
         let header = jsonwebtoken::Header {
             alg: jsonwebtoken::Algorithm::ES256,
@@ -79,22 +82,19 @@ mod tests {
             ..Default::default()
         };
 
-        #[derive(serde::Serialize)]
-        struct TestClaims {
-            sub: String,
-            iss: String,
-            aud: String,
-            exp: i64,
-            nonce: String,
+        let mut claims = serde_json::json!({
+            "sub": subject,
+            "iss": issuer,
+            "aud": audience,
+            "exp": expiry.unix_timestamp(),
+            "nonce": nonce,
+            "username": subject,
+        });
+        if let Some(obj) = extra_claims.as_object() {
+            for (k, v) in obj {
+                claims[k] = v.clone();
+            }
         }
-
-        let claims = TestClaims {
-            sub: subject.to_string(),
-            iss: issuer.to_string(),
-            aud: audience.to_string(),
-            exp: expiry.unix_timestamp(),
-            nonce: nonce.to_string(),
-        };
 
         let private_key_pem = keys
             .signing_key
@@ -106,25 +106,22 @@ mod tests {
         jsonwebtoken::encode(&header, &claims, &encoding_key).unwrap()
     }
 
-    // Generates a minimal Self-Signed X.509 Certificate for testing
     fn generate_tsa_keys() -> TsaKeys {
         let signing_key = SigningKey::random(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
         let spki_der = verifying_key.to_public_key_der().unwrap();
 
-        let mut spki_info: SubjectPublicKeyInfo =
+        let spki_info: SubjectPublicKeyInfo =
             rasn::der::decode(spki_der.as_bytes()).expect("Failed to decode generated SPKI");
 
         let sig_alg_oid = ObjectIdentifier::new_unchecked(std::borrow::Cow::Borrowed(&[
             1, 2, 840, 10045, 4, 3, 2,
-        ])); // ecdsa-with-SHA256
+        ]));
         let sig_alg = AlgorithmIdentifier {
             algorithm: sig_alg_oid.clone(),
             parameters: None,
         };
 
-        // Construct Name (RDNSequence) manually
-        // CN=Test TSA
         let common_name_oid =
             ObjectIdentifier::new_unchecked(std::borrow::Cow::Borrowed(&[2, 5, 4, 3]));
         let cn_value = rasn::der::encode(&Utf8String::from("Test TSA")).unwrap();
@@ -135,10 +132,24 @@ mod tests {
             value: Any::new(cn_value),
         });
 
-        // Wrap in Vec (RDNSequence) -> rasn_cms::Name::RdnSequence
         let rdn_sequence = vec![rdn_set.into()];
         let issuer_name = rasn_cms::Name::RdnSequence(rdn_sequence.clone());
         let subject_name = rasn_cms::Name::RdnSequence(rdn_sequence);
+
+        // Build ExtendedKeyUsage extension with id-kp-timeStamping so webpki
+        // accepts this cert as a TSA signer.
+        let timestamping_oid = ObjectIdentifier::new_unchecked(std::borrow::Cow::Borrowed(&[
+            1, 3, 6, 1, 5, 5, 7, 3, 8,
+        ]));
+        let eku_inner: Vec<ObjectIdentifier> = vec![timestamping_oid];
+        let eku_der = rasn::der::encode(&eku_inner).unwrap();
+        let ext_ext_key_usage_oid =
+            ObjectIdentifier::new_unchecked(std::borrow::Cow::Borrowed(&[2, 5, 29, 37]));
+        let eku_extension = rasn_pkix::Extension {
+            extn_id: ext_ext_key_usage_oid,
+            critical: false,
+            extn_value: OctetString::from(eku_der),
+        };
 
         let tbs = TbsCertificate {
             version: rasn_pkix::Version::V3,
@@ -146,7 +157,11 @@ mod tests {
             signature: sig_alg.clone(),
             issuer: issuer_name,
             validity: Validity {
-                not_before: rasn_pkix::Time::Utc(rasn::types::UtcTime::from(chrono::Utc::now())),
+                // Backdate not_before so tests can reference "gen_time in the past"
+                // without tripping webpki's NotValidYet check.
+                not_before: rasn_pkix::Time::Utc(rasn::types::UtcTime::from(
+                    chrono::Utc::now() - chrono::Duration::days(365),
+                )),
                 not_after: rasn_pkix::Time::Utc(rasn::types::UtcTime::from(
                     chrono::Utc::now() + chrono::Duration::days(365),
                 )),
@@ -155,18 +170,17 @@ mod tests {
             subject_public_key_info: spki_info,
             issuer_unique_id: None,
             subject_unique_id: None,
-            extensions: None,
+            extensions: Some(vec![eku_extension].into()),
         };
 
         let tbs_bytes = rasn::der::encode(&tbs).expect("Failed to encode TBS");
-
-        // Sign TBS
         let signature: Signature = signing_key.sign(&tbs_bytes);
 
         let cert = Certificate {
             tbs_certificate: tbs,
             signature_algorithm: sig_alg,
-            signature_value: BitString::from_slice(&signature.to_bytes()),
+            // X.509 encodes ECDSA signatures as DER SEQUENCE { r, s }, not raw r||s.
+            signature_value: BitString::from_slice(signature.to_der().as_bytes()),
         };
 
         let cert_der = rasn::der::encode(&cert).expect("Failed to encode Cert");
@@ -177,9 +191,7 @@ mod tests {
         }
     }
 
-    // Constructs a valid signed RFC 3161 Timestamp Token
     fn create_mock_timestamp(data: &[u8], gen_time: OffsetDateTime, tsa_keys: &TsaKeys) -> String {
-        // 1. Message Imprint
         let hash = Sha256::digest(data);
         let sha256_oid = ObjectIdentifier::new_unchecked(std::borrow::Cow::Borrowed(&[
             2, 16, 840, 1, 101, 3, 4, 2, 1,
@@ -194,13 +206,11 @@ mod tests {
             hashed_message: OctetString::from(hash.as_slice().to_vec()),
         };
 
-        // 2. TSTInfo
         let unix_timestamp = gen_time.unix_timestamp();
         let nanos = gen_time.nanosecond();
         let chrono_time = chrono::DateTime::from_timestamp(unix_timestamp, nanos)
             .unwrap()
             .with_timezone(&chrono::FixedOffset::east_opt(0).unwrap());
-
         let rasn_time = rasn::types::GeneralizedTime::from(chrono_time);
 
         let tst_info = TSTInfo {
@@ -218,7 +228,6 @@ mod tests {
 
         let tst_info_bytes = rasn::der::encode(&tst_info).unwrap();
 
-        // 3. EncapsulatedContentInfo
         let tst_info_oid = ObjectIdentifier::new_unchecked(std::borrow::Cow::Borrowed(&[
             1, 2, 840, 113549, 1, 9, 16, 1, 4,
         ]));
@@ -227,17 +236,12 @@ mod tests {
             content: Some(OctetString::from(tst_info_bytes.clone())),
         };
 
-        // 4. SignerInfo & Valid Signature
-        // Digest Alg
         let digest_alg = AlgorithmIdentifier {
             algorithm: sha256_oid,
             parameters: None,
         };
-
-        // Signature
         let signature: Signature = tsa_keys.signing_key.sign(&tst_info_bytes);
 
-        // Sid: IssuerAndSerialNumber
         let common_name_oid =
             ObjectIdentifier::new_unchecked(std::borrow::Cow::Borrowed(&[2, 5, 4, 3]));
         let cn_value = rasn::der::encode(&Utf8String::from("Test TSA")).unwrap();
@@ -255,7 +259,7 @@ mod tests {
 
         let sig_alg_oid = ObjectIdentifier::new_unchecked(std::borrow::Cow::Borrowed(&[
             1, 2, 840, 10045, 4, 3, 2,
-        ])); // ecdsa-with-SHA256
+        ]));
         let sig_alg = AlgorithmIdentifier {
             algorithm: sig_alg_oid,
             parameters: None,
@@ -263,7 +267,7 @@ mod tests {
 
         let signer_info = SignerInfo {
             version: Integer::from(1),
-            sid: sid,
+            sid,
             digest_algorithm: digest_alg,
             signed_attrs: None,
             signature_algorithm: sig_alg,
@@ -271,9 +275,7 @@ mod tests {
             unsigned_attrs: None,
         };
 
-        // 5. SignedData
         let cert_decoded: Certificate = rasn::der::decode(&tsa_keys.cert_der).unwrap();
-        // Box it for the enum variant
         let certs = SetOf::from_vec(vec![rasn_cms::CertificateChoices::Certificate(Box::new(
             cert_decoded,
         ))]);
@@ -289,7 +291,6 @@ mod tests {
 
         let signed_data_bytes = rasn::der::encode(&signed_data).unwrap();
 
-        // 6. ContentInfo
         let signed_data_oid = ObjectIdentifier::new_unchecked(std::borrow::Cow::Borrowed(&[
             1, 2, 840, 113549, 1, 7, 2,
         ]));
@@ -301,319 +302,354 @@ mod tests {
         hex::encode(rasn::der::encode(&content_info).unwrap())
     }
 
-    // --- Tests ---
+    // --- Bundle builders ---
+
+    struct Env {
+        tsa_keys: TsaKeys,
+        approver: TestKeys,
+        operator: TestKeys,
+        jwks: JwkSet,
+    }
+
+    fn new_env() -> Env {
+        let approver = setup_keys("approver-kid");
+        let operator = setup_keys("operator-kid");
+        let jwks = JwkSet {
+            keys: vec![keys_to_jwk(&approver), keys_to_jwk(&operator)],
+        };
+        Env {
+            tsa_keys: generate_tsa_keys(),
+            approver,
+            operator,
+            jwks,
+        }
+    }
+
+    fn build_approver_bundle(
+        env: &Env,
+        command: serde_json::Value,
+        operator_requires: Option<OperatorConstraint>,
+        approver_signed_at: OffsetDateTime,
+        approver_groups: Vec<&str>,
+    ) -> ApproverBundle {
+        let canonical = canonical_approver_payload(&command, &operator_requires);
+        let sig: p256::ecdsa::Signature = env.approver.signing_key.sign(canonical.as_bytes());
+        let sig_bytes = sig.to_bytes();
+        let sig_hex = hex::encode(sig_bytes);
+
+        let nonce = hex::encode(Sha256::digest(env.approver.public_key_pem.as_bytes()));
+        let id_token = create_valid_jwt(
+            &env.approver,
+            "https://issuer.example",
+            "remonse",
+            "alice",
+            &nonce,
+            approver_signed_at + Duration::minutes(30),
+            serde_json::json!({ "groups": approver_groups }),
+        );
+
+        let mut data = sig_bytes.to_vec();
+        data.extend_from_slice(id_token.as_bytes());
+        let timestamp_token = create_mock_timestamp(&data, approver_signed_at, &env.tsa_keys);
+
+        ApproverBundle {
+            command,
+            operator_requires,
+            signature: sig_hex,
+            id_token,
+            public_key: env.approver.public_key_pem.clone(),
+            timestamp_token,
+        }
+    }
+
+    fn build_operator_cosign(
+        env: &Env,
+        approver_sig_hex: &str,
+        operator_signed_at: OffsetDateTime,
+        operator_groups: Vec<&str>,
+    ) -> OperatorCosign {
+        let mut payload = approver_sig_hex.as_bytes().to_vec();
+        payload.extend_from_slice(env.operator.public_key_pem.as_bytes());
+        let sig: p256::ecdsa::Signature = env.operator.signing_key.sign(&payload);
+        let sig_bytes = sig.to_bytes();
+
+        let nonce = hex::encode(Sha256::digest(env.operator.public_key_pem.as_bytes()));
+        let id_token = create_valid_jwt(
+            &env.operator,
+            "https://issuer.example",
+            "remonse",
+            "bob",
+            &nonce,
+            operator_signed_at + Duration::minutes(30),
+            serde_json::json!({ "groups": operator_groups }),
+        );
+
+        let mut tsa_data = sig_bytes.to_vec();
+        tsa_data.extend_from_slice(id_token.as_bytes());
+        let timestamp_token = create_mock_timestamp(&tsa_data, operator_signed_at, &env.tsa_keys);
+
+        OperatorCosign {
+            approver_sig: approver_sig_hex.to_string(),
+            signature: hex::encode(sig_bytes),
+            id_token,
+            public_key: env.operator.public_key_pem.clone(),
+            timestamp_token,
+        }
+    }
+
+    fn verifier_config(env: &Env) -> VerifierConfig {
+        VerifierConfig {
+            client_id: "remonse".into(),
+            issuer_url: "https://issuer.example".into(),
+            jwks: env.jwks.clone(),
+            trusted_roots: vec![env.tsa_keys.cert_der.clone()],
+            approver_max_validity: StdDuration::from_secs(3 * 24 * 60 * 60), // 3 days
+            operator_max_validity: StdDuration::from_secs(10 * 60),          // 10 minutes
+        }
+    }
+
+    // --- Self-execute tests ---
 
     #[test]
-    fn test_verify_execution_happy_path() {
-        let keys = setup_keys();
-        let tsa_keys = generate_tsa_keys();
-
-        let command = json!({"command": "test-cmd", "args": []});
-        let command_str = command.to_string();
-
-        // Sign Command
-        let signature: p256::ecdsa::Signature = keys.signing_key.sign(command_str.as_bytes());
-        let signature_hex = hex::encode(signature.to_bytes());
-
-        // Generate Keys/Nonce
-        let public_key_hash = hex::encode(Sha256::digest(keys.public_key_pem.as_bytes()));
-
-        // Valid Time
+    fn self_execute_fresh_is_authorized() {
+        let env = new_env();
         let now = OffsetDateTime::now_utc();
-        let exp = now + Duration::minutes(5);
-
-        let id_token = create_valid_jwt(
-            &keys,
-            "https://issuer.com",
-            "my-client",
-            "user123",
-            &public_key_hash,
-            exp,
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now,
+            vec!["approvers"],
         );
-
-        // Timestamp Data
-        let mut data_to_timestamp = signature.to_bytes().to_vec();
-        data_to_timestamp.extend_from_slice(id_token.as_bytes());
-
-        let timestamp_token_hex = create_mock_timestamp(&data_to_timestamp, now, &tsa_keys);
-
-        let config = VerifierConfig {
-            client_id: "my-client".to_string(),
-            issuer_url: "https://issuer.com".to_string(),
-            jwks: keys.jwk_set.clone(),
-            trusted_roots: vec![tsa_keys.cert_der.clone()], // Trust the TSA cert
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
         };
-
-        let req = ExecutionRequest {
-            command: command,
-            signature_hex,
-            id_token,
-            public_key_pem: keys.public_key_pem.clone(),
-            timestamp_token_hex,
-        };
-
-        let result = verify_execution(&req, &config);
-        assert!(result.is_ok(), "Verification failed: {:?}", result.err());
-        let user = result.unwrap();
-        assert_eq!(user.username, "user123");
-        assert!((user.timestamp - now).abs() < Duration::seconds(1));
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(result.is_ok(), "expected ok, got {:?}", result.err());
+        let a = result.unwrap();
+        assert!(a.self_executed);
+        assert_eq!(a.approver.username, "alice");
+        assert_eq!(a.operator.username, "alice");
     }
 
     #[test]
-    fn test_reject_invalid_command_signature() {
-        let keys = setup_keys();
-        let tsa_keys = generate_tsa_keys();
-        let command = json!({"command": "test-cmd"});
-        let other_command = json!({"command": "other"});
-
-        // Sign WRONG command
-        let signature: p256::ecdsa::Signature =
-            keys.signing_key.sign(other_command.to_string().as_bytes());
-        let signature_hex = hex::encode(signature.to_bytes());
-
-        let req = ExecutionRequest {
-            command: command,
-            signature_hex,
-            id_token: "dummy".into(),
-            public_key_pem: keys.public_key_pem.clone(),
-            timestamp_token_hex: "dummy".into(),
-        };
-
-        let config = VerifierConfig {
-            client_id: "id".into(),
-            issuer_url: "url".into(),
-            jwks: keys.jwk_set.clone(),
-            trusted_roots: vec![],
-        };
-
-        let result = verify_execution(&req, &config);
-        assert!(matches!(
-            result,
-            Err(ValidationError::SignatureVerificationFailed)
-        ));
-    }
-
-    #[test]
-    fn test_reject_timestamp_hash_mismatch() {
-        let keys = setup_keys();
-        let tsa_keys = generate_tsa_keys();
-        let command = json!({"command": "test-cmd"});
-        let signature: p256::ecdsa::Signature =
-            keys.signing_key.sign(command.to_string().as_bytes());
-        let signature_hex = hex::encode(signature.to_bytes());
-
-        let public_key_hash = hex::encode(Sha256::digest(keys.public_key_pem.as_bytes()));
-        let id_token = create_valid_jwt(
-            &keys,
-            "iss",
-            "aud",
-            "sub",
-            &public_key_hash,
-            OffsetDateTime::now_utc() + Duration::minutes(5),
+    fn self_execute_stale_is_rejected() {
+        let env = new_env();
+        // 30 minutes ago — way past operator_max_validity of 10m.
+        let stale = OffsetDateTime::now_utc() - Duration::minutes(30);
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            stale,
+            vec!["approvers"],
         );
-
-        // Timestamp some GARBAGE data
-        let timestamp_token_hex =
-            create_mock_timestamp(b"garbage", OffsetDateTime::now_utc(), &tsa_keys);
-
-        let req = ExecutionRequest {
-            command,
-            signature_hex,
-            id_token,
-            public_key_pem: keys.public_key_pem.clone(),
-            timestamp_token_hex,
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
         };
-        let config = VerifierConfig {
-            client_id: "aud".into(),
-            issuer_url: "iss".into(),
-            jwks: keys.jwk_set.clone(),
-            trusted_roots: vec![tsa_keys.cert_der],
-        };
-
-        let result = verify_execution(&req, &config);
-        assert!(matches!(
-            result,
-            Err(ValidationError::TimestampVerificationFailed(_))
-        ));
-    }
-
-    #[test]
-    fn test_jwt_expiry_logic_valid_if_timestamped_before_expiry() {
-        let keys = setup_keys();
-        let tsa_keys = generate_tsa_keys();
-        let command = json!({"command": "test-cmd"});
-        let signature: p256::ecdsa::Signature =
-            keys.signing_key.sign(command.to_string().as_bytes());
-        let signature_hex = hex::encode(signature.to_bytes());
-        let public_key_hash = hex::encode(Sha256::digest(keys.public_key_pem.as_bytes()));
-
-        // Token expired 1 year ago relative to NOW
-        let valid_start = OffsetDateTime::now_utc() - Duration::days(400);
-        let expiry = valid_start + Duration::minutes(30);
-
-        let id_token = create_valid_jwt(&keys, "iss", "aud", "sub", &public_key_hash, expiry);
-
-        // Timestamp was created WHILE token was valid
-        let timestamp_time = valid_start + Duration::minutes(10);
-
-        let mut data = signature.to_bytes().to_vec();
-        data.extend_from_slice(id_token.as_bytes());
-        let timestamp_token_hex = create_mock_timestamp(&data, timestamp_time, &tsa_keys);
-
-        let req = ExecutionRequest {
-            command,
-            signature_hex,
-            id_token,
-            public_key_pem: keys.public_key_pem.clone(),
-            timestamp_token_hex,
-        };
-        let config = VerifierConfig {
-            client_id: "aud".into(),
-            issuer_url: "iss".into(),
-            jwks: keys.jwk_set.clone(),
-            trusted_roots: vec![tsa_keys.cert_der],
-        };
-
-        let result = verify_execution(&req, &config);
+        let result = verify_execution(&bundle, &verifier_config(&env));
         assert!(
-            result.is_ok(),
-            "Should accept token if timestamp is within validity period"
+            matches!(result, Err(ValidationError::ExecutorStale { .. })),
+            "expected ExecutorStale, got {:?}",
+            result
         );
     }
 
-    #[test]
-    fn test_jwt_expiry_logic_invalid_if_timestamped_after_expiry() {
-        let keys = setup_keys();
-        let tsa_keys = generate_tsa_keys();
-        let command = json!({"command": "test-cmd"});
-        let signature: p256::ecdsa::Signature =
-            keys.signing_key.sign(command.to_string().as_bytes());
-        let signature_hex = hex::encode(signature.to_bytes());
-        let public_key_hash = hex::encode(Sha256::digest(keys.public_key_pem.as_bytes()));
-
-        // Token valid window
-        let valid_start = OffsetDateTime::now_utc();
-        let expiry = valid_start + Duration::minutes(30);
-
-        let id_token = create_valid_jwt(&keys, "iss", "aud", "sub", &public_key_hash, expiry);
-
-        // Timestamp created AFTER token expired
-        let timestamp_time = expiry + Duration::seconds(1);
-
-        let mut data = signature.to_bytes().to_vec();
-        data.extend_from_slice(id_token.as_bytes());
-        let timestamp_token_hex = create_mock_timestamp(&data, timestamp_time, &tsa_keys);
-
-        let req = ExecutionRequest {
-            command,
-            signature_hex,
-            id_token,
-            public_key_pem: keys.public_key_pem.clone(),
-            timestamp_token_hex,
-        };
-        let config = VerifierConfig {
-            client_id: "aud".into(),
-            issuer_url: "iss".into(),
-            jwks: keys.jwk_set.clone(),
-            trusted_roots: vec![tsa_keys.cert_der],
-        };
-
-        let result = verify_execution(&req, &config);
-        assert!(
-            matches!(result, Err(ValidationError::JwtExpired)),
-            "Should reject if timestamp > exp"
-        );
-    }
+    // --- Delegated tests ---
 
     #[test]
-    fn test_reject_jwt_nonce_mismatch() {
-        let keys = setup_keys();
-        let tsa_keys = generate_tsa_keys();
-        let command = json!({"command": "test-cmd"});
-        let signature: p256::ecdsa::Signature =
-            keys.signing_key.sign(command.to_string().as_bytes());
-        let signature_hex = hex::encode(signature.to_bytes());
-
-        // Nonce mismatch
-        let id_token = create_valid_jwt(
-            &keys,
-            "iss",
-            "aud",
-            "sub",
-            "wrong-nonce",
-            OffsetDateTime::now_utc() + Duration::minutes(5),
-        );
-
+    fn delegated_fresh_operator_old_approver_authorized() {
+        let env = new_env();
         let now = OffsetDateTime::now_utc();
-        let mut data = signature.to_bytes().to_vec();
-        data.extend_from_slice(id_token.as_bytes());
-        let timestamp_token_hex = create_mock_timestamp(&data, now, &tsa_keys);
+        // Approver signed 2 days ago (within 3-day approver_max)
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            Some(OperatorConstraint {
+                any_of: vec![ClaimPredicate::Contains {
+                    claim: "groups".into(),
+                    value: serde_json::json!("noc-l2"),
+                }],
+            }),
+            now - Duration::days(2),
+            vec!["approvers"],
+        );
+        let op = build_operator_cosign(&env, &approver.signature, now, vec!["noc-l2"]);
 
-        let req = ExecutionRequest {
-            command,
-            signature_hex,
-            id_token,
-            public_key_pem: keys.public_key_pem.clone(),
-            timestamp_token_hex,
+        let bundle = ExecutionBundle {
+            approver,
+            operator: Some(op),
         };
-        let config = VerifierConfig {
-            client_id: "aud".into(),
-            issuer_url: "iss".into(),
-            jwks: keys.jwk_set.clone(),
-            trusted_roots: vec![tsa_keys.cert_der],
-        };
-
-        let result = verify_execution(&req, &config);
-        assert!(matches!(result, Err(ValidationError::JwtNonceMismatch)));
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(result.is_ok(), "expected ok, got {:?}", result.err());
+        let a = result.unwrap();
+        assert!(!a.self_executed);
+        assert_eq!(a.approver.username, "alice");
+        assert_eq!(a.operator.username, "bob");
     }
 
     #[test]
-    fn test_reject_untrusted_tsa_cert() {
-        let keys = setup_keys();
-        let tsa_keys = generate_tsa_keys(); // "Real" TSA
-        let attacker_keys = generate_tsa_keys(); // Attacker's self-signed TSA
+    fn delegated_stale_operator_rejected() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::minutes(1),
+            vec!["approvers"],
+        );
+        // Operator cosigned 30 minutes ago — beyond 10m operator_max.
+        let op = build_operator_cosign(
+            &env,
+            &approver.signature,
+            now - Duration::minutes(30),
+            vec!["noc-l2"],
+        );
+        let bundle = ExecutionBundle {
+            approver,
+            operator: Some(op),
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::ExecutorStale { .. })),
+            "expected ExecutorStale, got {:?}",
+            result
+        );
+    }
 
-        let command = json!({"command": "test-cmd"});
-        let signature: p256::ecdsa::Signature =
-            keys.signing_key.sign(command.to_string().as_bytes());
-        let signature_hex = hex::encode(signature.to_bytes());
-        let public_key_hash = hex::encode(Sha256::digest(keys.public_key_pem.as_bytes()));
+    #[test]
+    fn delegated_approver_too_old_rejected() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        // Approver signed 10 days ago — past 3-day approver_max.
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::days(10),
+            vec!["approvers"],
+        );
+        let op = build_operator_cosign(&env, &approver.signature, now, vec!["noc-l2"]);
+        let bundle = ExecutionBundle {
+            approver,
+            operator: Some(op),
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::ApproverStale { .. })),
+            "expected ApproverStale, got {:?}",
+            result
+        );
+    }
 
-        let id_token = create_valid_jwt(
-            &keys,
-            "iss",
-            "aud",
-            "sub",
-            &public_key_hash,
-            OffsetDateTime::now_utc() + Duration::minutes(5),
+    #[test]
+    fn delegated_operator_missing_required_claim_rejected() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            Some(OperatorConstraint {
+                any_of: vec![ClaimPredicate::Contains {
+                    claim: "groups".into(),
+                    value: serde_json::json!("noc-l2"),
+                }],
+            }),
+            now - Duration::minutes(1),
+            vec!["approvers"],
+        );
+        // Operator is in "noc-l1" only, not "noc-l2".
+        let op = build_operator_cosign(&env, &approver.signature, now, vec!["noc-l1"]);
+        let bundle = ExecutionBundle {
+            approver,
+            operator: Some(op),
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::OperatorConstraintUnsatisfied)),
+            "expected OperatorConstraintUnsatisfied, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn stapling_attack_rejected_when_approver_sig_swapped() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+
+        // Build approver bundle A + operator cosign bound to it.
+        let approver_a = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::minutes(1),
+            vec!["approvers"],
+        );
+        let op = build_operator_cosign(&env, &approver_a.signature, now, vec!["noc-l2"]);
+
+        // Build a DIFFERENT approver bundle B (different command).
+        let approver_b = build_approver_bundle(
+            &env,
+            json!({ "command": "dangerous-thing" }),
+            None,
+            now - Duration::minutes(1),
+            vec!["approvers"],
         );
 
-        let mut data = signature.to_bytes().to_vec();
-        data.extend_from_slice(id_token.as_bytes());
+        // Attacker staples operator cosign (bound to A) onto approver B.
+        // They set `approver_sig` to match approver_b (passing the equality check)
+        // but the operator's signature was computed over approver_a's hex — so it
+        // won't match approver_b's.
+        let mut tampered_op = op.clone();
+        tampered_op.approver_sig = approver_b.signature.clone();
 
-        // Token signed by Attacker
-        let timestamp_token_hex =
-            create_mock_timestamp(&data, OffsetDateTime::now_utc(), &attacker_keys);
-
-        let req = ExecutionRequest {
-            command,
-            signature_hex,
-            id_token,
-            public_key_pem: keys.public_key_pem.clone(),
-            timestamp_token_hex,
-        };
-        // Config ONLY trusts the Real TSA
-        let config = VerifierConfig {
-            client_id: "aud".into(),
-            issuer_url: "iss".into(),
-            jwks: keys.jwk_set.clone(),
-            trusted_roots: vec![tsa_keys.cert_der],
+        let bundle = ExecutionBundle {
+            approver: approver_b,
+            operator: Some(tampered_op),
         };
 
-        let result = verify_execution(&req, &config);
-        assert!(matches!(
-            result,
-            Err(ValidationError::TimestampVerificationFailed(_))
-        )); // Should fail TSA verification
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::OperatorSignatureFailed)),
+            "expected OperatorSignatureFailed, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn stapling_attack_mismatched_approver_sig_rejected() {
+        // If the attacker doesn't even bother updating `approver_sig` to match
+        // the new approver, the explicit mismatch check fires first.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver_a = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::minutes(1),
+            vec!["approvers"],
+        );
+        let op = build_operator_cosign(&env, &approver_a.signature, now, vec!["noc-l2"]);
+        let approver_b = build_approver_bundle(
+            &env,
+            json!({ "command": "dangerous-thing" }),
+            None,
+            now - Duration::minutes(1),
+            vec!["approvers"],
+        );
+        // Leave op.approver_sig pointing at approver_a even though bundle has approver_b.
+        let bundle = ExecutionBundle {
+            approver: approver_b,
+            operator: Some(op),
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::OperatorStapling)),
+            "expected OperatorStapling, got {:?}",
+            result
+        );
     }
 }

@@ -1,9 +1,21 @@
+//! Approver + (optional) Operator signature verification.
+//!
+//! See ARCHITECTURE.md for the full delegation model. In short:
+//!
+//! - **Approver** signs `canonical(command + operator_requires)` and embeds
+//!   constraints on who may execute. Long validity (days).
+//! - **Operator** (if present) signs `approver_signature_hex || operator_pubkey_pem`.
+//!   Short validity (minutes). Provides attribution + at-execution-time freshness.
+//! - **Self-execute shortcut**: if no operator is present, the approver's own
+//!   signature must be within the short window — they're acting as both roles.
+
 use crate::tsa;
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
 use p256::ecdsa::{Signature, VerifyingKey};
 use p256::pkcs8::DecodePublicKey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
@@ -11,41 +23,89 @@ pub enum ValidationError {
     InvalidPublicKey(String),
     #[error("Invalid signature format: {0}")]
     InvalidSignatureFormat(String),
-    #[error("Signature verification failed")]
-    SignatureVerificationFailed,
+    #[error("Approver signature verification failed")]
+    ApproverSignatureFailed,
+    #[error("Operator signature verification failed")]
+    OperatorSignatureFailed,
+    #[error("Operator cosign does not bind to approver signature")]
+    OperatorStapling,
     #[error("Invalid JWT header: {0}")]
     InvalidJwtHeader(String),
     #[error("JWT validation failed: {0}")]
     JwtValidationFailed(String),
-    #[error("JWT Nonce mismatch")]
+    #[error("JWT nonce not bound to signer's public key")]
     JwtNonceMismatch,
     #[error("Timestamp verification failed: {0}")]
     TimestampVerificationFailed(String),
-    #[error("Command verification failed: {0}")]
-    CommandVerificationFailed(String),
     #[error("JWT expired relative to timestamp")]
     JwtExpired,
+    #[error("Approver signature is stale ({age_secs}s > {max_secs}s)")]
+    ApproverStale { age_secs: u64, max_secs: u64 },
+    #[error("Executor signature is stale ({age_secs}s > {max_secs}s)")]
+    ExecutorStale { age_secs: u64, max_secs: u64 },
+    #[error("Operator does not satisfy operator_requires")]
+    OperatorConstraintUnsatisfied,
 }
 
-#[derive(Deserialize, Debug, Clone)] // Added Debug/Clone/Deserialize.
+#[derive(Deserialize, Debug, Clone)]
 pub struct Claims {
     pub sub: String,
     pub username: Option<String>,
     pub nonce: String,
     pub exp: u64,
-    // nbf: Option<u64>,
 }
 
-#[derive(Deserialize, Debug, Clone)] // Added Serialize/Deserialize/Debug/Clone
-pub struct ExecutionRequest {
+/// A predicate over OIDC claims. Minimal by design: if you need more
+/// expressive logic, put it in OPA rather than growing this language.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ClaimPredicate {
+    /// Claim value equals the given JSON value.
+    Equals {
+        claim: String,
+        value: serde_json::Value,
+    },
+    /// Claim is an array and contains the given JSON value.
+    Contains {
+        claim: String,
+        value: serde_json::Value,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct OperatorConstraint {
+    /// At least one predicate must match. Empty = no restriction.
+    #[serde(default)]
+    pub any_of: Vec<ClaimPredicate>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ApproverBundle {
     pub command: serde_json::Value,
-    #[serde(rename = "signature")]
-    pub signature_hex: String,
+    #[serde(default)]
+    pub operator_requires: Option<OperatorConstraint>,
+    pub signature: String,
     pub id_token: String,
-    #[serde(rename = "public_key")]
-    pub public_key_pem: String,
-    #[serde(rename = "timestamp_token")]
-    pub timestamp_token_hex: String,
+    pub public_key: String,
+    pub timestamp_token: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OperatorCosign {
+    /// Must equal `approver.signature`. Submitted for explicitness; the verifier
+    /// also re-derives it from the approver bundle to catch tampering.
+    pub approver_sig: String,
+    pub signature: String,
+    pub id_token: String,
+    pub public_key: String,
+    pub timestamp_token: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExecutionBundle {
+    pub approver: ApproverBundle,
+    #[serde(default)]
+    pub operator: Option<OperatorCosign>,
 }
 
 pub struct VerifierConfig {
@@ -53,57 +113,201 @@ pub struct VerifierConfig {
     pub issuer_url: String,
     pub jwks: jsonwebtoken::jwk::JwkSet,
     pub trusted_roots: Vec<Vec<u8>>,
+    pub approver_max_validity: Duration,
+    pub operator_max_validity: Duration,
 }
 
-#[derive(Debug, PartialEq)]
-pub struct AuthorizedUser {
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignerIdentity {
     pub username: String,
-    pub timestamp: time::OffsetDateTime,
+    pub claims: serde_json::Value,
+    pub signed_at: time::OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthorizedExecution {
+    pub approver: SignerIdentity,
+    /// Equals `approver` when self-executing.
+    pub operator: SignerIdentity,
+    pub self_executed: bool,
+    /// The signature whose freshness bounds execution (operator sig if
+    /// delegated, else approver sig). Used as the replay cache key.
+    pub executor_signature_hex: String,
+}
+
+/// Build the canonical bytes an approver signs over.
+///
+/// Using `serde_json::to_vec` on a Value with sorted keys is not guaranteed
+/// by serde_json — but in practice serde_json::Value uses BTreeMap when the
+/// `preserve_order` feature is *off*, which is the default. We document the
+/// canonicalization contract here and rely on it across signer + verifier.
+pub fn canonical_approver_payload(
+    command: &serde_json::Value,
+    operator_requires: &Option<OperatorConstraint>,
+) -> String {
+    let wrapper = serde_json::json!({
+        "command": command,
+        "operator_requires": operator_requires,
+    });
+    wrapper.to_string()
+}
+
+/// Build the bytes an operator signs over: approver signature hex followed
+/// by the operator's public-key PEM. Binds the cosign to *this* approver's sig.
+fn operator_payload(approver_sig_hex: &str, operator_public_key_pem: &str) -> Vec<u8> {
+    let mut bytes = approver_sig_hex.as_bytes().to_vec();
+    bytes.extend_from_slice(operator_public_key_pem.as_bytes());
+    bytes
 }
 
 pub fn verify_execution(
-    req: &ExecutionRequest,
+    bundle: &ExecutionBundle,
     config: &VerifierConfig,
-) -> Result<AuthorizedUser, ValidationError> {
-    // 1. Verify Command Signature
-    let command_str_verification = req.command.to_string();
+) -> Result<AuthorizedExecution, ValidationError> {
+    // ---- 1. Verify approver signature over canonical(command + operator_requires) ----
+    let approver_payload =
+        canonical_approver_payload(&bundle.approver.command, &bundle.approver.operator_requires);
 
-    let public_key = VerifyingKey::from_public_key_pem(&req.public_key_pem)
+    let approver_pubkey = VerifyingKey::from_public_key_pem(&bundle.approver.public_key)
         .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
 
-    let signature_bytes = hex::decode(&req.signature_hex)
-        .map_err(|_| ValidationError::InvalidSignatureFormat("Invalid hex".into()))?;
+    let approver_sig_bytes = hex::decode(&bundle.approver.signature)
+        .map_err(|_| ValidationError::InvalidSignatureFormat("approver: invalid hex".into()))?;
 
-    let signature = Signature::from_slice(&signature_bytes)
+    let approver_sig = Signature::from_slice(&approver_sig_bytes)
         .map_err(|e| ValidationError::InvalidSignatureFormat(e.to_string()))?;
 
     use p256::ecdsa::signature::Verifier;
-    if public_key
-        .verify(command_str_verification.as_bytes(), &signature)
-        .is_err()
-    {
-        return Err(ValidationError::SignatureVerificationFailed);
+    approver_pubkey
+        .verify(approver_payload.as_bytes(), &approver_sig)
+        .map_err(|_| ValidationError::ApproverSignatureFailed)?;
+
+    // ---- 2. Verify approver TSA over (sig_bytes || id_token) ----
+    let approver_tsa_bytes = hex::decode(&bundle.approver.timestamp_token).map_err(|_| {
+        ValidationError::TimestampVerificationFailed("approver TSA: invalid hex".into())
+    })?;
+    let mut approver_tsa_data = approver_sig_bytes.clone();
+    approver_tsa_data.extend_from_slice(bundle.approver.id_token.as_bytes());
+    let approver_signed_at =
+        tsa::verify_timestamp(&approver_tsa_bytes, &approver_tsa_data, &config.trusted_roots)
+            .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
+
+    // ---- 3. Verify approver JWT ----
+    let approver_claims_obj = verify_oidc_jwt(
+        &bundle.approver.id_token,
+        &bundle.approver.public_key,
+        approver_signed_at,
+        config,
+    )?;
+    let approver_username = approver_claims_obj
+        .get("username")
+        .and_then(|v| v.as_str())
+        .or_else(|| approver_claims_obj.get("sub").and_then(|v| v.as_str()))
+        .unwrap_or("unknown")
+        .to_string();
+
+    let approver = SignerIdentity {
+        username: approver_username,
+        claims: approver_claims_obj,
+        signed_at: approver_signed_at,
+    };
+
+    // ---- 4. Delegated vs self-execute branch ----
+    let now = time::OffsetDateTime::now_utc();
+
+    match &bundle.operator {
+        Some(op) => {
+            // 4a. Re-check the stated approver_sig matches the bundle.
+            if op.approver_sig != bundle.approver.signature {
+                return Err(ValidationError::OperatorStapling);
+            }
+
+            // 4b. Verify operator signature over (approver_sig_hex || operator_pubkey_pem).
+            let operator_pubkey = VerifyingKey::from_public_key_pem(&op.public_key)
+                .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
+
+            let op_sig_bytes = hex::decode(&op.signature).map_err(|_| {
+                ValidationError::InvalidSignatureFormat("operator: invalid hex".into())
+            })?;
+            let op_sig = Signature::from_slice(&op_sig_bytes)
+                .map_err(|e| ValidationError::InvalidSignatureFormat(e.to_string()))?;
+
+            let op_payload = operator_payload(&bundle.approver.signature, &op.public_key);
+            operator_pubkey
+                .verify(&op_payload, &op_sig)
+                .map_err(|_| ValidationError::OperatorSignatureFailed)?;
+
+            // 4c. Operator TSA.
+            let op_tsa_bytes = hex::decode(&op.timestamp_token).map_err(|_| {
+                ValidationError::TimestampVerificationFailed("operator TSA: invalid hex".into())
+            })?;
+            let mut op_tsa_data = op_sig_bytes.clone();
+            op_tsa_data.extend_from_slice(op.id_token.as_bytes());
+            let operator_signed_at =
+                tsa::verify_timestamp(&op_tsa_bytes, &op_tsa_data, &config.trusted_roots)
+                    .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
+
+            // 4d. Operator JWT + nonce bound to operator pubkey.
+            let operator_claims_obj = verify_oidc_jwt(
+                &op.id_token,
+                &op.public_key,
+                operator_signed_at,
+                config,
+            )?;
+            let operator_username = operator_claims_obj
+                .get("username")
+                .and_then(|v| v.as_str())
+                .or_else(|| operator_claims_obj.get("sub").and_then(|v| v.as_str()))
+                .unwrap_or("unknown")
+                .to_string();
+
+            // 4e. Freshness — operator (short) + approver (long).
+            check_age(now, operator_signed_at, config.operator_max_validity, true)?;
+            check_age(now, approver_signed_at, config.approver_max_validity, false)?;
+
+            // 4f. Evaluate operator_requires against operator claims.
+            if let Some(req) = &bundle.approver.operator_requires {
+                if !req.any_of.is_empty() && !any_of_matches(&req.any_of, &operator_claims_obj) {
+                    return Err(ValidationError::OperatorConstraintUnsatisfied);
+                }
+            }
+
+            Ok(AuthorizedExecution {
+                approver,
+                operator: SignerIdentity {
+                    username: operator_username,
+                    claims: operator_claims_obj,
+                    signed_at: operator_signed_at,
+                },
+                self_executed: false,
+                executor_signature_hex: op.signature.clone(),
+            })
+        }
+        None => {
+            // Self-execute: approver's own sig must be within the short window.
+            check_age(now, approver_signed_at, config.operator_max_validity, true)?;
+
+            Ok(AuthorizedExecution {
+                operator: approver.clone(),
+                self_executed: true,
+                executor_signature_hex: bundle.approver.signature.clone(),
+                approver,
+            })
+        }
     }
+}
 
-    // 2. Verify Timestamp
-    // We do this BEFORE JWT full validation because we need the timestamp to check JWT expiry correctly.
-    let timestamp_token_bytes = hex::decode(&req.timestamp_token_hex)
-        .map_err(|_| ValidationError::TimestampVerificationFailed("Invalid hex".into()))?;
-
-    let mut data_to_verify = signature_bytes.to_vec();
-    data_to_verify.extend_from_slice(req.id_token.as_bytes());
-
-    let timestamp = tsa::verify_timestamp(
-        &timestamp_token_bytes,
-        &data_to_verify,
-        &config.trusted_roots,
-    )
-    .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
-
-    // 3. Verify JWT
-    let header = decode_header(&req.id_token)
-        .map_err(|e| ValidationError::InvalidJwtHeader(e.to_string()))?;
-
+/// Shared JWT verification: signature against JWKS, issuer, audience, and
+/// nonce bound to the caller's ephemeral public key. Also checks the JWT's
+/// own `exp` against the TSA timestamp (not wall clock).
+fn verify_oidc_jwt(
+    id_token: &str,
+    signer_public_key_pem: &str,
+    signed_at: time::OffsetDateTime,
+    config: &VerifierConfig,
+) -> Result<serde_json::Value, ValidationError> {
+    let header =
+        decode_header(id_token).map_err(|e| ValidationError::InvalidJwtHeader(e.to_string()))?;
     let kid = header
         .kid
         .ok_or_else(|| ValidationError::InvalidJwtHeader("Missing kid".into()))?;
@@ -111,42 +315,120 @@ pub fn verify_execution(
         .jwks
         .find(&kid)
         .ok_or_else(|| ValidationError::JwtValidationFailed("Unknown signing key".into()))?;
+    let decoding_key = DecodingKey::from_jwk(jwk)
+        .map_err(|e| ValidationError::JwtValidationFailed(e.to_string()))?;
 
     let mut validation = Validation::new(header.alg);
     validation.set_audience(&[&config.client_id]);
     validation.set_issuer(&[&config.issuer_url]);
-
-    // CRITICAL: We validate expiry manually against the timestamp, NOT against "now".
-    // If the fast moving train of time has passed, but the timestamp was valid AT THAT TIME, we are good.
     validation.validate_exp = false;
 
-    let token_data = decode::<Claims>(
-        &req.id_token,
-        &DecodingKey::from_jwk(jwk)
-            .map_err(|e| ValidationError::JwtValidationFailed(e.to_string()))?,
-        &validation,
-    )
-    .map_err(|e| ValidationError::JwtValidationFailed(e.to_string()))?;
+    let token_data = decode::<serde_json::Value>(id_token, &decoding_key, &validation)
+        .map_err(|e| ValidationError::JwtValidationFailed(e.to_string()))?;
+    let claims = token_data.claims;
 
-    // 4. Validate JWT Nonce
-    let expected_nonce = hex::encode(Sha256::digest(req.public_key_pem.as_bytes()));
-    if token_data.claims.nonce != expected_nonce {
+    let expected_nonce = hex::encode(Sha256::digest(signer_public_key_pem.as_bytes()));
+    let nonce = claims
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ValidationError::JwtValidationFailed("Missing nonce".into()))?;
+    if nonce != expected_nonce {
         return Err(ValidationError::JwtNonceMismatch);
     }
 
-    // 5. Validate JWT Expiry against Timestamp
-    // exp is seconds since epoch
-    let exp_time = time::OffsetDateTime::from_unix_timestamp(token_data.claims.exp as i64)
+    let exp = claims
+        .get("exp")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ValidationError::JwtValidationFailed("Missing exp".into()))?;
+    let exp_time = time::OffsetDateTime::from_unix_timestamp(exp)
         .map_err(|_| ValidationError::JwtValidationFailed("Invalid exp claim".into()))?;
-
-    if timestamp > exp_time {
+    if signed_at > exp_time {
         return Err(ValidationError::JwtExpired);
     }
 
-    let username = token_data.claims.username.unwrap_or(token_data.claims.sub);
+    Ok(claims)
+}
 
-    Ok(AuthorizedUser {
-        username,
-        timestamp,
+fn check_age(
+    now: time::OffsetDateTime,
+    signed_at: time::OffsetDateTime,
+    max: Duration,
+    is_executor: bool,
+) -> Result<(), ValidationError> {
+    if signed_at > now {
+        // Clock skew or TSA returned a future time. Treat as zero age.
+        return Ok(());
+    }
+    let age = now - signed_at;
+    let age_secs = age.whole_seconds().max(0) as u64;
+    let max_secs = max.as_secs();
+    if age_secs > max_secs {
+        return Err(if is_executor {
+            ValidationError::ExecutorStale { age_secs, max_secs }
+        } else {
+            ValidationError::ApproverStale { age_secs, max_secs }
+        });
+    }
+    Ok(())
+}
+
+fn any_of_matches(preds: &[ClaimPredicate], claims: &serde_json::Value) -> bool {
+    preds.iter().any(|p| match p {
+        ClaimPredicate::Equals { claim, value } => {
+            claims.get(claim).map(|c| c == value).unwrap_or(false)
+        }
+        ClaimPredicate::Contains { claim, value } => claims
+            .get(claim)
+            .and_then(|c| c.as_array())
+            .map(|arr| arr.iter().any(|v| v == value))
+            .unwrap_or(false),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contains_predicate_against_groups_claim() {
+        let claims = serde_json::json!({
+            "groups": ["noc-l1", "noc-l2"],
+            "sub": "alice",
+        });
+        let preds = vec![ClaimPredicate::Contains {
+            claim: "groups".into(),
+            value: serde_json::json!("noc-l2"),
+        }];
+        assert!(any_of_matches(&preds, &claims));
+
+        let preds2 = vec![ClaimPredicate::Contains {
+            claim: "groups".into(),
+            value: serde_json::json!("admins"),
+        }];
+        assert!(!any_of_matches(&preds2, &claims));
+    }
+
+    #[test]
+    fn equals_predicate_against_scalar_claim() {
+        let claims = serde_json::json!({ "team": "webapp" });
+        let preds = vec![ClaimPredicate::Equals {
+            claim: "team".into(),
+            value: serde_json::json!("webapp"),
+        }];
+        assert!(any_of_matches(&preds, &claims));
+    }
+
+    #[test]
+    fn canonical_payload_is_stable() {
+        let cmd = serde_json::json!({ "command": "test", "target_machines": ["host-a"] });
+        let req = Some(OperatorConstraint {
+            any_of: vec![ClaimPredicate::Contains {
+                claim: "groups".into(),
+                value: serde_json::json!("noc-l2"),
+            }],
+        });
+        let a = canonical_approver_payload(&cmd, &req);
+        let b = canonical_approver_payload(&cmd, &req);
+        assert_eq!(a, b);
+    }
 }

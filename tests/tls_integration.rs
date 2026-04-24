@@ -32,12 +32,12 @@ async fn test_dynamic_cert_resolver_reloads() -> Result<(), Box<dyn std::error::
     // 1. Generate Cert A
     let cert_a = generate_simple_self_signed(vec!["localhost".to_string()])?;
     let pem_cert_a = cert_a.cert.pem();
-    let pem_key_a = cert_a.key_pair.serialize_pem();
+    let pem_key_a = cert_a.signing_key.serialize_pem();
     
     // 2. Generate Cert B
     let cert_b = generate_simple_self_signed(vec!["example.com".to_string()])?;
     let pem_cert_b = cert_b.cert.pem();
-    let pem_key_b = cert_b.key_pair.serialize_pem();
+    let pem_key_b = cert_b.signing_key.serialize_pem();
 
     // 3. Init resolver with Key A
     let certified_key_a = create_key_from_mem(&pem_cert_a, &pem_key_a)?;

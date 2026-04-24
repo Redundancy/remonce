@@ -1,3 +1,5 @@
+use crate::config::TlsConfig;
+use axum::Router;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -215,4 +217,143 @@ where
     fn local_addr(&self) -> io::Result<Self::Addr> {
         self.listener.local_addr()
     }
+}
+
+/// Peer socket address for a TLS-served connection. Used with
+/// `ConnectInfo<PeerAddr>` because orphan rules prevent us from implementing
+/// `Connected` on `std::net::SocketAddr` for our custom listener.
+#[derive(Copy, Clone, Debug)]
+pub struct PeerAddr(pub SocketAddr);
+
+impl PeerAddr {
+    pub fn ip_string(&self) -> String {
+        self.0.ip().to_string()
+    }
+}
+
+impl<A> axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener<A>>>
+    for PeerAddr
+where
+    A: AcceptTls,
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener<A>>) -> Self {
+        PeerAddr(*stream.remote_addr())
+    }
+}
+
+/// Serve an Axum `Router` over TLS using the given `TlsConfig`.
+///
+/// Supports both file-based certificates (with hot-reload via `notify`) and
+/// ACME (Let's Encrypt and compatible). This is the single entry point used
+/// by both the web tier and the agent so TLS-serving logic lives in one place.
+pub async fn serve_with_tls(
+    listener: TcpListener,
+    app: Router,
+    tls: &TlsConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match tls {
+        TlsConfig::Files { chain, key } => {
+            let certified_key = create_certified_key(chain, key)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("Failed to load certs: {e}").into()
+                })?;
+
+            let resolver = Arc::new(DynamicCertResolver::new(certified_key));
+            start_cert_watcher(chain.clone(), key.clone(), resolver.clone());
+
+            let mut rustls_config = rustls::server::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(resolver);
+            rustls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+            let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(rustls_config));
+            let tls_listener = TlsListener::new(listener, tls_acceptor);
+
+            axum::serve(
+                tls_listener,
+                app.into_make_service_with_connect_info::<PeerAddr>(),
+            )
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Server error: {e}").into()
+            })?;
+        }
+        TlsConfig::Acme {
+            domains,
+            email,
+            cache_dir,
+            directory_url,
+        } => {
+            use futures::StreamExt;
+            use hyper_util::rt::{TokioExecutor, TokioIo};
+            use hyper_util::server::conn::auto::Builder;
+            use hyper_util::service::TowerToHyperService;
+            use rustls_acme::{caches::DirCache, AcmeConfig};
+            use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+
+            let state = DirCache::new(cache_dir.clone());
+
+            let mut root_store = rustls::RootCertStore::empty();
+            for cert in rustls_native_certs::load_native_certs()
+                .expect("could not load platform certs")
+            {
+                root_store.add(cert).ok();
+            }
+
+            let client_config = rustls::client::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+            let mut acme_config =
+                AcmeConfig::new_with_client_config(domains.clone(), Arc::new(client_config))
+                    .contact(email.iter().map(|e| format!("mailto:{}", e)))
+                    .cache_option(Some(state));
+
+            if let Some(url) = directory_url {
+                acme_config = acme_config.directory(url);
+            } else {
+                acme_config = acme_config.directory_lets_encrypt(true);
+            }
+
+            let listener_stream = tokio_stream::wrappers::TcpListenerStream::new(listener)
+                .map(|res| res.map(|s| s.compat()));
+
+            let mut incoming = acme_config
+                .incoming(listener_stream, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+
+            // ACME per-connection path bypasses `axum::serve`, so `ConnectInfo<PeerAddr>`
+            // isn't populated automatically. Install a mock so extractors still work.
+            let app = app.layer(axum::extract::connect_info::MockConnectInfo(PeerAddr(
+                SocketAddr::from(([0, 0, 0, 0], 0)),
+            )));
+
+            while let Some(tls) = incoming.next().await {
+                match tls {
+                    Ok(tls_stream) => {
+                        let compat_tls = tls_stream.compat();
+                        let io = TokioIo::new(compat_tls);
+
+                        let app = app.clone();
+                        let service = TowerToHyperService::new(app);
+
+                        tokio::spawn(async move {
+                            let builder = Builder::new(TokioExecutor::new());
+                            if let Err(err) = builder.serve_connection(io, service).await {
+                                tracing::debug!("Error serving connection: {}", err);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::debug!("ACME handshake error: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

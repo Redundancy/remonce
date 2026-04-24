@@ -35,6 +35,29 @@ pub struct Config {
     /// List of allowed files for read-only access.
     #[serde(default)]
     pub files: Vec<FileConfig>,
+
+    /// Agent-specific configuration. Required when running `remonse agent`.
+    pub agent: Option<AgentConfig>,
+}
+
+/// Configuration for the remote agent. TLS is mandatory — the agent is the
+/// one network-facing component, and all command-execution requests must
+/// travel over TLS.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AgentConfig {
+    #[serde(default = "default_agent_listen_address")]
+    pub listen_address: String,
+
+    /// TLS configuration (Files or ACME). There is no plaintext mode.
+    pub tls: TlsConfig,
+
+    /// CORS origins the agent should allow. Empty = no CORS layer.
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
+}
+
+fn default_agent_listen_address() -> String {
+    "0.0.0.0:10022".to_string()
 }
 
 fn default_logs_dir() -> String {
@@ -68,9 +91,18 @@ pub struct TsaConfig {
     #[serde(default = "default_tsa_url")]
     pub url: String,
 
-    /// Path to a custom CA certificate (PEM) for verifying the TSA signature.
-    /// If not provided, the system's native certificate store will be used.
+    /// Path to a PEM file containing extra trust anchors for TSA signature
+    /// verification. These are *added* to the bundled DigiCert Trusted Root G4
+    /// which ships with the binary.
     pub ca_path: Option<String>,
+
+    /// If true, the agent will additionally trust every CA in the operating
+    /// system's native trust store for TSA signature verification. This
+    /// widens the trust surface to hundreds of CAs and is **insecure**;
+    /// the agent refuses to start with this enabled unless `--insecure` is
+    /// passed on the command line.
+    #[serde(default)]
+    pub trust_system_store: bool,
 }
 
 impl Default for TsaConfig {
@@ -78,6 +110,7 @@ impl Default for TsaConfig {
         Self {
             url: default_tsa_url(),
             ca_path: None,
+            trust_system_store: false,
         }
     }
 }
@@ -142,10 +175,29 @@ pub struct CommandConfig {
     /// Defaults to the agent's current working directory if not specified.
     pub cwd: Option<String>,
 
-    /// Maximum validity duration for a signed command (e.g., "3d", "1h").
+    /// Maximum age of an approver's signature, measured from their TSA timestamp.
+    /// Controls how long a pre-signed command remains usable after the approver signs.
     /// Defaults to 3 days if not specified.
     #[serde(default, with = "humantime_serde")]
-    pub max_validity: Option<std::time::Duration>,
+    pub approver_max_validity: Option<std::time::Duration>,
+
+    /// Maximum age of the executing-signer's TSA timestamp. In delegated flows this
+    /// is the operator's co-sign; in self-execute flows this is the approver's own
+    /// signature (acting as both roles). Defaults to 10 minutes if not specified.
+    #[serde(default, with = "humantime_serde")]
+    pub operator_max_validity: Option<std::time::Duration>,
+}
+
+impl CommandConfig {
+    pub fn approver_max_validity_or_default(&self) -> std::time::Duration {
+        self.approver_max_validity
+            .unwrap_or_else(|| std::time::Duration::from_secs(3 * 24 * 60 * 60))
+    }
+
+    pub fn operator_max_validity_or_default(&self) -> std::time::Duration {
+        self.operator_max_validity
+            .unwrap_or_else(|| std::time::Duration::from_secs(10 * 60))
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

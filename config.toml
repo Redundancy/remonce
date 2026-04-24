@@ -12,8 +12,13 @@ client_id = "xAoXyxo5QuLi3zxz17OR82L2vW258SEP"
 # Explicit redirect URI to avoid cookie domain mismatch (localhost vs 127.0.0.1)
 redirect_uri = "http://localhost:8080/oidc/callback"
 
+# Default TSA is DigiCert's free public service and the bundled DigiCert G4
+# root is always trusted. Uncomment only if you need to point at a different
+# TSA or add private roots. See CONFIGURATION.md.
 #[timestamp_authority]
-#ca_path = "./bin/DigiCertTrustedG4RSA4096SHA256TimeStampingCA.crt.pem"
+#url = "http://timestamp.digicert.com"
+#ca_path = "./tsa_chain.pem"
+#trust_system_store = false   # set true only with `--insecure`
 
 [[commands]]
 name = "test"
@@ -41,3 +46,24 @@ description = "Access to execution logs"
 [[files]]
 path = "config.toml"
 description = "Server configuration file"
+
+# Agent configuration — required when running `remonse agent`.
+# TLS is mandatory; use `mode = "files"` with a self-signed cert for local dev,
+# or `mode = "acme"` with a public DNS name in production.
+#
+# [agent]
+# listen_address = "0.0.0.0:10022"
+# cors_allowed_origins = []  # empty = no CORS layer
+#
+# [agent.tls]
+# mode = "files"
+# chain = "certs/agent-cert.pem"
+# key = "certs/agent-key.pem"
+#
+# Or for ACME:
+# [agent.tls]
+# mode = "acme"
+# domains = ["agent.example.com"]
+# email = ["ops@example.com"]
+# cache_dir = "certs/acme-cache"
+# # directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"

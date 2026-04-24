@@ -1,6 +1,5 @@
-use crate::config::{Config, TlsConfig};
+use crate::config::Config;
 use crate::security::Claims;
-use crate::tls::{create_certified_key, start_cert_watcher, DynamicCertResolver};
 use axum::{
     extract::{Query, State},
     response::{Html, IntoResponse, Redirect},
@@ -8,11 +7,7 @@ use axum::{
     Router,
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar};
-use futures::StreamExt;
-use rustls_acme::{caches::DirCache, AcmeConfig};
-use std::sync::Arc;
 
-use tokio_rustls::TlsAcceptor;
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce,
     aead::{Aead, generic_array::GenericArray},
@@ -99,12 +94,18 @@ struct UserProfile {
     public_key_pem: String,
 }
 
-pub async fn run() -> Result<(), AppError> {
+pub async fn run(insecure: bool) -> Result<(), AppError> {
     // Load configuration from `config.toml`
     let config_str = std::fs::read_to_string("config.toml")
         .map_err(|e| AppError::Config(format!("Failed to read config.toml: {e}")))?;
     let config: Config = toml::from_str(&config_str)
         .map_err(|e| AppError::Config(format!("Failed to parse config.toml: {e}")))?;
+
+    // Validate the `--insecure` posture up front; refuses to start when any
+    // degraded setting is active without the flag.
+    let insecure_mode = crate::insecure::validate(&config, insecure)
+        .map_err(|e| AppError::Config(format!("{e}")))?;
+    crate::audit::set_insecure_mode(insecure_mode.as_bool());
 
     // Create shared HTTP client and AppState
     let http_client = Client::new();
@@ -128,6 +129,13 @@ pub async fn run() -> Result<(), AppError> {
         .listen_address
         .parse()
         .map_err(|e| AppError::Config(format!("Invalid listen_address: {e}")))?;
+
+    if !addr.ip().is_loopback() {
+        return Err(AppError::Config(format!(
+            "web tier must bind to loopback (got {}); the signer is intended to run on the operator's workstation",
+            addr.ip()
+        )));
+    }
 
     let hostname = hostname::get()
         .map(|s| s.to_string_lossy().to_string())
@@ -160,6 +168,7 @@ pub async fn run() -> Result<(), AppError> {
         .route("/auth/login", get(login_handler))
         .route("/oidc/callback", get(callback_handler))
         .route("/api/sign", post(sign_handler))
+        .route("/api/cosign", post(cosign_handler))
         .route("/api/commands", get(get_commands_handler))
         .route("/ui", get(index_page_handler))
         .route("/ui/{page}", get(ui_handler))
@@ -178,93 +187,9 @@ pub async fn run() -> Result<(), AppError> {
 
     if let Some(tls_config) = config.tls {
         tracing::info!("TLS enabled in {:?} mode", tls_config);
-        
-        match tls_config {
-            TlsConfig::Files { chain, key } => {
-                let certified_key = create_certified_key(&chain, &key)
-                    .map_err(|e| AppError::Config(format!("Failed to load certs: {e}")))?;
-
-                let resolver = Arc::new(DynamicCertResolver::new(certified_key));
-                start_cert_watcher(chain.clone(), key.clone(), resolver.clone());
-                
-                let mut rustls_config = rustls::server::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(resolver);
-                rustls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-                
-                let tls_acceptor = TlsAcceptor::from(Arc::new(rustls_config));
-                let tls_listener = crate::tls::TlsListener::new(listener, tls_acceptor);
-                
-                axum::serve(tls_listener, app.into_make_service())
-                    .await
-                    .map_err(|e| AppError::Internal(format!("Server error: {e}")))?;
-            },
-            TlsConfig::Acme { domains, email, cache_dir, directory_url } => {
-                let state = DirCache::new(cache_dir);
-
-                // Load root certificates
-                let mut root_store = rustls::RootCertStore::empty();
-                for cert in rustls_native_certs::load_native_certs().expect("could not load platform certs") {
-                    root_store.add(cert).ok();
-                }
-
-                // Create client config with Ring provider
-                let client_config = rustls::client::ClientConfig::builder_with_provider(
-                    Arc::new(rustls::crypto::ring::default_provider())
-                )
-                    .with_safe_default_protocol_versions()
-                    .unwrap()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth();
-
-                let mut acme_config = AcmeConfig::new_with_client_config(domains, Arc::new(client_config))
-                    .contact(email.iter().map(|e| format!("mailto:{}", e)))
-                    .cache_option(Some(state));
-                
-                if let Some(url) = directory_url {
-                     acme_config = acme_config.directory(&url);
-                } else {
-                     acme_config = acme_config.directory_lets_encrypt(true);
-                }
-                
-                let local_addr = listener.local_addr().unwrap_or("0.0.0.0:0".parse().unwrap());
-                
-                use tokio_util::compat::{TokioAsyncReadCompatExt, FuturesAsyncReadCompatExt};
-                use hyper_util::rt::{TokioExecutor, TokioIo};
-                use hyper_util::server::conn::auto::Builder;
-                use hyper_util::service::TowerToHyperService;
-                
-                // Wrap listener in TcpListenerStream and map to Compat
-                let listener_stream = tokio_stream::wrappers::TcpListenerStream::new(listener)
-                    .map(|res| res.map(|s| s.compat()));
-                
-                let mut incoming = acme_config.incoming(listener_stream, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
-                
-                while let Some(tls) = incoming.next().await {
-                    match tls {
-                        Ok(tls_stream) => {
-                             // Compat: futures -> tokio
-                             let compat_tls = tls_stream.compat();
-                             // Adapter: tokio -> hyper
-                             let io = TokioIo::new(compat_tls);
-                             
-                             let app = app.clone();
-                             let service = TowerToHyperService::new(app);
-                             
-                             tokio::spawn(async move {
-                                 let builder = Builder::new(TokioExecutor::new());
-                                 if let Err(err) = builder.serve_connection(io, service).await {
-                                     tracing::debug!("Error serving connection: {}", err);
-                                 }
-                             });
-                        },
-                        Err(e) => {
-                            tracing::debug!("ACME handshake error: {}", e);
-                        }
-                    }
-                }
-            }
-        }
+        crate::tls::serve_with_tls(listener, app, &tls_config)
+            .await
+            .map_err(|e| AppError::Internal(format!("Server error: {e}")))?;
     } else {
         tracing::warn!("TLS disabled. running on HTTP.");
         axum::serve(listener, app.into_make_service())
@@ -531,69 +456,64 @@ async fn callback_handler(
 
 #[derive(Deserialize)]
 struct SignRequest {
-    payload: String,
+    command: serde_json::Value,
+    #[serde(default)]
+    operator_requires: Option<crate::security::OperatorConstraint>,
 }
 
-#[derive(Serialize)]
-struct SignResponse {
-    signature: String,
-    timestamp_token: String,
-    id_token: String,
-    public_key: String,
+#[derive(Deserialize)]
+struct CosignRequest {
+    approver: crate::security::ApproverBundle,
 }
 
-/// Signs a payload using the session's encrypted private key and the client's cookie key.
+/// Decrypt the session's ephemeral signing key using the per-request cookie key.
+fn load_signing_key(profile: &UserProfile, jar: &CookieJar) -> Result<SigningKey, AppError> {
+    let symmetric_key_hex = jar
+        .get("remonse_key")
+        .map(|c| c.value().to_string())
+        .ok_or(AppError::Auth("Missing decryption key cookie".into()))?;
+    let symmetric_key_bytes = hex::decode(symmetric_key_hex)
+        .map_err(|_| AppError::Auth("Invalid decryption key format".into()))?;
+
+    let encrypted_data = hex::decode(&profile.encrypted_private_key_hex)
+        .map_err(|_| AppError::Internal("Invalid encrypted key format".into()))?;
+    if encrypted_data.len() < 12 {
+        return Err(AppError::Internal("Encrypted key too short".into()));
+    }
+    let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&symmetric_key_bytes));
+    let signing_key_bytes = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| AppError::Auth("Failed to decrypt private key. Invalid key?".into()))?;
+    SigningKey::from_bytes(GenericArray::from_slice(&signing_key_bytes))
+        .map_err(|_| AppError::Internal("Invalid signing key bytes".into()))
+}
+
+/// Approver signs a command + optional `operator_requires` constraint.
+/// Returns an `ExecutionBundle` with `operator: null`. If the approver also
+/// plans to execute themselves immediately (same-person + fresh TSA), this
+/// bundle can be submitted directly to the agent.
 async fn sign_handler(
     State(state): State<AppState>,
     session: Session,
     jar: CookieJar,
-    yamld: axum::Json<SignRequest>,
-) -> Result<axum::Json<SignResponse>, AppError> {
-    // 1. Get user profile
+    axum::Json(req): axum::Json<SignRequest>,
+) -> Result<axum::Json<crate::security::ExecutionBundle>, AppError> {
     let profile: UserProfile = session
         .get(SESSION_KEY)
         .await?
         .ok_or(AppError::Auth("Not logged in".into()))?;
 
-    // 2. Get decryption key from cookie
-    let symmetric_key_hex = jar
-        .get("remonse_key")
-        .map(|c| c.value().to_string())
-        .ok_or(AppError::Auth("Missing decryption key cookie".into()))?;
+    let signing_key = load_signing_key(&profile, &jar)?;
 
-    let symmetric_key_bytes = hex::decode(symmetric_key_hex)
-        .map_err(|_| AppError::Auth("Invalid decryption key format".into()))?;
-
-    // 3. Decrypt private key
-    // The stored encrypted key includes nonce (12 bytes) + ciphertext
-    let encrypted_data = hex::decode(&profile.encrypted_private_key_hex)
-        .map_err(|_| AppError::Internal("Invalid encrypted key format".into()))?;
-
-    if encrypted_data.len() < 12 {
-        return Err(AppError::Internal("Encrypted key too short".into()));
-    }
-
-    let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&symmetric_key_bytes));
-
-    let signing_key_bytes = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| AppError::Auth("Failed to decrypt private key. Invalid key?".into()))?;
-
-    let signing_key = SigningKey::from_bytes(GenericArray::from_slice(&signing_key_bytes))
-        .map_err(|_| AppError::Internal("Invalid signing key bytes".into()))?;
-
-    // 4. Sign payload
-    let signature: p256::ecdsa::Signature = signing_key.sign(yamld.payload.as_bytes());
+    let canonical =
+        crate::security::canonical_approver_payload(&req.command, &req.operator_requires);
+    let signature: p256::ecdsa::Signature = signing_key.sign(canonical.as_bytes());
     let signature_bytes = signature.to_bytes();
 
-    // 5. Request Timestamp from TSA
-    // We send (Signature + ID Token) to the TSA.
-    // This binds the Command Signature AND the User Identity to the Time.
     let mut data_to_timestamp = signature_bytes.to_vec();
     data_to_timestamp.extend_from_slice(profile.id_token.as_bytes());
-
     let timestamp_token_bytes = crate::tsa::request_timestamp(
         &state.http_client,
         &state.config.timestamp_authority.url,
@@ -602,11 +522,59 @@ async fn sign_handler(
     .await
     .map_err(|e| AppError::Internal(format!("TSA Error: {e}")))?;
 
-    Ok(axum::Json(SignResponse {
-        signature: hex::encode(signature_bytes),
-        timestamp_token: hex::encode(timestamp_token_bytes),
-        id_token: profile.id_token,
-        public_key: profile.public_key_pem,
+    Ok(axum::Json(crate::security::ExecutionBundle {
+        approver: crate::security::ApproverBundle {
+            command: req.command,
+            operator_requires: req.operator_requires,
+            signature: hex::encode(signature_bytes),
+            id_token: profile.id_token,
+            public_key: profile.public_key_pem,
+            timestamp_token: hex::encode(timestamp_token_bytes),
+        },
+        operator: None,
+    }))
+}
+
+/// Operator co-signs an existing approver bundle. Produces an `ExecutionBundle`
+/// ready to submit to the agent. No validity check is done here — the agent is
+/// the enforcement point. The server simply signs `approver_sig || operator_pubkey`.
+async fn cosign_handler(
+    State(state): State<AppState>,
+    session: Session,
+    jar: CookieJar,
+    axum::Json(req): axum::Json<CosignRequest>,
+) -> Result<axum::Json<crate::security::ExecutionBundle>, AppError> {
+    let profile: UserProfile = session
+        .get(SESSION_KEY)
+        .await?
+        .ok_or(AppError::Auth("Not logged in".into()))?;
+
+    let signing_key = load_signing_key(&profile, &jar)?;
+
+    let mut payload = req.approver.signature.as_bytes().to_vec();
+    payload.extend_from_slice(profile.public_key_pem.as_bytes());
+    let signature: p256::ecdsa::Signature = signing_key.sign(&payload);
+    let signature_bytes = signature.to_bytes();
+
+    let mut data_to_timestamp = signature_bytes.to_vec();
+    data_to_timestamp.extend_from_slice(profile.id_token.as_bytes());
+    let timestamp_token_bytes = crate::tsa::request_timestamp(
+        &state.http_client,
+        &state.config.timestamp_authority.url,
+        &data_to_timestamp,
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("TSA Error: {e}")))?;
+
+    Ok(axum::Json(crate::security::ExecutionBundle {
+        operator: Some(crate::security::OperatorCosign {
+            approver_sig: req.approver.signature.clone(),
+            signature: hex::encode(signature_bytes),
+            id_token: profile.id_token,
+            public_key: profile.public_key_pem,
+            timestamp_token: hex::encode(timestamp_token_bytes),
+        }),
+        approver: req.approver,
     }))
 }
 

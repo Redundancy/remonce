@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 use crate::config::Config;
 use crate::web::OidcMetadata;
 use crate::files;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 pub struct AgentState {
@@ -29,6 +29,7 @@ pub struct AgentState {
     pub jwks: jsonwebtoken::jwk::JwkSet,
     pub hostname: String,
     pub trusted_roots: Vec<Vec<u8>>,
+    pub replay_cache: crate::replay::ReplayCache,
 }
 
 // ExecutionRequest is imported from security module
@@ -51,10 +52,19 @@ impl IntoResponse for ErrorResponse {
     }
 }
 
-pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load Config (Reuse web::Config for simplicity)
     let config_str = std::fs::read_to_string("config.toml")?;
     let config: Config = toml::from_str(&config_str)?;
+
+    let insecure_mode = crate::insecure::validate(&config, insecure)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+    crate::audit::set_insecure_mode(insecure_mode.as_bool());
+
+    let agent_config = config
+        .agent
+        .clone()
+        .ok_or("Missing [agent] section in config.toml — the agent requires an `[agent]` block with TLS configuration. See CONFIGURATION.md.")?;
 
     let http_client = Client::new();
 
@@ -69,7 +79,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // 3. Load TSA Trusted Roots
-    let trusted_roots = crate::tsa::load_trust_anchors(config.timestamp_authority.ca_path.as_deref());
+    let trusted_roots = crate::tsa::load_trust_anchors(
+        config.timestamp_authority.ca_path.as_deref(),
+        config.timestamp_authority.trust_system_store,
+    );
     tracing::info!("Loaded {} trusted TSA roots", trusted_roots.len());
 
     let hostname = hostname::get()
@@ -85,77 +98,129 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         jwks,
         hostname,
         trusted_roots,
+        replay_cache: crate::replay::ReplayCache::new(),
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/execute", post(execute_handler))
         .route("/stream/{id}", get(stream_logs_handler))
         .route("/api/files", get(list_files_handler))
         .route("/api/files/stream", get(stream_file_handler))
-        .with_state(state)
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any) // For local dev, Any is fine. In prod, strict origin.
-                .allow_headers(Any)
-                .allow_methods(Any),
-        );
+        .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 10022));
-    tracing::info!(event = "tcp_listen", address = %addr, "Agent listening");
+    if !agent_config.cors_allowed_origins.is_empty() {
+        use tower_http::cors::AllowOrigin;
+        use axum::http::HeaderValue;
+        let origins: Vec<HeaderValue> = agent_config
+            .cors_allowed_origins
+            .iter()
+            .filter_map(|o| HeaderValue::from_str(o).ok())
+            .collect();
+        app = app.layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_headers(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any),
+        );
+    }
+
+    let addr: SocketAddr = agent_config
+        .listen_address
+        .parse()
+        .map_err(|e| format!("Invalid agent.listen_address: {e}"))?;
+    tracing::info!(event = "tcp_listen", address = %addr, tls_mode = ?agent_config.tls, "Agent listening (TLS)");
 
     let listener = TcpListener::bind(&addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    crate::tls::serve_with_tls(listener, app, &agent_config.tls)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
 
     Ok(())
 }
 
 async fn execute_handler(
     State(state): State<AgentState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(req): Json<crate::security::ExecutionRequest>,
+    ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
+    Json(bundle): Json<crate::security::ExecutionBundle>,
 ) -> Result<Json<ExecutionResponse>, ErrorResponse> {
-    // Helper to log audit events on exit
-    // Helper to log audit events on exit
-    let log_audit = |decision: &'static str,
-                     reason: String,
-                     user: String,
-                     signed_at: Option<String>,
-                     command: Option<serde_json::Value>| {
-        crate::audit::log_audit(
-            decision,
-            reason,
-            user,
-            addr.ip().to_string(),
-            state.hostname.clone(),
-            signed_at,
-            command,
-            None,
-        );
+    use crate::audit::AuditContext;
+
+    let ip = addr.ip_string();
+    let hostname = state.hostname.clone();
+    let command_json = bundle.approver.command.clone();
+
+    let audit_ctx_basic = || AuditContext {
+        command: Some(command_json.clone()),
+        ..Default::default()
     };
 
-    tracing::info!("Verifying request for command execution");
+    tracing::info!("Verifying execution bundle");
 
-    // 1. Verify Request via Security Module
+    // 1. Resolve the command config up front so per-command validity windows
+    //    can feed into `verify_execution`.
+    let command_name = match command_json.get("command").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            crate::audit::log_audit(
+                "deny",
+                "Invalid command format: Missing 'command' field".into(),
+                "unauthenticated".into(),
+                ip.clone(),
+                hostname.clone(),
+                audit_ctx_basic(),
+            );
+            return Err(ErrorResponse {
+                error: "Invalid Request".into(),
+            });
+        }
+    };
+
+    let cmd_config = match state.config.commands.iter().find(|c| c.name == command_name) {
+        Some(c) => c.clone(),
+        None => {
+            crate::audit::log_audit(
+                "deny",
+                format!("Command '{}' not found in agent configuration", command_name),
+                "unauthenticated".into(),
+                ip.clone(),
+                hostname.clone(),
+                audit_ctx_basic(),
+            );
+            return Err(ErrorResponse {
+                error: "Invalid Request".into(),
+            });
+        }
+    };
+
+    let operator_max = cmd_config.operator_max_validity_or_default();
+    let approver_max = cmd_config.approver_max_validity_or_default();
+
+    // 2. Cryptographic + freshness + claim-predicate verification.
     let verifier_config = crate::security::VerifierConfig {
         client_id: state.config.oidc.client_id.clone(),
         issuer_url: state.config.oidc.issuer_url.clone(),
         jwks: state.jwks.clone(),
         trusted_roots: state.trusted_roots.clone(),
+        approver_max_validity: operator_max, // unused for self-exec; kept for symmetry
+        operator_max_validity: operator_max,
+    };
+    // We verify with operator_max_validity reflecting the short window; approver_max_validity
+    // needs to come from cmd_config:
+    let verifier_config = crate::security::VerifierConfig {
+        approver_max_validity: approver_max,
+        ..verifier_config
     };
 
-    let authorized_user = match crate::security::verify_execution(&req, &verifier_config) {
-        Ok(user) => user,
+    let authz = match crate::security::verify_execution(&bundle, &verifier_config) {
+        Ok(a) => a,
         Err(e) => {
-            log_audit(
+            crate::audit::log_audit(
                 "deny",
                 format!("Verification failed: {}", e),
                 "unauthenticated".into(),
-                None, // No signed_at for invalid signature
-                Some(req.command.clone()),
+                ip.clone(),
+                hostname.clone(),
+                audit_ctx_basic(),
             );
             return Err(ErrorResponse {
                 error: "Verification Failed".into(),
@@ -163,129 +228,113 @@ async fn execute_handler(
         }
     };
 
-    let authenticated_user = authorized_user.username;
-    let gen_time_str = authorized_user
-        .timestamp
+    let approver_user = authz.approver.username.clone();
+    let operator_user = authz.operator.username.clone();
+    let approver_signed_at = authz
+        .approver
+        .signed_at
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown_time".to_string());
-    
-    let signed_at_str = Some(gen_time_str.clone());
+    let operator_signed_at = authz
+        .operator
+        .signed_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown_time".to_string());
 
-    // 4. OPA Authorization
-    let command_name = match req.command.get("command").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            log_audit(
-                "deny",
-                "Invalid command format: Missing 'command' field".into(),
-                authenticated_user,
-                signed_at_str,
-                Some(req.command.clone()),
-            );
-            return Err(ErrorResponse {
-                error: "Invalid Request".into(),
-            });
-        }
+    let full_ctx = || AuditContext {
+        signed_at: Some(approver_signed_at.clone()),
+        command: Some(command_json.clone()),
+        operator_user: Some(operator_user.clone()),
+        operator_signed_at: Some(operator_signed_at.clone()),
+        self_executed: Some(authz.self_executed),
+        ..Default::default()
     };
 
-    tracing::info!("Authorizing command '{}' with OPA", command_name);
-
-    let cmd_config = match state
-        .config
-        .commands
-        .iter()
-        .find(|c| c.name == command_name)
+    // 3. Replay check — executor signature (operator if delegated, else approver).
+    if state
+        .replay_cache
+        .check_and_insert(&authz.executor_signature_hex, operator_max)
+        .is_err()
     {
-        Some(c) => c,
+        crate::audit::log_audit(
+            "deny",
+            "Replay detected: executor signature already used".into(),
+            approver_user.clone(),
+            ip.clone(),
+            hostname.clone(),
+            full_ctx(),
+        );
+        return Err(ErrorResponse {
+            error: "Replay Detected".into(),
+        });
+    }
+
+    // 4. Command-level constraints (target machines, not_before/not_after).
+    let now = time::OffsetDateTime::now_utc();
+
+    let target_machines = command_json
+        .get("target_machines")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        });
+
+    let not_before = command_json
+        .get("not_before")
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+        });
+
+    let not_after = command_json
+        .get("not_after")
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+        });
+
+    let targets = match target_machines {
+        Some(t) => t,
         None => {
-            log_audit(
+            crate::audit::log_audit(
                 "deny",
-                format!(
-                    "Command '{}' not found in agent configuration",
-                    command_name
-                ),
-                authenticated_user,
-                signed_at_str,
-                Some(req.command.clone()),
+                "Missing mandatory 'target_machines' field".into(),
+                approver_user.clone(),
+                ip.clone(),
+                hostname.clone(),
+                full_ctx(),
             );
             return Err(ErrorResponse {
-                error: "Invalid Request".into(),
+                error: "Missing Target Restriction".into(),
             });
         }
     };
 
-    // 4b. Verify Validity and Constraints
-    let now = time::OffsetDateTime::now_utc();
-    
-    // Check 1: Max Validity
-    let max_validity = cmd_config
-        .max_validity
-        .and_then(|d| time::Duration::try_from(d).ok())
-        .unwrap_or(time::Duration::days(3));
-
-    let age = now - authorized_user.timestamp;
-    if age > max_validity {
-        log_audit(
+    if !targets.contains(&hostname) {
+        crate::audit::log_audit(
             "deny",
-            format!("Command signature expired (max validity: {}, age: {})", max_validity, age),
-            authenticated_user.clone(),
-            signed_at_str.clone(),
-            Some(req.command.clone()),
+            format!("Hostname '{}' not in target list '{:?}'", hostname, targets),
+            approver_user.clone(),
+            ip.clone(),
+            hostname.clone(),
+            full_ctx(),
         );
         return Err(ErrorResponse {
-            error: format!("Command Signature Expired (age: {} > max: {})", age, max_validity),
+            error: format!("Target Machine Mismatch ({} not in {:?})", hostname, targets),
         });
     }
 
-    // Parse constraints from command payload
-    let target_machines = req.command.get("target_machines")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
-
-    let not_before = req.command.get("not_before")
-        .and_then(|v| v.as_str())
-        .and_then(|s| time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok());
-
-    let not_after = req.command.get("not_after")
-        .and_then(|v| v.as_str())
-        .and_then(|s| time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok());
-
-    // Check 2: Target Machine (Mandatory)
-    let targets = target_machines.ok_or_else(|| {
-        log_audit(
-            "deny",
-            "Missing mandatory 'target_machines' field".to_string(),
-            authenticated_user.clone(),
-            signed_at_str.clone(),
-            Some(req.command.clone()),
-        );
-        ErrorResponse {
-            error: "Missing Target Restriction".into(),
-        }
-    })?;
-
-    if !targets.contains(&state.hostname) {
-        log_audit(
-            "deny",
-            format!("Hostname '{}' not in target list '{:?}'", state.hostname, targets),
-            authenticated_user.clone(),
-            signed_at_str.clone(),
-            Some(req.command.clone()),
-        );
-        return Err(ErrorResponse {
-            error: format!("Target Machine Mismatch ({} not in {:?})", state.hostname, targets),
-        });
-    }
-
-    // Check 3: Time Constraints
     if let Some(nbf) = not_before {
         if now < nbf {
-            log_audit(
+            crate::audit::log_audit(
                 "deny",
                 format!("Command not yet valid (nbf: {}, now: {})", nbf, now),
-                authenticated_user.clone(),
-                signed_at_str.clone(),
-                Some(req.command.clone()),
+                approver_user.clone(),
+                ip.clone(),
+                hostname.clone(),
+                full_ctx(),
             );
             return Err(ErrorResponse {
                 error: format!("Command Not Yet Valid (Starts at {})", nbf),
@@ -295,12 +344,13 @@ async fn execute_handler(
 
     if let Some(exp) = not_after {
         if now > exp {
-            log_audit(
+            crate::audit::log_audit(
                 "deny",
                 format!("Command expired (not_after: {}, now: {})", exp, now),
-                authenticated_user.clone(),
-                signed_at_str.clone(),
-                Some(req.command.clone()),
+                approver_user.clone(),
+                ip.clone(),
+                hostname.clone(),
+                full_ctx(),
             );
             return Err(ErrorResponse {
                 error: format!("Command Expired (Expired at {})", exp),
@@ -308,24 +358,38 @@ async fn execute_handler(
         }
     }
 
-    // Call OPA
+    // 5. OPA authorization with both identities.
+    let opa_input = crate::opa::OpaInput {
+        command: command_json.clone(),
+        approver: crate::opa::SignerContext {
+            username: approver_user.clone(),
+            claims: authz.approver.claims.clone(),
+            signed_at: approver_signed_at.clone(),
+        },
+        operator: crate::opa::SignerContext {
+            username: operator_user.clone(),
+            claims: authz.operator.claims.clone(),
+            signed_at: operator_signed_at.clone(),
+        },
+        self_executed: authz.self_executed,
+        host: hostname.clone(),
+    };
+
     let decision = crate::opa::check_authorization(
         &state.http_client,
         &state.config.opa_url,
         &cmd_config.opa_rule,
-        req.command.clone(),
-        req.id_token.clone(),
-        gen_time_str.clone(),
-        state.hostname.clone(),
+        opa_input,
     )
     .await
     .map_err(|e| {
-        log_audit(
+        crate::audit::log_audit(
             "error",
             format!("OPA evaluation failed: {}", e),
-            authenticated_user.clone(),
-            signed_at_str.clone(),
-            Some(req.command.clone()),
+            approver_user.clone(),
+            ip.clone(),
+            hostname.clone(),
+            full_ctx(),
         );
         ErrorResponse {
             error: "Internal Error".into(),
@@ -333,18 +397,24 @@ async fn execute_handler(
     })?;
 
     if !decision.allow {
-            log_audit(
-                "deny",
-                decision.reason.clone(),
-                authenticated_user,
-                signed_at_str,
-                Some(req.command.clone()),
-            );
-        // Do not leak reason to client
+        crate::audit::log_audit(
+            "deny",
+            decision.reason.clone(),
+            approver_user.clone(),
+            ip.clone(),
+            hostname.clone(),
+            full_ctx(),
+        );
         return Err(ErrorResponse {
             error: "Authorization Denied".into(),
         });
     }
+
+    // Preserve legacy locals used below.
+    let authenticated_user = approver_user.clone();
+    let gen_time_str = approver_signed_at.clone();
+    let signed_at_str = Some(gen_time_str.clone());
+    let req_command = command_json.clone();
 
     // 5. Execute Command
     let executable = cmd_config
@@ -354,8 +424,7 @@ async fn execute_handler(
 
     // Check for explicit ID in payload, else generate one?
     // Plan said UI generates it.
-    let execution_id = req
-        .command
+    let execution_id = req_command
         .get("id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -371,12 +440,13 @@ async fn execute_handler(
     let logs_dir = PathBuf::from(&state.config.logs_dir);
     if !logs_dir.exists() {
         tokio::fs::create_dir_all(&logs_dir).await.map_err(|e| {
-            log_audit(
+            crate::audit::log_audit(
                 "error",
                 format!("Failed to create logs dir: {}", e),
                 authenticated_user.clone(),
-                signed_at_str.clone(),
-                Some(req.command.clone()),
+                ip.clone(),
+                hostname.clone(),
+                full_ctx(),
             );
             ErrorResponse {
                 error: "Internal Error".into(),
@@ -385,12 +455,13 @@ async fn execute_handler(
     }
     let log_path = logs_dir.join(format!("{}.log", execution_id));
     let mut log_file = tokio::fs::File::create(&log_path).await.map_err(|e| {
-        log_audit(
+        crate::audit::log_audit(
             "error",
             format!("Failed to create log file: {}", e),
             authenticated_user.clone(),
-            signed_at_str.clone(),
-            Some(req.command.clone()),
+            ip.clone(),
+            hostname.clone(),
+            full_ctx(),
         );
         ErrorResponse {
             error: "Internal Error".into(),
@@ -421,12 +492,13 @@ async fn execute_handler(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
-            log_audit(
+            crate::audit::log_audit(
                 "error",
                 format!("Failed to spawn command: {}", e),
                 authenticated_user.clone(),
-                signed_at_str.clone(),
-                Some(req.command.clone()),
+                ip.clone(),
+                hostname.clone(),
+                full_ctx(),
             );
             ErrorResponse {
                 error: "Execution Failed".into(),
@@ -483,13 +555,15 @@ async fn execute_handler(
         }
     });
 
-    log_audit(
+    crate::audit::log_audit(
         "allow",
         "Command Started".to_string(),
         authenticated_user.clone(),
-        signed_at_str,
-        Some(req.command.clone()),
+        ip.clone(),
+        hostname.clone(),
+        full_ctx(),
     );
+    let _ = signed_at_str;
 
     Ok(Json(ExecutionResponse {
         status: "authorized".to_string(),
@@ -528,12 +602,10 @@ fn default_tail_lines() -> Option<usize> {
 
 async fn stream_file_handler(
     State(state): State<AgentState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
     Query(params): Query<StreamFileParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Helper for audit logging
-    // Helper for audit logging
     let log_audit = |decision: &'static str,
                      reason: String,
                      user: String,
@@ -542,11 +614,12 @@ async fn stream_file_handler(
             decision,
             reason,
             user,
-            addr.ip().to_string(),
+            addr.ip_string(),
             state.hostname.clone(),
-            None,
-            None,
-            file_info,
+            crate::audit::AuditContext {
+                file: file_info,
+                ..Default::default()
+            },
         );
     };
 

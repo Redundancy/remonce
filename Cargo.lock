@@ -2280,6 +2280,7 @@ dependencies = [
  "rustls-acme",
  "rustls-native-certs",
  "rustls-pemfile",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha2",
@@ -2297,7 +2298,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "webpki",
  "x509-parser 0.18.0",
 ]
 
@@ -3510,16 +3510,6 @@ checksum = "3a1f95c0d03a47f4ae1f7a64643a6bb97465d9b740f0fa8f90ea33915c99a9a1"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "webpki"
-version = "0.22.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed63aea5ce73d0ff405984102c42de94fc55a6b75765d621c65262469b3c9b53"
-dependencies = [
- "ring",
- "untrusted",
 ]
 
 [[package]]

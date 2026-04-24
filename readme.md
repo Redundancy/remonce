@@ -21,16 +21,18 @@ Remonse is built to be an easily configured, lightweight system that lowers the 
 *   **Low Touch**: Lightweight deployment with minimal configuration.
 *   **Flexible Centralization**: Teams decide their own trade-offs—run fully decentralized or enforce global policies centrally.
 *   **Secure Defaults**: Architecture enforces a **deny-by-default** posture, ensuring **least-privileged access**.
-*   **Delegated Permissions**: Architecture supports multi-approver workflows where approvers authorize actions without needing direct access to the target.
+*   **Delegated Permissions**: Two-signature protocol where a senior approver authorizes commands with a long validity (days) and an on-call operator adds a fresh co-signature (minutes) at execution time. The approver can restrict *who* may execute via OIDC claim predicates.
 *   **Cloud Agnostic**: Works on AWS, Azure, GCP, or On-Prem.
 
 ---
 
 ## How It Works
 
-The process begins when a user authenticates via their corporate Identity Provider (e.g., Vault, Okta, Azure AD). The local client then generates a **Signed Command** bundled with a short-lived Proof-of-Identity (JWT). This payload is sent to the target machine (Agent), which cryptographically verifies both the signature and the identity.
+The process begins when a user authenticates via their corporate Identity Provider (e.g., Vault, Okta, Azure AD). The local client generates a **Signed Command** bundled with a short-lived Proof-of-Identity (JWT) and an RFC 3161 timestamp.
 
-Once verified, the Agent consults the **Open Policy Agent (OPA)** to determine if *this specific user* is authorized to execute *this specific command* based on fine-grained logic. If authorized, the command runs immediately, with stdout and stderr streamed securely back to the user in real-time.
+For synchronous work, the same user submits the bundle directly to the Agent — a "self-execute" path where freshness is enforced at the short (minutes) window. For delegated work (e.g., overnight NOC maintenance), the approver's bundle is handed off to an operator who adds a fresh co-signature under their own identity before submitting; the approver's authorization can remain valid for days while the operator's attestation proves the command was actually sent in the current moment.
+
+The Agent cryptographically verifies signatures, timestamps, nonce-bound identities, and any approver-embedded constraints on *who* may execute, then consults **Open Policy Agent (OPA)** for the final business-logic allow/deny. Authorized commands run immediately with stdout and stderr streamed back in real-time; an in-memory replay cache prevents duplicate executions within the freshness window.
 
 ---
 
@@ -78,22 +80,39 @@ Read-only access to files can be configured via `[[files]]` entries.
 
 ---
 
+## Deployment Model
+
+Remonse is split into two processes that usually live on different machines:
+
+- **`remonse web`** — the **signer**, runs on the operator's workstation. Always binds to loopback (`127.0.0.1` / `::1`); no TLS needed.
+- **`remonse agent`** — the **executor**, runs on the remote target server. TLS is mandatory (file-based cert or ACME); there is no plaintext mode.
+
+The signer builds a signed command locally and the operator (or a delegate) sends it to the agent over TLS.
+
 ## Quick Start (Local)
 
 1.  **Prerequisites**: Rust, Vault, OPA, Terraform (see [Dev Guide](DEVELOPMENT.md)).
-2.  **Start Services**:
+2.  **Generate a self-signed cert for the agent** (first time only):
+    ```powershell
+    mkdir certs
+    openssl req -x509 -newkey rsa:2048 -nodes -days 365 `
+      -keyout certs/agent-key.pem -out certs/agent-fullchain.pem `
+      -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+    ```
+    Then uncomment the `[agent]` / `[agent.tls]` block in [config.toml](config.toml).
+3.  **Start Services**:
     ```powershell
     ./start_services.bat
     ```
-3.  **Run Web Interface**:
+4.  **Run Web Interface** (signer, on your workstation):
     ```powershell
     cargo run -- web
     ```
-4.  **Run Agent**:
+5.  **Run Agent** (executor, on the target host):
     ```powershell
     cargo run -- agent
     ```
-5.  **Open**: [http://localhost:8080](http://localhost:8080)
+6.  **Open**: [http://localhost:8080](http://localhost:8080)
 
 ---
 

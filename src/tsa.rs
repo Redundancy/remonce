@@ -9,6 +9,17 @@ use sha2::{Digest, Sha256}; // Needed for Integer -> i64
 use p256::ecdsa::{Signature, VerifyingKey};
 use x509_parser::prelude::*;
 
+/// Bundled DigiCert Trusted Root G4 (expires 2038-01-15). Forms the default
+/// trust anchor for TSA signature verification; matches the default TSA URL
+/// (`http://timestamp.digicert.com`) and the free DigiCert public TSA that
+/// most deployments will use out of the box.
+pub const DIGICERT_ROOT_G4_DER: &[u8] =
+    include_bytes!("../trust_anchors/DigiCertTrustedRootG4.crt");
+
+/// DER-encoded OID content for id-kp-timeStamping (1.3.6.1.5.5.7.3.8),
+/// per RFC 3161 §2.3.
+const TIMESTAMPING_EKU_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08];
+
 // OID Constants
 const OID_SIGNED_DATA: &[u32] = &[1, 2, 840, 113549, 1, 7, 2];
 const OID_TST_INFO_CONTENT_TYPE: &[u32] = &[1, 2, 840, 113549, 1, 9, 16, 1, 4];
@@ -204,19 +215,18 @@ pub fn verify_timestamp(
     // 3. Verify MessageImprint (RFC 3161 Section 2.4.1)
     verify_message_imprint(&tst_info.message_imprint, data)?;
 
-    // 4. Verify CMS Signature (RFC 5652)
-    verify_cms_signature(&signed_data, &tst_info_bytes, trusted_roots)?;
-
-    // 5. Return Time from TSTInfo
+    // 4. Extract gen_time from TSTInfo — used for historical chain validation.
     let chrono_time: chrono::DateTime<chrono::FixedOffset> = tst_info.gen_time.into();
     let timestamp = chrono_time.timestamp();
     let nanos = chrono_time.timestamp_subsec_nanos();
-
-    let dt = ::time::OffsetDateTime::from_unix_timestamp(timestamp)
+    let gen_time = ::time::OffsetDateTime::from_unix_timestamp(timestamp)
         .map_err(|_| TsaError::Verification("Invalid timestamp range".into()))?
         + ::time::Duration::nanoseconds(nanos as i64);
 
-    Ok(dt)
+    // 5. Verify CMS Signature + chain (RFC 5652). Chain check uses gen_time.
+    verify_cms_signature(&signed_data, &tst_info_bytes, trusted_roots, gen_time)?;
+
+    Ok(gen_time)
 }
 
 /// Parses the RFC 3161 TimeStampToken (ContentInfo) and extracts SignedData and TSTInfo.
@@ -324,6 +334,7 @@ fn verify_cms_signature(
     signed_data: &SignedData,
     tst_info_bytes: &[u8],
     trusted_roots: &[Vec<u8>],
+    gen_time: ::time::OffsetDateTime,
 ) -> Result<(), TsaError> {
     if signed_data.signer_infos.len() != 1 {
         let msg = format!(
@@ -461,8 +472,8 @@ fn verify_cms_signature(
         )));
     }
 
-    // Verify Trust Chain
-    verify_trust_chain(signer_cert_der, &certs_der, trusted_roots)?;
+    // Verify Trust Chain (EKU, validity window, signature, path) via rustls-webpki.
+    verify_trust_chain(signer_cert_der, &certs_der, trusted_roots, gen_time)?;
     Ok(())
 }
 
@@ -494,196 +505,139 @@ fn verify_signature_rsa(spki: &[u8], msg: &[u8], signature_bytes: &[u8]) -> Resu
         .map_err(|e| format!("RSA Verification failed: {}", e))
 }
 
+/// Verify the end-entity TSA signer cert chains to a trusted root, was valid
+/// at `gen_time`, and carries the `id-kp-timeStamping` EKU (RFC 3161 §2.3).
+/// Delegates to `rustls-webpki`.
 fn verify_trust_chain(
     cert_der: &[u8],
     intermediates: &[Vec<u8>],
     roots: &[Vec<u8>],
+    gen_time: ::time::OffsetDateTime,
 ) -> Result<(), TsaError> {
-    // Max depth to prevent infinite loops
-    const MAX_CHAIN_DEPTH: usize = 10;
+    use rustls::pki_types::{CertificateDer, UnixTime};
+    use webpki::{EndEntityCert, KeyUsage};
 
-    let mut current_cert_der = cert_der.to_vec();
+    let ee_der = CertificateDer::from(cert_der);
+    let ee = EndEntityCert::try_from(&ee_der).map_err(|e| {
+        TsaError::CertValidation(format!("invalid TSA end-entity cert: {:?}", e))
+    })?;
 
-    for depth in 0..MAX_CHAIN_DEPTH {
-        // 1. Check if current_cert is directly trusted (Root or Trusted Intermediate)
-        for (i, root_der) in roots.iter().enumerate() {
-            if root_der == &current_cert_der {
-                tracing::debug!("TSA Verification: Direct trust match with Root[{}]", i);
-                return Ok(());
-            }
-
-            // Check if signed by root
-            if let Ok((_, root)) = x509_parser::parse_x509_certificate(root_der) {
-                if let Ok((_, current)) = x509_parser::parse_x509_certificate(&current_cert_der) {
-                    if root.tbs_certificate.subject == current.tbs_certificate.issuer {
-                        tracing::debug!(
-                            "TSA Verification: Found potential issuer Root[{}] for cert at depth {}",
-                            i,
-                            depth
-                        );
-
-                        // Verify signature
-                        let root_spki =
-                            root.tbs_certificate.subject_pki.subject_public_key.as_ref();
-                        let spki_oid_str = root
-                            .tbs_certificate
-                            .subject_pki
-                            .algorithm
-                            .algorithm
-                            .to_string();
-
-                        let sig_valid = if spki_oid_str == OID_EC_PUBLIC_KEY_STR {
-                            verify_signature_p256(
-                                root_spki,
-                                current.tbs_certificate.as_ref(),
-                                current.signature_value.as_ref(),
-                            )
-                            .is_ok()
-                        } else if spki_oid_str == OID_RSA_ENCRYPTION_STR {
-                            verify_signature_rsa(
-                                root_spki,
-                                current.tbs_certificate.as_ref(),
-                                current.signature_value.as_ref(),
-                            )
-                            .is_ok()
-                        } else {
-                            tracing::warn!(
-                                "TSA Verification: Unsupported algorithm {}",
-                                spki_oid_str
-                            );
-                            false
-                        };
-
-                        if sig_valid {
-                            tracing::info!(
-                                "TSA Verification: Trust chain verified at depth {}",
-                                depth
-                            );
-                            return Ok(());
-                        } else {
-                            tracing::warn!(
-                                "TSA Verification: Signature verification failed for Root[{}]",
-                                i
-                            );
-                        }
-                    }
+    let anchors: Vec<rustls::pki_types::TrustAnchor> = roots
+        .iter()
+        .filter_map(|der| {
+            let cd = CertificateDer::from(der.as_slice());
+            match webpki::anchor_from_trusted_cert(&cd) {
+                Ok(ta) => Some(ta.to_owned()),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable trust anchor: {:?}", e);
+                    None
                 }
             }
-        }
+        })
+        .collect();
 
-        // 2. If not trusted by root, look for issuer in intermediates
-        // Scope the parsing to avoid long-lived borrow of current_cert_der
-        let next_cert_der = {
-            let (_, current) =
-                x509_parser::parse_x509_certificate(&current_cert_der).map_err(|_| {
-                    TsaError::CertValidation("Failed to parse current cert in chain".into())
-                })?;
-
-            // Self-signed check to stop (if not found in roots)
-            if current.tbs_certificate.issuer == current.tbs_certificate.subject {
-                return Err(TsaError::CertValidation(
-                    "Self-signed certificate at end of chain is not trusted".into(),
-                ));
-            }
-
-            let mut found_issuer = None;
-            for inter_der in intermediates {
-                if let Ok((_, inter)) = x509_parser::parse_x509_certificate(inter_der) {
-                    if inter.tbs_certificate.subject == current.tbs_certificate.issuer {
-                        // Potential issuer found
-                        tracing::debug!(
-                            "TSA Verification: Found intermediate issuer for current cert"
-                        );
-
-                        // Verify signature to be sure
-                        let inter_spki = inter
-                            .tbs_certificate
-                            .subject_pki
-                            .subject_public_key
-                            .as_ref();
-                        let spki_oid_str = inter
-                            .tbs_certificate
-                            .subject_pki
-                            .algorithm
-                            .algorithm
-                            .to_string();
-
-                        let sig_valid = if spki_oid_str == OID_EC_PUBLIC_KEY_STR {
-                            verify_signature_p256(
-                                inter_spki,
-                                current.tbs_certificate.as_ref(),
-                                current.signature_value.as_ref(),
-                            )
-                            .is_ok()
-                        } else if spki_oid_str == OID_RSA_ENCRYPTION_STR {
-                            verify_signature_rsa(
-                                inter_spki,
-                                current.tbs_certificate.as_ref(),
-                                current.signature_value.as_ref(),
-                            )
-                            .is_ok()
-                        } else {
-                            false
-                        };
-
-                        if sig_valid {
-                            found_issuer = Some(inter_der.clone());
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if let Some(next) = found_issuer {
-                next
-            } else {
-                return Err(TsaError::CertValidation(format!(
-                    "Issuer not found for certificate at depth {}. Issuer: {:?}",
-                    depth, current.tbs_certificate.issuer
-                )));
-            }
-        };
-
-        current_cert_der = next_cert_der;
+    if anchors.is_empty() {
+        return Err(TsaError::CertValidation(
+            "no usable TSA trust anchors configured".into(),
+        ));
     }
 
-    Err(TsaError::CertValidation("Max chain depth exceeded".into()))
+    let intermediate_ders: Vec<CertificateDer> = intermediates
+        .iter()
+        .map(|v| CertificateDer::from(v.as_slice()))
+        .collect();
+
+    // Use the gen_time from the TSTInfo, not wall-clock now(). A TSA cert that
+    // was valid when it signed should still produce a verifiable historical
+    // timestamp even if the cert later expired.
+    let time = UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+        gen_time.unix_timestamp().max(0) as u64,
+    ));
+
+    let usage = KeyUsage::required(TIMESTAMPING_EKU_OID);
+
+    ee.verify_for_usage(
+        webpki::ALL_VERIFICATION_ALGS,
+        &anchors,
+        &intermediate_ders,
+        time,
+        usage,
+        None,
+        None,
+    )
+    .map_err(|e| TsaError::CertValidation(format!("TSA chain verification failed: {:?}", e)))?;
+
+    tracing::debug!("TSA Verification: chain validated via rustls-webpki");
+    Ok(())
 }
 
+/// Find the signer cert referenced by `sid` in the candidate set. Per RFC 5652
+/// §5.1, `IssuerAndSerialNumber` identifies a cert by the **pair** of issuer DN
+/// and serial; serial alone is not unique across CAs.
 fn find_signer_cert<'a>(certs: &'a [Vec<u8>], sid: &SignerIdentifier) -> Option<&'a Vec<u8>> {
     use num_bigint::{BigInt, Sign};
     for (i, cert_der) in certs.iter().enumerate() {
-        if let Ok((_, x509)) = x509_parser::parse_x509_certificate(cert_der) {
-            match sid {
-                SignerIdentifier::IssuerAndSerialNumber(ias) => {
-                    // Check Serial Number.
-                    let x509_serial_bytes = x509.tbs_certificate.serial.to_bytes_be();
-                    let x509_as_int = BigInt::from_bytes_be(Sign::Plus, &x509_serial_bytes);
-                    tracing::debug!(
-                        "TSA Verification: Candidate Cert [{}] Serial: {}",
-                        i,
-                        x509_as_int
-                    );
-
-                    // ias.serial_number is rasn::types::Integer (BigInt alias).
-                    if x509_as_int == ias.serial_number.clone().into() {
-                        tracing::debug!("TSA Verification: Match found for serial {}", x509_as_int);
-                        tracing::debug!(
-                            "TSA Verification: Signer Issuer: {:?}",
-                            x509.tbs_certificate.issuer
-                        );
-                        return Some(cert_der);
-                    }
+        let parsed = match x509_parser::parse_x509_certificate(cert_der) {
+            Ok((_, p)) => p,
+            Err(_) => {
+                tracing::warn!(
+                    "TSA Verification: Candidate Cert [{}] failed to parse X.509",
+                    i
+                );
+                continue;
+            }
+        };
+        match sid {
+            SignerIdentifier::IssuerAndSerialNumber(ias) => {
+                let x509_serial_bytes = parsed.tbs_certificate.serial.to_bytes_be();
+                let x509_as_int = BigInt::from_bytes_be(Sign::Plus, &x509_serial_bytes);
+                if x509_as_int != ias.serial_number.clone().into() {
+                    continue;
                 }
-                SignerIdentifier::SubjectKeyIdentifier(_ski) => {
-                    tracing::warn!("TSA Verification: SKI matching not implemented yet");
+                // Serial matches — verify issuer DN too. Compare the raw DER of
+                // the cert's Issuer field against the `sid.issuer` re-encoded.
+                let cert_issuer_der = parsed.tbs_certificate.issuer.as_raw();
+                let sid_issuer_der = match rasn::der::encode(&ias.issuer) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            "TSA Verification: Failed to encode sid.issuer for comparison: {}",
+                            e
+                        );
+                        continue;
+                    }
+                };
+                if cert_issuer_der == sid_issuer_der.as_slice() {
+                    tracing::debug!(
+                        "TSA Verification: Signer cert matched on issuer+serial (candidate {})",
+                        i
+                    );
+                    return Some(cert_der);
+                } else {
+                    tracing::debug!(
+                        "TSA Verification: Candidate {} has matching serial but issuer DN mismatch",
+                        i
+                    );
                 }
             }
-        } else {
-            tracing::warn!(
-                "TSA Verification: Candidate Cert [{}] failed to parse X.509",
-                i
-            );
+            SignerIdentifier::SubjectKeyIdentifier(ski) => {
+                if let Ok(Some(ext)) = parsed.get_extension_unique(
+                    &x509_parser::oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER,
+                ) {
+                    if let x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(
+                        cert_ski,
+                    ) = ext.parsed_extension()
+                    {
+                        if cert_ski.0 == ski.as_ref() {
+                            tracing::debug!(
+                                "TSA Verification: Signer cert matched on SKI (candidate {})",
+                                i
+                            );
+                            return Some(cert_der);
+                        }
+                    }
+                }
+            }
         }
     }
     if !certs.is_empty() {
@@ -692,35 +646,30 @@ fn find_signer_cert<'a>(certs: &'a [Vec<u8>], sid: &SignerIdentifier) -> Option<
     None
 }
 
-/// Helper to load system roots + optional file
-pub fn load_trust_anchors(extra_path: Option<&str>) -> Vec<Vec<u8>> {
+/// Load the TSA trust anchor set.
+///
+/// Always includes the bundled DigiCert Trusted Root G4. Adds certs from
+/// `extra_path` (PEM) if provided. If `trust_system_store` is true, the OS
+/// native trust store is *also* included — this is guarded by `--insecure`
+/// because it widens the TSA trust surface to every CA the OS trusts.
+pub fn load_trust_anchors(extra_path: Option<&str>, trust_system_store: bool) -> Vec<Vec<u8>> {
     let mut roots = Vec::new();
 
-    // Load native
-    let cert_res = rustls_native_certs::load_native_certs();
-    for c in cert_res.certs {
-        roots.push(c.as_ref().to_vec());
-    }
-    if !cert_res.errors.is_empty() {
-        tracing::warn!("Errors loading native certs: {:?}", cert_res.errors);
-    }
+    // Always: bundled DigiCert Root G4.
+    roots.push(DIGICERT_ROOT_G4_DER.to_vec());
+    tracing::info!("TSA trust: bundled DigiCert Trusted Root G4 (always-on default)");
 
-    // Load extra
+    // Optional: operator-supplied extra CAs.
     if let Some(path) = extra_path {
-        tracing::info!(
-            "TSA Verification: Loading extra trust anchors from {}",
-            path
-        );
         match std::fs::read(path) {
             Ok(bytes) => {
-                // Parse PEM
                 let mut count = 0;
                 for pem in x509_parser::pem::Pem::iter_from_buffer(&bytes).flatten() {
                     roots.push(pem.contents);
                     count += 1;
                 }
                 tracing::info!(
-                    "TSA Verification: Loaded {} certificates from {}",
+                    "TSA trust: loaded {} additional anchor(s) from {}",
                     count,
                     path
                 );
@@ -730,5 +679,22 @@ pub fn load_trust_anchors(extra_path: Option<&str>) -> Vec<Vec<u8>> {
             }
         }
     }
+
+    // Opt-in: OS native trust store. Gated by `--insecure`.
+    if trust_system_store {
+        let cert_res = rustls_native_certs::load_native_certs();
+        let count = cert_res.certs.len();
+        for c in cert_res.certs {
+            roots.push(c.as_ref().to_vec());
+        }
+        if !cert_res.errors.is_empty() {
+            tracing::warn!("Errors loading native certs: {:?}", cert_res.errors);
+        }
+        tracing::warn!(
+            "TSA trust: system store enabled (INSECURE) — trusting {} additional OS CA(s)",
+            count
+        );
+    }
+
     roots
 }

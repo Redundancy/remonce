@@ -6,15 +6,23 @@ use remonse::web;
 #[command(name = "remonse")]
 #[command(about = "Remote Monitoring and Secure Execution")]
 struct Cli {
+    /// Run with a security-degraded configuration. Unlocks settings that
+    /// broaden the trust surface (HTTP non-loopback OIDC issuer, OS TSA
+    /// trust store, long operator_max_validity, wildcard CORS). Each
+    /// active gate is logged at startup and every audit entry includes
+    /// `insecure: true`.
+    #[arg(long, global = true)]
+    insecure: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the OIDC/Web Proxy Server
+    /// Run the OIDC/Web Proxy Server (signer)
     Web,
-    /// Run the Execution Agent
+    /// Run the Execution Agent (remote executor)
     Agent,
 }
 
@@ -26,12 +34,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Web => {
             println!("Starting Web Proxy...");
-            // web::run returns specialized AppError, we map it to Box<dyn Error> for main
-            web::run().await.map_err(|e| e.into())
+            web::run(cli.insecure).await.map_err(|e| e.into())
         }
         Commands::Agent => {
             println!("Starting Execution Agent...");
-            agent::run().await
+            agent::run(cli.insecure).await
         }
     }
 }

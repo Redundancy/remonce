@@ -59,7 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Verifying generated token (self-test)...");
 
     // Load trust anchors
-    let trusted_roots = tsa::load_trust_anchors(config.timestamp_authority.ca_path.as_deref());
+    let trusted_roots = tsa::load_trust_anchors(
+        config.timestamp_authority.ca_path.as_deref(),
+        config.timestamp_authority.trust_system_store,
+    );
 
     // verify_timestamp expects raw data and checks its hash against msgImprint
     match tsa::verify_timestamp(&token_bytes, input_data, &trusted_roots) {

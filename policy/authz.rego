@@ -1,69 +1,82 @@
 package remonse.authz
 import future.keywords.if
+import future.keywords.in
 
 default allow = false
 default reason = "Denied by default"
 
 # Input Documentation
 # -------------------
-# The 'input' object contains the following fields:
+# For command execution requests, `input` contains:
 #
-# input.command: object
-#   The JSON payload of the command request.
-#   Example: { "command": "test" }
+#   input.command: object          - the approver's signed command payload
+#   input.approver:                - the authorizing identity
+#     .username: string
+#     .claims:   object            - the approver's OIDC JWT claims (groups, etc.)
+#     .signed_at: string           - RFC3339 approver TSA timestamp
+#   input.operator:                - the executing identity (equals approver
+#                                    when self-executing)
+#     .username: string
+#     .claims:   object
+#     .signed_at: string
+#   input.self_executed: bool      - true iff approver == operator
+#   input.host: string             - agent hostname
 #
-# input.action: string
-#   The action being requested (optional).
-#   Example: "view_docs" used by the API to list commands.
+# For file access / command listing, a simpler shape is used:
+#   input.action:  string   ("view_docs" | "read_file")
+#   input.jwt:     string   (file-access legacy path)
+#   input.file:    object   (when action == "read_file")
 #
-# input.jwt: string
-#   The raw encoded ID Token (JWT) of the authenticated user.
-#   You can use `io.jwt.decode(input.jwt)` to inspect claims (e.g. groups, sub, iss).
-#
-# input.timestamp: string
-#   The RFC3339 formatted verification timestamp from the TSA.
-#   This represents when the command was signed.
-#
-# input.host: string
-#   The hostname of the system where the agent is running.
-#   Example: "agent-server-prod-01"
-#
+# The agent enforces cryptographic checks (signatures, TSA freshness, operator
+# claim predicates) BEFORE calling OPA. Policy here encodes business-level
+# authorization: who may authorize what, separation of duties, etc.
 
-# Helper to extract claims
+# --- Helpers ---
+
+approver_groups := g if { g := input.approver.claims.groups } else := []
+operator_groups := g if { g := input.operator.claims.groups } else := []
+
+# --- File access / command listing ---
+# These keep the legacy `jwt`-in-input shape for the file streaming handler.
 claims := payload if {
     [_, payload, _] := io.jwt.decode(input.jwt)
 }
+legacy_user_groups := g if { g := claims.groups } else := []
 
-# Helper to get groups (default to empty list)
-user_groups := claims.groups if {
-    claims.groups
-} else := []
-
-# Action: View Docs
-# Allow if the user is in the 'webapp-users' group
 allow if {
     input.action == "view_docs"
-    user_groups[_] == "webapp-users"
+    "webapp-users" in legacy_user_groups
 }
 
-# Action: Read File
-# Allow if the user is in the 'webapp-users' group
 allow if {
     input.action == "read_file"
-    user_groups[_] == "webapp-users"
+    "webapp-users" in legacy_user_groups
 }
 
-# Command: test
+# --- Command execution rules ---
+
+# test: any approver in `webapp-users` can authorize; no operator restriction.
 allow if {
     input.command.command == "test"
-    user_groups[_] == "webapp-users"
+    "webapp-users" in approver_groups
 }
 
-# Command: ping-test
+# ping-test: same.
 allow if {
     input.command.command == "ping-test"
-    user_groups[_] == "webapp-users"
+    "webapp-users" in approver_groups
 }
+
+# Example (disabled — add your own rules below):
+# Restrict a "restart-service" command to approvers in `oncall-managers`, and
+# require a distinct operator (four-eyes).
+#
+# allow if {
+#     input.command.command == "restart-service"
+#     "oncall-managers" in approver_groups
+#     not input.self_executed
+#     "noc-l2" in operator_groups
+# }
 
 reason = "Authorized" if {
     allow
@@ -71,5 +84,5 @@ reason = "Authorized" if {
 
 decision = {
     "allow": allow,
-    "reason": reason
+    "reason": reason,
 }

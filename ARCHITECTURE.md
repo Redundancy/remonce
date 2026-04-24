@@ -63,20 +63,81 @@ JWTs are short-lived, but we may want to execute commands slightly later. Howeve
 -   The TSA returns a signed timestamp proving the signature existed at time $T$.
 -   **Validation**: The Agent checks that $T$ is within the validity period of the User's ID Token.
 
+## Delegated Signing (Approver + Operator)
+
+Real-world operations rarely have the person authorizing an action also executing it. A senior engineer wants to approve a maintenance runbook in advance so the on-call NOC operator can execute it at 3am without waking the approver. Remonse models this directly with a two-signature protocol.
+
+### Roles
+
+-   **Approver**: authorizes an action. Signs the command + constraints with a **long** validity (default: 3 days). Can optionally restrict *who* may execute via OIDC claim predicates.
+-   **Operator**: executes the action. Adds a co-signature with a **short** validity (default: 10 minutes). Provides at-execution-time freshness and attribution.
+-   **Approver self-execute**: when the approver's own TSA timestamp is within the short (operator) window, no co-signature is required — they are acting as both roles. This is the common path for synchronous operations.
+
+### Bundle shape
+
+```
+ExecutionBundle
+├── approver: ApproverBundle
+│     command                    // the JSON the approver authorized
+│     operator_requires?         // OIDC claim predicates the operator must satisfy
+│     signature                  // over canonical(command + operator_requires)
+│     id_token, public_key, timestamp_token
+└── operator: OperatorCosign?    // absent when the approver self-executes
+      approver_sig               // hex of the approver's signature — binds this cosign
+      signature                  // over (approver_sig || operator.public_key_pem)
+      id_token, public_key, timestamp_token
+```
+
+### Verification (agent)
+
+1.  Verify the approver signature over `canonical(command + operator_requires)`.
+2.  Verify the approver's TSA token covers `(approver_signature || approver_id_token)`.
+3.  Verify the approver's OIDC JWT: signature, issuer, audience, `nonce == SHA256(approver.public_key_pem)`, and `exp > approver_tsa_timestamp`.
+4.  **If operator cosign present**:
+    -   Verify the operator signature covers `(approver_sig_hex || operator.public_key_pem)` — this binds the cosign to *this specific* approver signature (prevents stapling).
+    -   Verify the operator's TSA token and JWT the same way as the approver's.
+    -   **Freshness**: operator TSA timestamp must be within `operator_max_validity`; approver TSA must be within `approver_max_validity`.
+    -   **Claim predicates**: if `operator_requires.any_of` is non-empty, at least one predicate must match the operator's JWT claims.
+5.  **Else (self-execute)**: the approver's own TSA timestamp must be within the short (`operator_max_validity`) window. `operator_requires` is ignored — it describes who the approver delegates to, not themselves.
+
+Only after these checks does the agent hand control to OPA, which sees both identities as `input.approver` and `input.operator` plus an `input.self_executed` flag. Most policy rules will be approver-centric; operator attestation is a fixed agent-level control.
+
+### Claim predicates
+
+The predicate language is deliberately small — if you need more expressive logic, put it in OPA rather than growing the predicate grammar:
+
+| Op | Shape | Matches when |
+|----|-------|-------------|
+| `equals`    | `{ "op": "equals", "claim": "team", "value": "webapp" }` | Claim scalar equals `value` |
+| `contains`  | `{ "op": "contains", "claim": "groups", "value": "noc-l2" }` | Claim array contains `value` |
+
+`any_of` semantics: if any predicate in the list matches, the operator passes. Empty list means no claim restriction. Evaluation happens at **execution time** against the operator's freshly-issued OIDC token — so personnel changes (someone leaving a group) take effect immediately, not at approval time.
+
+### Replay protection
+
+The agent keeps an in-memory cache keyed on the *executor* signature (operator cosign if delegated, approver signature if self-executing). The first submission succeeds; subsequent submissions within `operator_max_validity` are rejected. TTL equals the operator window, so once a signature is too old to pass freshness it naturally ages out of the cache.
+
+This complements — doesn't replace — the freshness windows: freshness bounds exposure, replay cache prevents double-execution within that window.
+
 ## Policy Engine (OPA)
 
 Authentication proves *who* you are. Authorization proves *what* you can do.
 
-Remonse integrates **Open Policy Agent (OPA)** to evaluate every request.
--   **Input**: Command, User Claims (Groups), Context.
--   **Policy**: Rego rules define access (e.g., "Only `webapp-users` can run `test`").
--   **Result**: Allow/Deny decisions are decoupled from the code.
+Remonse integrates **Open Policy Agent (OPA)** to evaluate every request. OPA receives both the approver and operator identities (claims, username, signed_at) plus `self_executed`. Rules can:
+
+-   Allow based on the approver's group (`input.approver.claims.groups`).
+-   Require distinct identities via `not input.self_executed` (four-eyes).
+-   Layer additional operator-side restrictions beyond the approver-embedded `operator_requires`.
+
+A deny-by-default posture is the default. Example rules in [policy/authz.rego](policy/authz.rego).
 
 ## Future Considerations
 
-### Multi-step Workflows
-Complex workflows where Entity A initiates an action that Entity B must execute (involving C and D) can be modeled as a chain of signed approvals.
-Borrowing from Certificate Signing Requests (CSRs), we can chain permissions anchored to the root of trust (JWKS).
+### Revocation server
+Approver/operator freshness windows + the replay cache cover most of the threat surface, but an approver may want to cancel a pre-authorized delegation before the operator acts. A standalone revocation service, consulted by the agent as part of verification, would close that gap. Tradeoff: adds an availability dependency on the critical path (choose fail-open and defeat the purpose, or fail-closed and block the 3am maintenance case). Deferred as an additive hardening.
+
+### Multi-party approval chains
+The current design accepts exactly one approver + one optional operator. For workflows that need $N$ approvers, the approver bundle would generalize to a list, with the verification extending naturally. Not currently implemented.
 
 ### Zero Knowledge Proofs
 We explored using zkSNARKs (e.g., [Spartan](https://github.com/Microsoft/Spartan)) for privacy-preserving signatures. While powerful, standard OIDC provides sufficient security for the current enterprise context without the computational overhead of ZKP.

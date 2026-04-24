@@ -2,10 +2,18 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
+pub struct SignerContext {
+    pub username: String,
+    pub claims: serde_json::Value,
+    pub signed_at: String,
+}
+
+#[derive(Serialize)]
 pub struct OpaInput {
     pub command: serde_json::Value,
-    pub jwt: String,
-    pub timestamp: String,
+    pub approver: SignerContext,
+    pub operator: SignerContext,
+    pub self_executed: bool,
     pub host: String,
 }
 
@@ -26,11 +34,8 @@ pub async fn evaluate(
     input: &OpaInput,
 ) -> Result<OpaResult, Box<dyn std::error::Error>> {
     let opa_request = serde_json::json!({ "input": input });
-
     let opa_res = client.post(opa_url).json(&opa_request).send().await?;
-
     let opa_decision: OpaResponse = opa_res.json().await?;
-
     Ok(opa_decision.result.unwrap_or(OpaResult {
         allow: false,
         reason: "No decision from policy".into(),
@@ -41,18 +46,8 @@ pub async fn check_authorization(
     client: &Client,
     opa_base_url: &str,
     opa_rule: &str,
-    command: serde_json::Value,
-    jwt: String,
-    timestamp: String,
-    host: String,
+    input: OpaInput,
 ) -> Result<OpaResult, Box<dyn std::error::Error>> {
-    let input = OpaInput {
-        command,
-        jwt,
-        timestamp,
-        host,
-    };
-
     let opa_url = format!("{}/v1/{}", opa_base_url, opa_rule.replace(".", "/"));
     evaluate(client, &opa_url, &input).await
 }
@@ -64,18 +59,27 @@ mod tests {
     #[test]
     fn test_opa_input_serialization() {
         let input = OpaInput {
-            command: serde_json::json!({"cmd": "test"}),
-            jwt: "fake.jwt.token".to_string(),
-            timestamp: "2023-01-01T00:00:00Z".to_string(),
-            host: "test-host".to_string(),
+            command: serde_json::json!({ "command": "test" }),
+            approver: SignerContext {
+                username: "alice".into(),
+                claims: serde_json::json!({ "sub": "alice", "groups": ["approvers"] }),
+                signed_at: "2026-04-23T10:00:00Z".into(),
+            },
+            operator: SignerContext {
+                username: "bob".into(),
+                claims: serde_json::json!({ "sub": "bob", "groups": ["noc-l2"] }),
+                signed_at: "2026-04-23T10:05:00Z".into(),
+            },
+            self_executed: false,
+            host: "agent-01".into(),
         };
 
         let json = serde_json::to_string(&input).unwrap();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(val["command"]["cmd"], "test");
-        assert_eq!(val["jwt"], "fake.jwt.token");
-        assert_eq!(val["timestamp"], "2023-01-01T00:00:00Z");
-        assert_eq!(val["host"], "test-host");
+        assert_eq!(val["command"]["command"], "test");
+        assert_eq!(val["approver"]["username"], "alice");
+        assert_eq!(val["operator"]["claims"]["groups"][0], "noc-l2");
+        assert_eq!(val["self_executed"], false);
     }
 }
