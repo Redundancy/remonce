@@ -36,7 +36,7 @@ pub struct Config {
     #[serde(default)]
     pub files: Vec<FileConfig>,
 
-    /// Agent-specific configuration. Required when running `remonse agent`.
+    /// Agent-specific configuration. Required when running `remonce agent`.
     pub agent: Option<AgentConfig>,
 }
 
@@ -160,7 +160,7 @@ pub struct CommandConfig {
     /// A human-readable description of what this command does.
     pub description: Option<String>,
 
-    /// The OPA rule path to query for authorization (e.g., "data.remonse.authz.decision").
+    /// The OPA rule path to query for authorization (e.g., "data.remonce.authz.decision").
     pub opa_rule: String,
 
     /// The actual executable binary to run.

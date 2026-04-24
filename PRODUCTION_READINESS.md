@@ -1,6 +1,6 @@
 # Production Readiness & Outstanding Items
 
-This document tracks known security gaps, "TODO" items, and requirements for moving Remonse from a development prototype to a production-ready system.
+This document tracks known security gaps, "TODO" items, and requirements for moving Remonce from a development prototype to a production-ready system.
 
 ## Critical Security Gaps
 

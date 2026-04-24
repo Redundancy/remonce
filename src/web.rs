@@ -26,7 +26,7 @@ use tower_http::{
 use tower_sessions::MemoryStore;
 use tower_sessions::{Expiry, Session, SessionManagerLayer, cookie::SameSite};
 
-const SESSION_KEY: &str = "remonse.session";
+const SESSION_KEY: &str = "remonce.session";
 
 // Application-wide error type.
 #[derive(Debug, thiserror::Error)]
@@ -594,7 +594,7 @@ async fn get_commands_handler(
         }
     });
 
-    let opa_url = format!("{}/v1/data/remonse/authz/decision", state.config.opa_url);
+    let opa_url = format!("{}/v1/data/remonce/authz/decision", state.config.opa_url);
 
     let opa_response: serde_json::Value = state
         .http_client

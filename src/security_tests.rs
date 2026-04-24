@@ -341,7 +341,7 @@ mod tests {
         let id_token = create_valid_jwt(
             &env.approver,
             "https://issuer.example",
-            "remonse",
+            "remonce",
             "alice",
             &nonce,
             approver_signed_at + Duration::minutes(30),
@@ -377,7 +377,7 @@ mod tests {
         let id_token = create_valid_jwt(
             &env.operator,
             "https://issuer.example",
-            "remonse",
+            "remonce",
             "bob",
             &nonce,
             operator_signed_at + Duration::minutes(30),
@@ -399,7 +399,7 @@ mod tests {
 
     fn verifier_config(env: &Env) -> VerifierConfig {
         VerifierConfig {
-            client_id: "remonse".into(),
+            client_id: "remonce".into(),
             issuer_url: "https://issuer.example".into(),
             jwks: env.jwks.clone(),
             trusted_roots: vec![env.tsa_keys.cert_der.clone()],

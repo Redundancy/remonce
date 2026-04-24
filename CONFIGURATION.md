@@ -1,24 +1,24 @@
 # Configuration Guide
 
-This document identifies the configuration options available for Remonse, including authentication, authorization, and security settings.
+This document identifies the configuration options available for Remonce, including authentication, authorization, and security settings.
 
 ## Configuration File (`config.toml`)
 
-Both `remonse web` (the signer) and `remonse agent` (the executor) read the same `config.toml` from the current working directory. Each binary only uses the sections relevant to it.
+Both `remonce web` (the signer) and `remonce agent` (the executor) read the same `config.toml` from the current working directory. Each binary only uses the sections relevant to it.
 
 ### Deployment model
 
-Remonse is designed around a split:
+Remonce is designed around a split:
 
-- **`remonse web`** — the **signer** runs on the operator's own workstation, always on loopback. It hosts the OIDC login + command-signing UI. Because nothing crosses the network, TLS on this tier is unnecessary and the server **refuses to bind anything other than `127.0.0.1` / `::1`**.
-- **`remonse agent`** — the **executor** runs on the remote target server and accepts signed commands over the network. It is the one network-facing component, so **TLS is mandatory**. There is no plaintext mode.
+- **`remonce web`** — the **signer** runs on the operator's own workstation, always on loopback. It hosts the OIDC login + command-signing UI. Because nothing crosses the network, TLS on this tier is unnecessary and the server **refuses to bind anything other than `127.0.0.1` / `::1`**.
+- **`remonce agent`** — the **executor** runs on the remote target server and accepts signed commands over the network. It is the one network-facing component, so **TLS is mandatory**. There is no plaintext mode.
 
 ### The `--insecure` flag
 
 Several config knobs broaden the trust surface in ways we consider dangerous by default. The agent refuses to start if any of them are set, unless you pass `--insecure` on the command line:
 
 ```bash
-remonse --insecure agent       # or: remonse --insecure web
+remonce --insecure agent       # or: remonce --insecure web
 ```
 
 With `--insecure` active, the agent logs a loud warning banner at startup listing every active gate, and every audit log entry carries `"insecure": true` so post-incident review can see that the run was in a degraded posture. The flag is blunt on purpose — it's meant to be visible, not convenient.
@@ -34,7 +34,7 @@ Currently gated settings:
 
 Loopback HTTP for OIDC (e.g., local Vault in dev) is **not** gated — it stays fine without the flag.
 
-### Web tier settings (`remonse web`)
+### Web tier settings (`remonce web`)
 
 Loopback-only binding and storage paths.
 
@@ -60,7 +60,7 @@ chain = "./certs/fullchain.pem"
 key = "./certs/privkey.pem"
 ```
 
-### Agent settings (`remonse agent`) — **required**
+### Agent settings (`remonce agent`) — **required**
 
 The agent requires an `[agent]` block with TLS configured. Startup will fail with a clear error if it is missing.
 
@@ -159,7 +159,7 @@ ca_path = "./tsa_chain.pem"
 trust_system_store = false
 ```
 
-**Trust model:** the agent ships with **DigiCert Trusted Root G4** bundled into the binary (valid through 2038). This forms the default trust anchor and aligns with the default TSA URL (`http://timestamp.digicert.com`, DigiCert's free public TSA). DigiCert's intermediates ride the timestamp token itself; rotation of intermediates does not require a Remonse rebuild.
+**Trust model:** the agent ships with **DigiCert Trusted Root G4** bundled into the binary (valid through 2038). This forms the default trust anchor and aligns with the default TSA URL (`http://timestamp.digicert.com`, DigiCert's free public TSA). DigiCert's intermediates ride the timestamp token itself; rotation of intermediates does not require a Remonce rebuild.
 
 To use a different TSA, point `ca_path` at a PEM containing your TSA's root (or full chain). The bundled DigiCert root remains trusted unless you also disable — we don't provide a knob for that, but adding your own roots is strictly additive.
 
@@ -174,7 +174,7 @@ Define the commands that can be executed by the agent.
 [[commands]]
 name = "ping-test"
 description = "Pings localhost for connectivity check."
-opa_rule = "data.remonse.authz.decision" # The OPA rule to query for authorization
+opa_rule = "data.remonce.authz.decision" # The OPA rule to query for authorization
 executable = "ping"
 args = ["-n", "4", "127.0.0.1"]
 
@@ -190,7 +190,7 @@ operator_max_validity = "10m"
 
 ### Delegation & signing validity
 
-Remonse separates **authorization freshness** (approver) from **execution freshness** (operator):
+Remonce separates **authorization freshness** (approver) from **execution freshness** (operator):
 
 | Setting | Default | Controls |
 |---------|---------|----------|

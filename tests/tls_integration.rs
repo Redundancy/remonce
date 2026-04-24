@@ -3,7 +3,7 @@ use rcgen::generate_simple_self_signed;
 #[tokio::test]
 async fn test_dynamic_cert_resolver_reloads() -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
-    use remonse::tls::DynamicCertResolver;
+    use remonce::tls::DynamicCertResolver;
     use rustls::sign::CertifiedKey;
     use rustls::pki_types::PrivateKeyDer;
 

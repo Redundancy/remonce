@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
-use remonse::agent;
-use remonse::web;
+use remonce::agent;
+use remonce::web;
 
 #[derive(Parser)]
-#[command(name = "remonse")]
+#[command(name = "remonce")]
 #[command(about = "Remote Monitoring and Secure Execution")]
 struct Cli {
     /// Run with a security-degraded configuration. Unlocks settings that

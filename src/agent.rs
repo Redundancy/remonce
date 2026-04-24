@@ -714,7 +714,7 @@ async fn stream_file_handler(
         }
     });
     
-    let opa_url = format!("{}/v1/data/remonse/authz/decision", state.config.opa_url);
+    let opa_url = format!("{}/v1/data/remonce/authz/decision", state.config.opa_url);
     let opa_res: serde_json::Value = match state.http_client.post(&opa_url).json(&check_input).send().await {
         Ok(r) => r.json().await.unwrap_or(serde_json::json!({})),
         Err(e) => {

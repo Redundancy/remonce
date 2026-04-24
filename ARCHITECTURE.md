@@ -1,6 +1,6 @@
 # Architecture & Design
 
-This document details the core architectural decisions, security mechanisms, and design philosophy behind Remonse.
+This document details the core architectural decisions, security mechanisms, and design philosophy behind Remonce.
 
 ## Core Problem Statement
 
@@ -9,7 +9,7 @@ Many organizations struggle with executing privileged actions on remote systems 
 - **VPNs/Bastions**: Complex network requirements that don't scale well across diverse clouds.
 - **Lack of Non-Repudiation**: Hard to prove *who* executed a command and *when* it was approved.
 
-Remonse aims to solve this by enabling **Signed Commands** that are verified cryptographically, time-bounded, and policy-driven.
+Remonce aims to solve this by enabling **Signed Commands** that are verified cryptographically, time-bounded, and policy-driven.
 
 ## Signed Commands
 
@@ -34,9 +34,9 @@ This architecture uses the same core mechanism as [OpenPubkey](https://github.co
 
 ### Comparison with OpenPubkey
 
-OpenPubkey is an open-source protocol that augments OIDC with proof-of-possession—precisely what Remonse does. Both systems share the same foundational mechanism:
+OpenPubkey is an open-source protocol that augments OIDC with proof-of-possession—precisely what Remonce does. Both systems share the same foundational mechanism:
 
-| Aspect | Remonse & OpenPubkey |
+| Aspect | Remonce & OpenPubkey |
 |--------|---------------------|
 | Core Binding | Embed public key hash in OIDC `nonce` |
 | Key Lifecycle | Ephemeral keys (per-session/command) |
@@ -45,14 +45,14 @@ OpenPubkey is an open-source protocol that augments OIDC with proof-of-possessio
 
 **Key Differences:**
 
-| Aspect | Remonse | OpenPubkey |
+| Aspect | Remonce | OpenPubkey |
 |--------|---------|------------|
 | **Use Case** | Remote command execution | General identity signing |
 | **Timestamping** | RFC 3161 TSA for non-repudiation | Not standard |
 | **Policy Engine** | Built-in OPA integration | Application-specific |
 | **MFA Cosigner** | Not implemented | Optional (reduces single IdP trust) |
 
-Remonse extends the OpenPubkey concept with **integrated authorization** (OPA) and **cryptographic timestamping** (TSA), making it purpose-built for auditable command execution rather than general-purpose signing.
+Remonce extends the OpenPubkey concept with **integrated authorization** (OPA) and **cryptographic timestamping** (TSA), making it purpose-built for auditable command execution rather than general-purpose signing.
 
 ### Time-Bounding & Non-Repudiation
 
@@ -65,7 +65,7 @@ JWTs are short-lived, but we may want to execute commands slightly later. Howeve
 
 ## Delegated Signing (Approver + Operator)
 
-Real-world operations rarely have the person authorizing an action also executing it. A senior engineer wants to approve a maintenance runbook in advance so the on-call NOC operator can execute it at 3am without waking the approver. Remonse models this directly with a two-signature protocol.
+Real-world operations rarely have the person authorizing an action also executing it. A senior engineer wants to approve a maintenance runbook in advance so the on-call NOC operator can execute it at 3am without waking the approver. Remonce models this directly with a two-signature protocol.
 
 ### Roles
 
@@ -123,7 +123,7 @@ This complements — doesn't replace — the freshness windows: freshness bounds
 
 Authentication proves *who* you are. Authorization proves *what* you can do.
 
-Remonse integrates **Open Policy Agent (OPA)** to evaluate every request. OPA receives both the approver and operator identities (claims, username, signed_at) plus `self_executed`. Rules can:
+Remonce integrates **Open Policy Agent (OPA)** to evaluate every request. OPA receives both the approver and operator identities (claims, username, signed_at) plus `self_executed`. Rules can:
 
 -   Allow based on the approver's group (`input.approver.claims.groups`).
 -   Require distinct identities via `not input.self_executed` (four-eyes).

@@ -1,6 +1,6 @@
 # Local Development Guide
 
-This guide describes how to set up `remonse` locally, iterate on features, and test changes.
+This guide describes how to set up `remonce` locally, iterate on features, and test changes.
 
 ## Prerequisites
 
@@ -78,7 +78,7 @@ Authorization logic is handled by **OPA** using Rego.
 2.  You will be redirected to Vault for login.
     -   **Username**: `webapp`
     -   **Password**: *See `vault_setup.tf` or Terraform output (commonly `password` or similar in dev setups)*.
-3.  Upon success, you are redirected back to the `remonse` Commands page.
+3.  Upon success, you are redirected back to the `remonce` Commands page.
 
 ## Troubleshooting
 

@@ -1,5 +1,5 @@
 [package]
-name = "remonse"
+name = "remonce"
 version = "0.1.0"
 edition = "2024"
 
@@ -59,11 +59,11 @@ humantime-serde = "1.1"
 glob = "0.3"
 
 [lib]
-name = "remonse"
+name = "remonce"
 path = "src/lib.rs"
 
 [[bin]]
-name = "remonse"
+name = "remonce"
 path = "src/main.rs"
 
 [[bin]]

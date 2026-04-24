@@ -1,4 +1,4 @@
-# Configuration for the Remonse local server
+# Configuration for the Remonce local server
 
 [oidc]
 # The base URL of the OIDC provider (Vault)
@@ -23,18 +23,18 @@ redirect_uri = "http://localhost:8080/oidc/callback"
 [[commands]]
 name = "test"
 description = "A basic test command to verify connectivity."
-opa_rule = "data.remonse.authz.decision"
+opa_rule = "data.remonce.authz.decision"
 max_validity = "1d" # Optional: Override default 3 day validity (e.g. 1h, 30m)
 
 [[commands]]
 name = "fail"
 description = "A command designed to fail for testing error handling."
-opa_rule = "data.remonse.authz.decision"
+opa_rule = "data.remonce.authz.decision"
 
 [[commands]]
 name = "ping-test"
 description = "Pings localhost 10 times to test execution streaming."
-opa_rule = "data.remonse.authz.decision"
+opa_rule = "data.remonce.authz.decision"
 executable = "ping"
 args = ["-n", "10", "127.0.0.1"]
 
@@ -47,7 +47,7 @@ description = "Access to execution logs"
 path = "config.toml"
 description = "Server configuration file"
 
-# Agent configuration — required when running `remonse agent`.
+# Agent configuration — required when running `remonce agent`.
 # TLS is mandatory; use `mode = "files"` with a self-signed cert for local dev,
 # or `mode = "acme"` with a public DNS name in production.
 #

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Remonse is a remote command execution system designed with a security-first approach ("Zero Trust Remote Execution"). It ensures that any command executed on a target machine is individually authenticated, authorized, and time-bound.
+Remonce is a remote command execution system designed with a security-first approach ("Zero Trust Remote Execution"). It ensures that any command executed on a target machine is individually authenticated, authorized, and time-bound.
 
 The core security model relies on:
 1.  **OIDC Authentication**: Users authenticate via an OIDC provider (HashiCorp Vault).
@@ -103,7 +103,7 @@ The asymmetric treatment reflects blast radius: naming a specific CA to trust is
 
 ## The `--insecure` flag
 
-A single top-level flag (`remonse --insecure {web|agent}`) gates all settings that meaningfully degrade the default security posture. Without the flag, the agent refuses to start and names every violation.
+A single top-level flag (`remonce --insecure {web|agent}`) gates all settings that meaningfully degrade the default security posture. Without the flag, the agent refuses to start and names every violation.
 
 With the flag set:
 
@@ -129,7 +129,7 @@ Each ID token in the execution artifact may contain:
 ### Risk Scoping
 
 > [!IMPORTANT]
-> **Use a dedicated OIDC clientID for Remonse.** The JWT's `aud` (audience) claim limits its validity to services using that clientID. A dedicated clientID ensures the token cannot be replayed against other applications in your organization.
+> **Use a dedicated OIDC clientID for Remonce.** The JWT's `aud` (audience) claim limits its validity to services using that clientID. A dedicated clientID ensures the token cannot be replayed against other applications in your organization.
 
 ### Claim Minimization Best Practices
 
@@ -150,7 +150,7 @@ Reduce information exposure by configuring your IdP to issue minimal claims:
 
 ## Comparison with OpenPubkey
 
-Remonse uses the same core mechanism as [OpenPubkey](https://github.com/openpubkey/openpubkey): binding an ephemeral public key to an OIDC identity via the JWT `nonce` field.
+Remonce uses the same core mechanism as [OpenPubkey](https://github.com/openpubkey/openpubkey): binding an ephemeral public key to an OIDC identity via the JWT `nonce` field.
 
 ### Shared Security Properties
 
@@ -159,7 +159,7 @@ Remonse uses the same core mechanism as [OpenPubkey](https://github.com/openpubk
 -   **Proof-of-possession**: Upgrades bearer tokens to proof-of-possession
 -   **No IdP changes required**: Works with standard OIDC providers
 
-### Remonse's Additional Security
+### Remonce's Additional Security
 
 | Feature | Benefit |
 |---------|---------|
@@ -169,11 +169,11 @@ Remonse uses the same core mechanism as [OpenPubkey](https://github.com/openpubk
 
 ### OpenPubkey's MFA Cosigner
 
-OpenPubkey's **MFA Cosigner** is a second attestation intended to eliminate the IdP as a single point of compromise. Remonse's **operator cosign** serves a similar structural role — a second signature from a different identity — but with a different purpose: the operator attests to *freshness and attribution* at execution time, not to an independent MFA factor. Both patterns can coexist: a future enhancement could require the operator's IdP to be distinct from the approver's, or to include an MFA claim.
+OpenPubkey's **MFA Cosigner** is a second attestation intended to eliminate the IdP as a single point of compromise. Remonce's **operator cosign** serves a similar structural role — a second signature from a different identity — but with a different purpose: the operator attests to *freshness and attribution* at execution time, not to an independent MFA factor. Both patterns can coexist: a future enhancement could require the operator's IdP to be distinct from the approver's, or to include an MFA claim.
 
 ### Privacy Considerations
 
-Both Remonse and OpenPubkey expose JWT claims when sharing signed artifacts. Mitigate this through:
+Both Remonce and OpenPubkey expose JWT claims when sharing signed artifacts. Mitigate this through:
 -   **Dedicated clientID** (limits token scope)
 -   **Claim minimization** (reduce exposed PII)
 -   **Roles over groups** (less organizational exposure)

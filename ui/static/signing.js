@@ -1,4 +1,4 @@
-// Shared logic for Remonse UI
+// Shared logic for Remonce UI
 
 document.addEventListener('DOMContentLoaded', () => {
     // Page: Commands
@@ -600,7 +600,7 @@ function startStreaming(target) {
         wsUrl = `ws://127.0.0.1:10022/stream/${target.id}`;
         statusArea.innerText = `Streaming logs for Execution ID: ${target.id}`;
     } else if (target.type === 'file') {
-        const tokenMeta = document.querySelector('meta[name="remonse-token"]');
+        const tokenMeta = document.querySelector('meta[name="remonce-token"]');
         const token = tokenMeta ? tokenMeta.content : '';
         if (!token) {
             alert('Authentication token missing. Please refresh.');

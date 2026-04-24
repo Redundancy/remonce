@@ -1,8 +1,8 @@
-# Remonse - *Remote Monitoring and Secure Execution*
+# Remonce - *Remote Monitoring and Secure Execution*
 
 > **Secure, Identity-Aware, JIT Command Execution.**
 
-Remonse provides a secure, cloud-agnostic way to execute privileged commands on remote fleets without managing persistent SSH keys or complex VPNs. It leverages **OIDC Identities** and **Ephemeral Cryptography** to ensure every action is authenticated, authorized, and non-repudiable.
+Remonce provides a secure, cloud-agnostic way to execute privileged commands on remote fleets without managing persistent SSH keys or complex VPNs. It leverages **OIDC Identities** and **Ephemeral Cryptography** to ensure every action is authenticated, authorized, and non-repudiable.
 
 Making it easy to execute a controlled menu of actions on a remote machine, or eventually directly read a log file, makes it very easy and accessible to teams to do things like check the results of **cloud-init**, or request **NOC runbooks** without giving out SSH access.
 
@@ -10,9 +10,9 @@ Making it easy to execute a controlled menu of actions on a remote machine, or e
 
 ---
 
-## Why Remonse?
+## Why Remonce?
 
-Remonse is built to be an easily configured, lightweight system that lowers the operational burden on teams while meeting their diverse needs using standard, well-documented tools. It aims to support every option that enhances security and flexibility, starting with sensible, secure defaults to encourage adoption across varied environments. We believe that if security is hard, users will drift towards insecurity, so we prioritize a friction-free path to being secure.
+Remonce is built to be an easily configured, lightweight system that lowers the operational burden on teams while meeting their diverse needs using standard, well-documented tools. It aims to support every option that enhances security and flexibility, starting with sensible, secure defaults to encourage adoption across varied environments. We believe that if security is hard, users will drift towards insecurity, so we prioritize a friction-free path to being secure.
 
 *   **Zero Persistent Credentials**: No SSH keys or long-lived secrets on your servers.
 *   **Identity First**: Users authenticate with their corporate identity (OIDC).
@@ -38,7 +38,7 @@ The Agent cryptographically verifies signatures, timestamps, nonce-bound identit
 
 ## Capabilities
 
-Remonse supports **Cryptographic Non-Repudiation** by leveraging RFC 3161 Timestamping Authorities to create verifiable audit trails. Access control is **Attribute-Based**, allowing policies to be defined on any user claim, membership (e.g., `webapp-users`), or context.
+Remonce supports **Cryptographic Non-Repudiation** by leveraging RFC 3161 Timestamping Authorities to create verifiable audit trails. Access control is **Attribute-Based**, allowing policies to be defined on any user claim, membership (e.g., `webapp-users`), or context.
 
 From a usability standpoint, the system offers a **Secure UI** with a modern dark mode for ease of use, while the underlying **Real-time Monitoring** ensures operators have immediate visibility into execution results. **TLS Support** is available for securing communications, offering both file-based and (experimental) ACME automated certificate management. Built in **Rust**, the agent is a lightweight, cross-platform binary that brings performance and safety to both Linux and Windows environments.
 
@@ -82,10 +82,10 @@ Read-only access to files can be configured via `[[files]]` entries.
 
 ## Deployment Model
 
-Remonse is split into two processes that usually live on different machines:
+Remonce is split into two processes that usually live on different machines:
 
-- **`remonse web`** — the **signer**, runs on the operator's workstation. Always binds to loopback (`127.0.0.1` / `::1`); no TLS needed.
-- **`remonse agent`** — the **executor**, runs on the remote target server. TLS is mandatory (file-based cert or ACME); there is no plaintext mode.
+- **`remonce web`** — the **signer**, runs on the operator's workstation. Always binds to loopback (`127.0.0.1` / `::1`); no TLS needed.
+- **`remonce agent`** — the **executor**, runs on the remote target server. TLS is mandatory (file-based cert or ACME); there is no plaintext mode.
 
 The signer builds a signed command locally and the operator (or a delegate) sends it to the agent over TLS.
 
