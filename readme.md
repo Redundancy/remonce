@@ -73,6 +73,7 @@ Read-only access to files can be configured via `[[files]]` entries.
 ## Documentation
 
 *   [**Getting Started (Dev Guide)**](DEVELOPMENT.md): Spin up the environment locally.
+*   [**Use Cases**](USECASES.md): Concrete scenarios — solo VM ops, CI workflows, NOC delegation, cross-team authorization.
 *   [**Architecture Deep Dive**](ARCHITECTURE.md): The cryptographic protocols and design decisions.
 *   [**Security Model**](SECURITY.md): How we secure the chain of trust.
 *   [**Production Readiness**](PRODUCTION_READINESS.md): Roadmap to going live.
