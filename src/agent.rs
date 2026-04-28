@@ -34,6 +34,40 @@ pub struct AgentState {
 
 // ExecutionRequest is imported from security module
 
+/// Verify an OIDC JWT against the agent's pinned JWKS. Used by the
+/// `/api/files` and `/api/files/stream` endpoints, where the bearer token
+/// is the only auth (we don't have a session). Returns the JWT claims.
+///
+/// Note: this is bearer-token auth and intentionally does NOT enforce the
+/// nonce-binding to an ephemeral key (that's the approver/operator path
+/// in `security::verify_execution`). A leaked ID token grants file-read
+/// until it expires; mitigate via short JWT lifetimes and dedicated
+/// clientID.
+fn verify_query_token(
+    token: &str,
+    jwks: &jsonwebtoken::jwk::JwkSet,
+    issuer: &str,
+    audience: &str,
+) -> Result<serde_json::Value, (axum::http::StatusCode, &'static str)> {
+    use axum::http::StatusCode;
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid Token Header"))?;
+    let kid = header
+        .kid
+        .ok_or((StatusCode::UNAUTHORIZED, "Missing KID"))?;
+    let jwk = jwks
+        .find(&kid)
+        .ok_or((StatusCode::UNAUTHORIZED, "Unknown Key"))?;
+    let decoding_key = jsonwebtoken::DecodingKey::from_jwk(jwk)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Key Error"))?;
+    let mut validation = jsonwebtoken::Validation::new(header.alg);
+    validation.set_audience(&[audience]);
+    validation.set_issuer(&[issuer]);
+    let token_data = jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid Token"))?;
+    Ok(token_data.claims)
+}
+
 #[derive(Serialize)]
 pub struct ExecutionResponse {
     pub status: String,
@@ -422,12 +456,13 @@ async fn execute_handler(
         .clone()
         .unwrap_or_else(|| command_name.to_string());
 
-    // Check for explicit ID in payload, else generate one?
-    // Plan said UI generates it.
+    // execution_id forms the log filename, so we must reject anything that
+    // isn't a canonical UUID — otherwise a signed payload could path-traverse
+    // out of `logs_dir`.
     let execution_id = req_command
         .get("id")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok().map(|u| u.to_string()))
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     tracing::info!(
@@ -484,41 +519,45 @@ async fn execute_handler(
         // Non-critical, continue
     }
 
-    // Spawn Command
-    let mut child = tokio::process::Command::new(&executable)
+    // Spawn Command — hardened:
+    //   - stdin closed (commands that read stdin would otherwise hang forever)
+    //   - parent env scrubbed; only operator-configured `env` survives
+    //   - wall-clock timeout enforced via tokio::time::timeout + child.kill()
+    let timeout = cmd_config.command_timeout_or_default();
+
+    let mut spawn_cmd = tokio::process::Command::new(&executable);
+    spawn_cmd
         .args(&cmd_config.args)
-        .current_dir(cmd_config.cwd.clone().unwrap_or(".".to_string()))
+        .current_dir(cmd_config.cwd.clone().unwrap_or_else(|| ".".to_string()))
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            crate::audit::log_audit(
-                "error",
-                format!("Failed to spawn command: {}", e),
-                authenticated_user.clone(),
-                ip.clone(),
-                hostname.clone(),
-                full_ctx(),
-            );
-            ErrorResponse {
-                error: "Execution Failed".into(),
-            }
-        })?;
+        .env_clear();
+    for (k, v) in &cmd_config.env {
+        spawn_cmd.env(k, v);
+    }
 
-    // Pipe Output
-    // We want to merge stdout and stderr into the log file.
+    let mut child = spawn_cmd.spawn().map_err(|e| {
+        crate::audit::log_audit(
+            "error",
+            format!("Failed to spawn command: {}", e),
+            authenticated_user.clone(),
+            ip.clone(),
+            hostname.clone(),
+            full_ctx(),
+        );
+        ErrorResponse {
+            error: "Execution Failed".into(),
+        }
+    })?;
+
+    // Pipe Output and enforce timeout in a background task.
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
+    let exec_id_for_log = execution_id.clone();
 
-    // Background task to pipe output to file
     tokio::spawn(async move {
-        // Simple approach: pipe both to same file. Access via mutex or just let OS handle concurrent writes?
-        // Better: Multiplex or just spawn two tasks writing to split owned writers of the file?
-        // Tokio File can be cloned? No. `try_clone`.
-
-        // Single writer task via channel
         let mut file_out = log_file;
-
         let mut stdout_reader = tokio::io::BufReader::new(stdout);
         let mut stderr_reader = tokio::io::BufReader::new(stderr);
 
@@ -549,10 +588,48 @@ async fn execute_handler(
             }
         });
 
-        while let Some(msg) = rx.recv().await {
-            let _ = file_out.write_all(msg.as_bytes()).await;
-            let _ = file_out.flush().await;
+        // Pipe writer (terminates when both pump tasks drop their senders).
+        let writer = async {
+            while let Some(msg) = rx.recv().await {
+                let _ = file_out.write_all(msg.as_bytes()).await;
+                let _ = file_out.flush().await;
+            }
+            file_out
+        };
+
+        // Race the child's exit against the timeout. If the timer fires first,
+        // SIGKILL the child and continue draining its remaining output.
+        let wait_result = tokio::select! {
+            r = child.wait() => Some(r),
+            _ = tokio::time::sleep(timeout) => {
+                tracing::warn!(
+                    "Command {} exceeded timeout ({:?}); killing",
+                    exec_id_for_log, timeout
+                );
+                let _ = child.kill().await;
+                None
+            }
+        };
+
+        let mut file_out = writer.await;
+        match wait_result {
+            Some(Ok(status)) => {
+                let _ = file_out
+                    .write_all(format!("\n--- EXIT: {} ---\n", status).as_bytes())
+                    .await;
+            }
+            Some(Err(e)) => {
+                let _ = file_out
+                    .write_all(format!("\n--- WAIT ERROR: {} ---\n", e).as_bytes())
+                    .await;
+            }
+            None => {
+                let _ = file_out
+                    .write_all(b"\n--- TIMEOUT: process killed by agent ---\n")
+                    .await;
+            }
         }
+        let _ = file_out.flush().await;
     });
 
     crate::audit::log_audit(
@@ -578,13 +655,33 @@ async fn stream_logs_handler(
     State(state): State<AgentState>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // Path traversal guard: only allow canonical UUIDs through.
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return (axum::http::StatusCode::BAD_REQUEST, "Invalid log id").into_response();
+    }
     let log_path = PathBuf::from(&state.config.logs_dir).join(format!("{}.log", id));
-    // Default to tailing logs as they are written
     ws.on_upgrade(move |socket| tail_file(socket, log_path, None))
 }
 
-async fn list_files_handler(State(state): State<AgentState>) -> Json<Vec<files::FileMetadata>> {
-    Json(files::list_available_files(&state.config.files))
+#[derive(Deserialize)]
+struct ListFilesParams {
+    token: String,
+}
+
+async fn list_files_handler(
+    State(state): State<AgentState>,
+    Query(params): Query<ListFilesParams>,
+) -> Response {
+    // Same auth posture as `/api/files/stream` — bearer ID token required.
+    match verify_query_token(
+        &params.token,
+        &state.jwks,
+        &state.config.oidc.issuer_url,
+        &state.config.oidc.client_id,
+    ) {
+        Ok(_claims) => Json(files::list_available_files(&state.config.files)).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -623,61 +720,22 @@ async fn stream_file_handler(
         );
     };
 
-    // 1. Verify Token & OPA
-    // Note: We are doing this before upgrade to return HTTP error if auth fails.
-    /* 
-       Optimization: We could reuse security::VerifierConfig logic if we refactored security.rs 
-       to expose a simple "verify_jwt(token)" function. 
-       For now, manual verification is fine.
-    */
-    
-    // We need the key.
-    let header = match jsonwebtoken::decode_header(&params.token) {
-        Ok(h) => h,
-        Err(_) => {
-            log_audit("deny", "Invalid Token Header".into(), "unknown".into(), None);
-            return (axum::http::StatusCode::UNAUTHORIZED, "Invalid Token Header").into_response();
+    // 1. Verify Token via shared helper.
+    let claims = match verify_query_token(
+        &params.token,
+        &state.jwks,
+        &state.config.oidc.issuer_url,
+        &state.config.oidc.client_id,
+    ) {
+        Ok(c) => c,
+        Err((status, msg)) => {
+            log_audit("deny", msg.into(), "unknown".into(), None);
+            return (status, msg).into_response();
         }
-    };
-    
-    // Logic similar to web callback, but here we just need to verify signature against JWKS.
-    let kid = match header.kid {
-        Some(k) => k,
-        None => {
-             log_audit("deny", "Missing KID".into(), "unknown".into(), None);
-             return (axum::http::StatusCode::UNAUTHORIZED, "Missing KID").into_response();
-        }
-    };
-    
-    let jwk = match state.jwks.find(&kid) {
-        Some(j) => j,
-        None => {
-            log_audit("deny", "Unknown Key".into(), "unknown".into(), None);
-            return (axum::http::StatusCode::UNAUTHORIZED, "Unknown Key").into_response();
-        }
-    };
-    
-    let decoding_key = match jsonwebtoken::DecodingKey::from_jwk(jwk) {
-        Ok(k) => k,
-        Err(_) => {
-            log_audit("deny", "Key Error".into(), "unknown".into(), None);
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Key Error").into_response();
-        }
-    };
-    
-    let mut validation = jsonwebtoken::Validation::new(header.alg);
-    validation.set_audience(&[&state.config.oidc.client_id]);
-    validation.set_issuer(&[&state.config.oidc.issuer_url]);
-    
-    let token_data = match jsonwebtoken::decode::<serde_json::Value>(&params.token, &decoding_key, &validation) {
-         Ok(t) => t,
-         Err(_) => {
-             log_audit("deny", "Invalid Token Signature".into(), "unknown".into(), None);
-             return (axum::http::StatusCode::UNAUTHORIZED, "Invalid Token").into_response();
-         }
     };
 
-    let user = token_data.claims.get("username")
+    let user = claims
+        .get("username")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();

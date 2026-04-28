@@ -1,7 +1,7 @@
 use crate::config::FileConfig;
 use glob::glob;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Clone)]
 pub struct FileMetadata {
@@ -10,18 +10,32 @@ pub struct FileMetadata {
     pub description: Option<String>,
 }
 
+/// Resolve a path through `canonicalize` (which follows symlinks in parent
+/// components and gives us a stable absolute path), but reject the final
+/// component being a symlink itself. This prevents an attacker who can write
+/// inside a globbed directory from staging a symlink to a sensitive file
+/// outside the configured allowlist.
+fn safe_canonicalize(p: &Path) -> Option<PathBuf> {
+    let lstat = std::fs::symlink_metadata(p).ok()?;
+    if lstat.file_type().is_symlink() {
+        tracing::warn!("File resolver: refusing symlink {}", p.display());
+        return None;
+    }
+    if !lstat.file_type().is_file() {
+        return None;
+    }
+    std::fs::canonicalize(p).ok()
+}
+
 pub fn list_available_files(configs: &[FileConfig]) -> Vec<FileMetadata> {
     let mut files = Vec::new();
-
     for config in configs {
-        // If it's a simple path (no glob patterns), just add it (if it exists?)
-        // Or we can just use glob() on everything since it handles non-glob paths too.
         if let Ok(paths) = glob(&config.path) {
-            for entry in paths {
-                if let Ok(path) = entry {
+            for entry in paths.flatten() {
+                if let Some(canon) = safe_canonicalize(&entry) {
                     files.push(FileMetadata {
                         name: config.name.clone(),
-                        path: path.to_string_lossy().to_string(), // Absolute or relative as resolved
+                        path: canon.to_string_lossy().to_string(),
                         description: config.description.clone(),
                     });
                 }
@@ -36,21 +50,21 @@ pub enum FileIdentifier {
     Path(String),
 }
 
+/// Resolve a file identifier to a concrete on-disk path, with two safety
+/// rails beyond the configured glob match:
+///
+/// 1. The final path must not be a symlink (`safe_canonicalize` rejects it).
+/// 2. For path-identifiers, the canonicalized request must equal a
+///    canonicalized glob expansion — `==` on raw `PathBuf`s isn't enough
+///    because callers can pass relative paths or `..` segments.
 pub fn resolve_file_path(configs: &[FileConfig], identifier: &FileIdentifier) -> Option<PathBuf> {
     match identifier {
         FileIdentifier::Name(name) => {
-            // Find config with this name
-            for config in configs {
-                if config.name.as_deref() == Some(name) {
-                    // If name matches, we must find the concrete file. 
-                    // If the config path is a glob, implies we might need to be specific?
-                    // For now, if name maps to a glob, we might just pick the first match or fail if ambiguous?
-                    // User requirement: "Files can be named, in which case they are accessible using their name."
-                    // If "logs/*.log" is named "logs", asking for "logs" -> maybe ambiguous?
-                    // Let's assume if named, it SHOULD be a single file, OR we just return the first match.
-                    if let Ok(mut paths) = glob(&config.path) {
-                        if let Some(Ok(path)) = paths.next() {
-                           return Some(path);
+            for config in configs.iter().filter(|c| c.name.as_deref() == Some(name)) {
+                if let Ok(mut paths) = glob(&config.path) {
+                    if let Some(Ok(p)) = paths.next() {
+                        if let Some(canon) = safe_canonicalize(&p) {
+                            return Some(canon);
                         }
                     }
                 }
@@ -58,22 +72,17 @@ pub fn resolve_file_path(configs: &[FileConfig], identifier: &FileIdentifier) ->
             None
         }
         FileIdentifier::Path(requested_path) => {
-            // Check if requested_path matches ANY config's glob expansion
-            let req_path = PathBuf::from(requested_path);
-            
-            // Normalize absolute path if possible, but simplest check is:
-            // Does this path exist in the set of allowed paths?
-            
+            let requested_canon = safe_canonicalize(Path::new(requested_path))?;
             for config in configs {
-                 if let Ok(paths) = glob(&config.path) {
-                    for entry in paths {
-                        if let Ok(allowed_path) = entry {
-                            if allowed_path == req_path {
-                                return Some(allowed_path);
+                if let Ok(paths) = glob(&config.path) {
+                    for entry in paths.flatten() {
+                        if let Some(allowed_canon) = safe_canonicalize(&entry) {
+                            if allowed_canon == requested_canon {
+                                return Some(allowed_canon);
                             }
                         }
                     }
-                 }
+                }
             }
             None
         }

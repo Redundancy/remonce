@@ -178,6 +178,15 @@ opa_rule = "data.remonce.authz.decision" # The OPA rule to query for authorizati
 executable = "ping"
 args = ["-n", "4", "127.0.0.1"]
 
+# Optional: wall-clock timeout. Once exceeded, the agent SIGKILLs the child
+# and writes a TIMEOUT trailer into the execution log. Default: 5m.
+command_timeout = "5m"
+
+# Optional: environment variables passed to the child. The agent calls
+# env_clear() before applying these — *no* parent-process env leaks
+# through. If your executable needs PATH, add it explicitly.
+env = { PATH = "/usr/bin:/bin" }
+
 # Optional: delegation validity windows.
 # approver_max_validity   — how long a pre-signed command remains usable
 #                           after the approver signs. Default: 3d.

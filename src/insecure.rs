@@ -182,6 +182,8 @@ mod tests {
             cwd: None,
             approver_max_validity: None,
             operator_max_validity: Some(Duration::from_secs(3 * 60 * 60)),
+            command_timeout: None,
+            env: Default::default(),
         });
         assert!(matches!(
             validate(&cfg, false),

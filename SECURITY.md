@@ -74,6 +74,22 @@ When the Agent receives an `ExecutionBundle`, it performs this strict sequence (
     *   *Scope*: Limited to systems using the same OIDC clientID. The JWTs cannot be used to authenticate to unrelated services.
     *   *Mitigation*: **Dedicated clientID** (strongly recommended), **short-lived JWTs**, **nonce binding** (JWTs unusable for new commands without the corresponding private keys), **command allowlisting**, and **claim minimization** (request only necessary claims from the IdP).
 
+10. **Subprocess Misbehavior (long-running, env exfiltration, stdin hang)**
+    *   *Attack*: A configured command runs indefinitely, leaks parent-process env vars, or hangs reading stdin.
+    *   *Mitigation*: Every spawned process has stdin closed (`Stdio::null`), a fully cleared environment (`env_clear()` plus only the operator-supplied `env` map from `[[commands]]`), and a wall-clock timeout (`command_timeout`, default 5 minutes). On timeout, the agent SIGKILLs the child and writes a TIMEOUT trailer into the execution log.
+
+11. **Path Traversal via execution ID**
+    *   *Attack*: Approver-signed payload includes `id: "../../etc/passwd"`; the agent uses it to construct the log file path.
+    *   *Mitigation*: `execution_id` is parsed through `uuid::Uuid::parse_str` before any filesystem use. Non-UUID values are silently replaced with a freshly generated UUID. The `/stream/{id}` log-tailing endpoint applies the same UUID gate.
+
+12. **File Resolver Symlink Traversal**
+    *   *Attack*: Operator drops a symlink inside a configured `[[files]]` glob directory pointing at a sensitive file outside the allowlist.
+    *   *Mitigation*: `safe_canonicalize` rejects any final component that is a symlink, then canonicalizes parent components for stable comparison. Path-mode requests are matched against canonicalized glob expansions, so `..` segments and relative-vs-absolute mismatches no longer bypass the allowlist.
+
+13. **Unauthenticated File Listing**
+    *   *Attack*: Anyone who can reach the agent's `/api/files` discovers the configured file allowlist (paths, names, descriptions).
+    *   *Mitigation*: `/api/files` now requires the same bearer ID token as `/api/files/stream`. Token verification is shared via `verify_query_token` so the two endpoints can't drift apart.
+
 ## Audit Logging
 
 Every execution attempt (Allowed or Denied) generates a structured audit log entry.

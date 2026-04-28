@@ -186,6 +186,18 @@ pub struct CommandConfig {
     /// signature (acting as both roles). Defaults to 10 minutes if not specified.
     #[serde(default, with = "humantime_serde")]
     pub operator_max_validity: Option<std::time::Duration>,
+
+    /// Wall-clock timeout for the spawned process. Once exceeded, the agent
+    /// SIGKILLs the child and writes a "TIMEOUT" trailer into the execution
+    /// log. Defaults to 5 minutes if not specified.
+    #[serde(default, with = "humantime_serde")]
+    pub command_timeout: Option<std::time::Duration>,
+
+    /// Environment variables passed to the spawned process. The agent calls
+    /// `env_clear()` before applying these — no parent-process env leaks
+    /// through. Empty by default; add `PATH` here if your executable needs it.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 impl CommandConfig {
@@ -197,6 +209,11 @@ impl CommandConfig {
     pub fn operator_max_validity_or_default(&self) -> std::time::Duration {
         self.operator_max_validity
             .unwrap_or_else(|| std::time::Duration::from_secs(10 * 60))
+    }
+
+    pub fn command_timeout_or_default(&self) -> std::time::Duration {
+        self.command_timeout
+            .unwrap_or_else(|| std::time::Duration::from_secs(5 * 60))
     }
 }
 
