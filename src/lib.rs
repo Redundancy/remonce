@@ -1,6 +1,8 @@
 pub mod config;
 pub mod security;
 pub mod agent;
+pub mod agent_proxy;
+pub mod cosign;
 pub mod web;
 pub mod files;
 pub mod audit;

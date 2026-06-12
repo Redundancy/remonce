@@ -53,6 +53,7 @@ Key options include:
 -   `[oidc]`: Identity Provider settings.
 -   `[tls]`: HTTPS configuration (Files or manual ACME).
 -   `[timestamp_authority]`: TSA URL and CA.
+-   `agent_url` / `agent_ca_path`: the agent the signer UI proxies to, and extra CA roots for its TLS cert.
 -   `[[commands]]`: Whitelisted commands.
     -   `max_validity`: Maximum duration a token is valid for (e.g., "1h", "3d"). Defaults to "3d" if not specified.
 
@@ -85,10 +86,10 @@ Read-only access to files can be configured via `[[files]]` entries.
 
 Remonce is split into two processes that usually live on different machines:
 
-- **`remonce web`** — the **signer**, runs on the operator's workstation. Always binds to loopback (`127.0.0.1` / `::1`); no TLS needed.
+- **`remonce web`** — the **signer**, runs on the operator's workstation. Always binds to loopback (`127.0.0.1` / `::1`); no TLS needed. The browser never talks to the agent directly: the signer proxies execution, file reads, and log streams to the agent over TLS (`agent_url`, with `agent_ca_path` for self-signed/private-CA agent certs).
 - **`remonce agent`** — the **executor**, runs on the remote target server. TLS is mandatory (file-based cert or ACME); there is no plaintext mode.
 
-The signer builds a signed command locally and the operator (or a delegate) sends it to the agent over TLS.
+There is also **`remonce cosign`** — a headless CLI for operators who receive a delegated approval bundle: it runs its own OIDC login, co-signs the bundle, and optionally submits it to the agent (see [CONFIGURATION.md](CONFIGURATION.md)).
 
 ## Quick Start (Local)
 

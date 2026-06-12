@@ -1,6 +1,6 @@
 # Use Cases
 
-Concrete scenarios that map a real operational need onto Remonce's primitives. Each one shows what the operator does, what configuration the agent needs, and what's still missing in the UI today.
+Concrete scenarios that map a real operational need onto Remonce's primitives. Each one shows what the operator does, what configuration the agent needs, and how the UI/CLI supports it.
 
 The four primitives in play across all of these:
 
@@ -83,7 +83,7 @@ allow if {
    ```
    *(Note: `any_of` means at least one matches. For a strict AND of two claims you'd add the rule in OPA — see below.)*
 2. The bundle is handed to CI as a build artifact (or stored in the release record).
-3. The CI job, when it reaches the deploy step, runs `remonce web` in agent-mode-cosigner against its own OIDC token, calls `/api/cosign` with the approver bundle, then `POST`s the resulting `ExecutionBundle` to the agent's `/execute`.
+3. The CI job, when it reaches the deploy step, cosigns the approver bundle with its own OIDC identity (`remonce cosign -b bundle.json --submit`) and submits the resulting `ExecutionBundle` to the agent's `/execute`.
 4. Agent verifies: approver sig still within `approver_max_validity` (e.g. 1 day), CI's cosign within `operator_max_validity` (10 min), CI's claims satisfy `operator_requires`. The replay cache prevents the same cosign from being submitted twice.
 5. If the CI run is retried, it produces a *new* cosign over the same approver bundle — a fresh execution with its own audit trail.
 
@@ -112,10 +112,10 @@ allow if {
 }
 ```
 
-**UI status.** ⚠️ Partial.
-- ✅ Wire format + `/api/cosign` endpoint exist.
-- ⚠️ Producing the approver bundle in a "delegate to CI" flow has no dedicated UI; today you'd do it manually (sign in the UI, copy the JSON response). A "create a delegation" UI page is needed.
-- ❌ The CI side is currently CLI-shaped (call `/api/cosign` directly with curl). A small standalone `remonce-cosign` CLI subcommand would be a natural addition.
+**UI status.** ✅ Supported, with one identity-provider caveat.
+- ✅ The Generate page has an `operator_requires` builder; Inspect & Sign exports the approver bundle as copyable base64 or downloadable JSON.
+- ✅ `remonce cosign` covers the executor side: reads the bundle from a file or stdin, does the cosign locally, and `--submit`s to the agent.
+- ⚠️ Caveat: the cosigner's OIDC token must carry a `nonce` bound to its ephemeral key. Platform-minted tokens (GitHub Actions OIDC, etc.) don't honor a custom `nonce`, so the CI workload needs an issuer that does (e.g. Vault's OIDC provider with the CI runner authenticating via JWT auth) — or a human runs the cosign step.
 
 ---
 
@@ -151,10 +151,9 @@ allow if {
 
 The `not input.self_executed` is a four-eyes constraint — even if you happen to also be in `noc-l2`, you can't both authorize and execute the same bundle. Drop the line if you don't need separation of duties.
 
-**UI status.** ⚠️ Partial.
-- ✅ Wire format, replay cache, claim predicates, audit fields all support this.
-- ⚠️ The signer needs an explicit "produce a delegation bundle" mode that surfaces the approver bundle as exportable JSON with copy-to-clipboard / download.
-- ❌ The NOC side needs a "import + co-sign" page: paste/upload approver bundle, log in (if needed), confirm action, submit. Today the operator would have to script this with curl.
+**UI status.** ✅ Fully supported.
+- ✅ The approver builds the delegation on the Generate page (operator-requirements builder), signs on Inspect & Sign, and exports via copy or Download JSON.
+- ✅ The NOC side uses the **Cosign** page: paste the bundle, inspect the command + who approved it, co-sign, Execute Now — or `remonce cosign` from a terminal.
 
 ---
 
@@ -221,12 +220,10 @@ A few cross-cutting notes that fall out of these four:
 - **Replay safety is automatic**. The agent's in-memory replay cache means a single approver bundle can be cosigned by multiple operators (use case 2's CI retries) without each cosign being individually unique — what's gated is the *executor signature*.
 - **The wire format is portable**. Approver bundles are plain JSON. Email them, attach them to tickets, paste them into Slack — the cryptography is what protects them, not the channel.
 
-## UI gaps to close
+## Delegation tooling
 
-What's needed to make the delegation use cases (2 and 3) first-class in the UI:
+The delegation use cases (2 and 3) are covered by:
 
-1. **"Create a delegation"** mode in `remonce web` that produces an approver bundle the user can copy/download, with an explicit `operator_requires` builder (group/claim picker).
-2. **"Import and co-sign"** page that accepts a pasted/uploaded approver bundle, validates it client-side (best-effort — agent is the final authority), and walks the operator through cosigning + submission.
-3. **Standalone `remonce cosign` CLI** for non-browser flows (especially CI). Reads an approver bundle from stdin or a file, uses an OIDC token from the environment, calls `/api/cosign` against a local web tier or directly does the cosign math, and submits to the agent.
-
-None of these require protocol changes — the wire format, endpoints, and verification logic are already in place.
+1. **"Create a delegation"** — the Generate page includes an `operator_requires` builder (claim/op/value rows); Inspect & Sign exports the signed approver bundle via copy-to-clipboard or Download JSON.
+2. **Cosign page** (`/ui/cosign`) — paste an approver bundle, inspect the command + claimed approver identity (best-effort; the agent is the final authority), co-sign with your session identity, and submit.
+3. **`remonce cosign` CLI** — reads an approver bundle from a file or stdin, runs its own browser-based OIDC login (PKCE + nonce-bound ephemeral key), cosigns locally, and writes the ExecutionBundle to stdout/a file or `--submit`s it to the agent. See CONFIGURATION.md.

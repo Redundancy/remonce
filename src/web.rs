@@ -70,6 +70,11 @@ pub struct AppState {
     pub oidc_metadata: OidcMetadata,
     pub jwks: jsonwebtoken::jwk::JwkSet,
     pub hostname: String,
+    /// HTTP client for agent calls — trusts `agent_ca_path` in addition to
+    /// system roots.
+    pub agent_http: Client,
+    /// rustls config for WebSocket connections to the agent.
+    pub agent_tls: std::sync::Arc<rustls::ClientConfig>,
 }
 
 /// Data stored in the session during the OIDC login flow.
@@ -88,11 +93,24 @@ struct OidcFlowState {
 
 /// Data stored in the session after a user has logged in.
 #[derive(Serialize, Deserialize, Default)]
-struct UserProfile {
-    subject: String,
-    id_token: String,
-    signing_key_hex: String,
-    public_key_pem: String,
+pub(crate) struct UserProfile {
+    pub(crate) subject: String,
+    pub(crate) id_token: String,
+    pub(crate) signing_key_hex: String,
+    pub(crate) public_key_pem: String,
+}
+
+/// Fetch the logged-in user's profile from the session, or fail with an
+/// auth error. Shared by the signing endpoints and the agent proxy.
+pub(crate) async fn require_profile(session: &Session) -> Result<UserProfile, AppError> {
+    let profile: UserProfile = session
+        .get(SESSION_KEY)
+        .await?
+        .ok_or(AppError::Auth("Not logged in".into()))?;
+    if profile.subject.is_empty() {
+        return Err(AppError::Auth("Not logged in".into()));
+    }
+    Ok(profile)
 }
 
 pub async fn run(insecure: bool) -> Result<(), AppError> {
@@ -142,12 +160,19 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
+    let agent_http = crate::agent_proxy::build_agent_http(config.agent_ca_path.as_deref())
+        .map_err(AppError::Config)?;
+    let agent_tls = crate::agent_proxy::build_agent_tls(config.agent_ca_path.as_deref())
+        .map_err(AppError::Config)?;
+
     let app_state = AppState {
         http_client: http_client.clone(),
         config: config.clone(),
         oidc_metadata,
         jwks,
         hostname,
+        agent_http,
+        agent_tls,
     };
 
     // Session layer for storing OIDC state and user profile.
@@ -171,6 +196,10 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         .route("/api/sign", post(sign_handler))
         .route("/api/cosign", post(cosign_handler))
         .route("/api/commands", get(get_commands_handler))
+        .route("/api/agent/execute", post(crate::agent_proxy::execute_proxy))
+        .route("/api/agent/files", get(crate::agent_proxy::files_proxy))
+        .route("/ws/exec", get(crate::agent_proxy::exec_stream_proxy))
+        .route("/ws/file", get(crate::agent_proxy::file_stream_proxy))
         .route("/ui", get(index_page_handler))
         .route("/ui/{page}", get(ui_handler))
         .nest_service("/static", ServeDir::new("ui/static"))
@@ -206,7 +235,7 @@ async fn index_page_handler(
     State(state): State<AppState>,
     session: Session,
 ) -> Result<Html<String>, AppError> {
-    render_template(session, "index", &state.hostname).await
+    render_template(session, "index", &state).await
 }
 
 /// Generic UI handler for /ui/:page
@@ -219,15 +248,16 @@ async fn ui_handler(
     if !page.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
          return Err(AppError::Internal("Invalid page name".into()));
     }
-    render_template(session, &page, &state.hostname).await
+    render_template(session, &page, &state).await
 }
 
 /// Helper to render pages using Header/Footer partials
 async fn render_template(
     session: Session,
     template_name: &str,
-    hostname: &str,
+    state: &AppState,
 ) -> Result<Html<String>, AppError> {
+    let hostname = &state.hostname;
     let profile: UserProfile = session.get(SESSION_KEY).await?.unwrap_or_default();
 
     if profile.subject.is_empty() {
@@ -261,7 +291,8 @@ async fn render_template(
         .replace("{{subject}}", &profile.subject)
         .replace("{{id_token}}", &profile.id_token)
         .replace("{{public_key}}", &profile.public_key_pem)
-        .replace("{{hostname}}", hostname);
+        .replace("{{hostname}}", hostname)
+        .replace("{{agent_url}}", &state.config.agent_url);
 
     Ok(Html(body))
 }
@@ -547,7 +578,7 @@ async fn cosign_handler(
 }
 
 /// A simple PKCE implementation.
-mod pkce {
+pub(crate) mod pkce {
     use super::{Digest, OsRng, RngCore, Sha256};
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 

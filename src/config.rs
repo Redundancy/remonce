@@ -38,6 +38,21 @@ pub struct Config {
 
     /// Agent-specific configuration. Required when running `remonce agent`.
     pub agent: Option<AgentConfig>,
+
+    /// Default agent URL the signer UI submits bundles to. Must be https.
+    /// The browser never talks to the agent directly — the loopback web tier
+    /// proxies all agent traffic so cert trust is handled server-side.
+    #[serde(default = "default_agent_url")]
+    pub agent_url: String,
+
+    /// Optional PEM file with extra root CA(s) trusted when the web tier
+    /// connects to the agent (e.g. a self-signed agent cert). Added on top
+    /// of the system trust store.
+    pub agent_ca_path: Option<String>,
+}
+
+fn default_agent_url() -> String {
+    "https://localhost:10022".to_string()
 }
 
 /// Configuration for the remote agent. TLS is mandatory — the agent is the

@@ -25,6 +25,16 @@
                         <input type="datetime-local"
                             class="form-control form-control-sm bg-dark text-light border-secondary" id="not-after">
                     </div>
+                    <div class="col-12">
+                        <label class="form-label small text-secondary mb-1">Operator Requirements
+                            (delegation)</label>
+                        <p class="small text-muted mb-2">Restrict who may co-sign and run this command. The
+                            executing operator's identity token must match <strong>at least one</strong> of these
+                            requirements. Leave empty for a normal (self or single-signer) token.</p>
+                        <div id="opreq-rows"></div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary"
+                            onclick="addOpReqRow()">+ Add requirement</button>
+                    </div>
                 </div>
             </div>
         </div>

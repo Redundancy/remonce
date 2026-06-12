@@ -142,6 +142,8 @@ mod tests {
             opa_url: "http://127.0.0.1:8181".into(),
             files: vec![],
             agent: None,
+            agent_url: "https://localhost:10022".into(),
+            agent_ca_path: None,
         }
     }
 

@@ -26,6 +26,11 @@
                         <dd class="col-sm-9 text-light small" id="detail-constraints">
                             <span class="text-muted">None</span>
                         </dd>
+
+                        <dt class="col-sm-3">Operator Must:</dt>
+                        <dd class="col-sm-9 text-light small" id="detail-opreq">
+                            <span class="text-muted">None (single signer)</span>
+                        </dd>
                     </dl>
 
                     <div class="alert alert-warning small">
@@ -48,9 +53,13 @@
                         style="font-family: monospace; font-size: 0.9rem; background-color: #0d1117; color: #7ee787; border: 1px solid #30363d;"></textarea>
                     <div class="mt-2 d-flex gap-2">
                         <button id="copy-signed-btn" class="btn btn-outline-success">Copy Signed Token</button>
+                        <button id="download-signed-btn" class="btn btn-outline-secondary">Download
+                            JSON</button>
                         <button id="execute-now-btn" class="btn btn-success flex-grow-1">Execute Now</button>
                     </div>
                 </div>
+
+                <div id="agent-url-area" class="mt-3"></div>
             </div>
         </div>
     </div>

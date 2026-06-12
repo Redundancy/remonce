@@ -47,6 +47,17 @@ listen_address = "127.0.0.1:8080"
 # Directory where execution logs will be stored.
 # Default: "logs"
 logs_dir = "logs"
+
+# Agent the web UI talks to. The browser never contacts the agent directly:
+# the signer proxies /api/agent/* and the /ws/* log streams to this URL over
+# TLS. Must be https://. The UI lets the user override it per-session.
+# Default: "https://localhost:10022"
+agent_url = "https://agent.example.com:10022"
+
+# Optional: PEM file with extra CA roots trusted when the signer connects to
+# the agent (e.g. a self-signed agent cert or private CA). System roots are
+# always trusted; this is additive.
+agent_ca_path = "./certs/agent-fullchain.pem"
 ```
 
 ### Web tier TLS (optional)
@@ -224,3 +235,21 @@ The approver can embed OIDC claim predicates that the executing operator must sa
 ```
 
 Semantics: if `any_of` is non-empty, at least one predicate must match the operator's OIDC token claims. Empty/absent = no constraint (any authenticated operator in OPA's allow-set may execute). Claims are evaluated at **execution time** against the operator's fresh token, so group changes propagate immediately.
+
+## CLI cosigning (`remonce cosign`)
+
+Operators who receive a delegated approval can co-sign it without running the web UI:
+
+```bash
+# Co-sign a bundle (JSON file or base64 token; '-' reads stdin) and submit it
+remonce cosign --bundle approval.json --submit
+
+# Or just emit the cosigned ExecutionBundle for later submission
+remonce cosign -b approval.json -o execution-bundle.json
+```
+
+The command reads `[oidc]` and `agent_url` / `agent_ca_path` from `config.toml`. It generates a fresh ephemeral keypair, runs a browser-based OIDC authorization-code flow (PKCE, with the nonce bound to the ephemeral key — same pattern as the web UI), obtains an RFC 3161 timestamp on the cosignature, and produces an ExecutionBundle.
+
+- `--agent <url>` overrides `agent_url` for `--submit`. Must be `https://`.
+- The OIDC redirect listener binds the host/port from `oidc.redirect_uri`. If `remonce web` is already running on that port, use its Cosign page instead.
+- Note for CI: tokens minted by platform OIDC issuers (e.g. GitHub Actions) cannot carry a custom nonce, so they cannot bind an ephemeral key. CLI cosigning is for humans; machine flows need an issuer that honors the `nonce` parameter.

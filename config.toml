@@ -12,6 +12,12 @@ client_id = "xAoXyxo5QuLi3zxz17OR82L2vW258SEP"
 # Explicit redirect URI to avoid cookie domain mismatch (localhost vs 127.0.0.1)
 redirect_uri = "http://localhost:8080/oidc/callback"
 
+# Agent the web UI proxies execution/files/log-streams to. Must be https://.
+# Default: "https://localhost:10022". For self-signed agent certs, point
+# agent_ca_path at the cert/CA PEM (additive to system roots).
+#agent_url = "https://localhost:10022"
+#agent_ca_path = "certs/agent-cert.pem"
+
 # Default TSA is DigiCert's free public service and the bundled DigiCert G4
 # root is always trusted. Uncomment only if you need to point at a different
 # TSA or add private roots. See CONFIGURATION.md.
