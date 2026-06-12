@@ -31,6 +31,9 @@ pub struct AgentState {
     pub trusted_roots: Vec<Vec<u8>>,
     pub replay_cache: crate::replay::ReplayCache,
     pub revocations: crate::replay::RevocationCache,
+    /// Central revocation service (client, base URL). When set, every
+    /// execution checks it and FAILS CLOSED if it is unreachable.
+    pub revocation_service: Option<(Client, url::Url)>,
 }
 
 // ExecutionRequest is imported from security module
@@ -126,6 +129,28 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(event = "agent_startup", hostname = %hostname, "Agent starting up");
 
+    let revocation_service = match &agent_config.revocation_service_url {
+        Some(raw) => {
+            let parsed: url::Url = raw
+                .trim()
+                .parse()
+                .map_err(|e| format!("Invalid agent.revocation_service_url: {e}"))?;
+            if parsed.scheme() != "https" {
+                return Err(format!(
+                    "agent.revocation_service_url must be https (got '{raw}')"
+                )
+                .into());
+            }
+            let client = crate::agent_proxy::build_agent_http(
+                agent_config.revocation_service_ca_path.as_deref(),
+            )
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            tracing::info!(url = %parsed, "Central revocation service enabled (fail-closed)");
+            Some((client, parsed))
+        }
+        None => None,
+    };
+
     let state = AgentState {
         http_client,
         config,
@@ -135,6 +160,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         trusted_roots,
         replay_cache: crate::replay::ReplayCache::new(),
         revocations: crate::replay::RevocationCache::new(),
+        revocation_service,
     };
 
     let mut app = Router::new()
@@ -288,7 +314,8 @@ async fn execute_handler(
     };
 
     // 3. Revocation check — the approver's signature may have been revoked
-    //    after the bundle was issued.
+    //    after the bundle was issued. Local cache first, then the central
+    //    revocation service (fail-closed) if one is configured.
     if state.revocations.is_revoked(&bundle.approver.signature) {
         crate::audit::log_audit(
             "deny",
@@ -301,6 +328,40 @@ async fn execute_handler(
         return Err(ErrorResponse {
             error: "Approval Revoked".into(),
         });
+    }
+
+    if let Some((client, base)) = &state.revocation_service {
+        match check_revocation_service(client, base, &bundle.approver.signature).await {
+            Ok(false) => {}
+            Ok(true) => {
+                crate::audit::log_audit(
+                    "deny",
+                    "Approval has been revoked (revocation service)".into(),
+                    approver_user.clone(),
+                    ip.clone(),
+                    hostname.clone(),
+                    full_ctx(),
+                );
+                return Err(ErrorResponse {
+                    error: "Approval Revoked".into(),
+                });
+            }
+            Err(e) => {
+                // Fail-closed: a configured revocation service must be
+                // available, otherwise we cannot know the approval is live.
+                crate::audit::log_audit(
+                    "error",
+                    format!("Revocation service check failed: {}", e),
+                    approver_user.clone(),
+                    ip.clone(),
+                    hostname.clone(),
+                    full_ctx(),
+                );
+                return Err(ErrorResponse {
+                    error: "Revocation Check Failed".into(),
+                });
+            }
+        }
     }
 
     // 4. Replay check — executor signature (operator if delegated, else approver).
@@ -714,10 +775,40 @@ pub struct RevocationResponse {
     pub message: String,
 }
 
+#[derive(Deserialize)]
+struct RevokedStatusResponse {
+    revoked: bool,
+}
+
+/// Query the central revocation service for `sig_hex`. Any transport or
+/// protocol error is surfaced to the caller, which treats it as fatal
+/// (fail-closed).
+async fn check_revocation_service(
+    client: &Client,
+    base: &url::Url,
+    sig_hex: &str,
+) -> Result<bool, String> {
+    let mut url = base.clone();
+    url.set_path(&format!("/revoked/{}", sig_hex));
+    url.set_query(None);
+    let resp = client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    let status: RevokedStatusResponse = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(status.revoked)
+}
+
 /// Revoke an approver bundle. The revoker submits the full approver bundle
 /// plus a fresh, nonce-bound attestation signing the domain-separated
 /// revocation payload. Authorized when the revoker is the original approver
 /// (same OIDC `sub`) or when OPA allows `action = "revoke"`. Idempotent.
+/// When a central revocation service is configured, the bundle is also
+/// forwarded there so the revocation takes effect estate-wide.
 async fn revoke_handler(
     State(state): State<AgentState>,
     ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
@@ -729,72 +820,18 @@ async fn revoke_handler(
     let hostname = state.hostname.clone();
     let command_json = req.approver.command.clone();
 
-    let audit_ctx = || AuditContext {
-        command: Some(command_json.clone()),
-        ..Default::default()
+    let ctx = crate::revocation::RevocationCtx {
+        config: &state.config,
+        jwks: &state.jwks,
+        trusted_roots: &state.trusted_roots,
+        http_client: &state.http_client,
+        hostname: &hostname,
     };
 
-    // Resolve the command config: it supplies the validity windows and the
-    // OPA rule governing third-party revocation.
-    let command_name = match command_json.get("command").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
-            crate::audit::log_audit(
-                "deny",
-                "Revocation rejected: missing 'command' field".into(),
-                "unauthenticated".into(),
-                ip.clone(),
-                hostname.clone(),
-                audit_ctx(),
-            );
-            return Err(ErrorResponse {
-                error: "Invalid Request".into(),
-            });
-        }
-    };
-
-    let cmd_config = match state.config.commands.iter().find(|c| c.name == command_name) {
-        Some(c) => c.clone(),
-        None => {
-            crate::audit::log_audit(
-                "deny",
-                format!("Revocation rejected: command '{}' not configured", command_name),
-                "unauthenticated".into(),
-                ip.clone(),
-                hostname.clone(),
-                audit_ctx(),
-            );
-            return Err(ErrorResponse {
-                error: "Invalid Request".into(),
-            });
-        }
-    };
-
-    let verifier_config = crate::security::VerifierConfig {
-        client_id: state.config.oidc.client_id.clone(),
-        issuer_url: state.config.oidc.issuer_url.clone(),
-        jwks: state.jwks.clone(),
-        trusted_roots: state.trusted_roots.clone(),
-        approver_max_validity: cmd_config.approver_max_validity_or_default(),
-        operator_max_validity: cmd_config.operator_max_validity_or_default(),
-    };
-
-    let revocation = match crate::security::verify_revocation(&req, &verifier_config) {
-        Ok(r) => r,
-        Err(e) => {
-            crate::audit::log_audit(
-                "deny",
-                format!("Revocation verification failed: {}", e),
-                "unauthenticated".into(),
-                ip.clone(),
-                hostname.clone(),
-                audit_ctx(),
-            );
-            return Err(ErrorResponse {
-                error: "Verification Failed".into(),
-            });
-        }
-    };
+    let verified = crate::revocation::verify_and_authorize(&ctx, &req, &ip)
+        .await
+        .map_err(|e| ErrorResponse { error: e.into() })?;
+    let revocation = &verified.authorized;
 
     let revoker_user = revocation.revoker.username.clone();
     let approver_user = revocation.approver.username.clone();
@@ -805,79 +842,53 @@ async fn revoke_handler(
         ..Default::default()
     };
 
-    // Authorization: self-revocation is always allowed; anyone else needs an
-    // explicit OPA decision for action = "revoke".
-    if !revocation.self_revoked {
-        let opa_input = crate::opa::OpaInput {
-            action: "revoke".into(),
-            command: command_json.clone(),
-            approver: crate::opa::SignerContext {
-                username: approver_user.clone(),
-                claims: revocation.approver.claims.clone(),
-                signed_at: revocation
-                    .approver
-                    .signed_at
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "unknown_time".to_string()),
-            },
-            operator: crate::opa::SignerContext {
-                username: revoker_user.clone(),
-                claims: revocation.revoker.claims.clone(),
-                signed_at: revocation
-                    .revoker
-                    .signed_at
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "unknown_time".to_string()),
-            },
-            self_executed: false,
-            host: hostname.clone(),
-        };
-
-        let decision = crate::opa::check_authorization(
-            &state.http_client,
-            &state.config.opa_url,
-            &cmd_config.opa_rule,
-            opa_input,
-        )
-        .await
-        .map_err(|e| {
-            crate::audit::log_audit(
-                "error",
-                format!("OPA evaluation failed during revocation: {}", e),
-                revoker_user.clone(),
-                ip.clone(),
-                hostname.clone(),
-                revoke_ctx(),
-            );
-            ErrorResponse {
-                error: "Internal Error".into(),
-            }
-        })?;
-
-        if !decision.allow {
-            crate::audit::log_audit(
-                "deny",
-                format!("Third-party revocation denied: {}", decision.reason),
-                revoker_user.clone(),
-                ip.clone(),
-                hostname.clone(),
-                revoke_ctx(),
-            );
-            return Err(ErrorResponse {
-                error: "Authorization Denied".into(),
-            });
-        }
-    }
-
     // Pin the revocation until the approval would have expired anyway.
     let now = time::OffsetDateTime::now_utc();
-    let expiry = revocation.approver.signed_at + cmd_config.approver_max_validity_or_default();
+    let expiry = revocation.approver.signed_at + verified.approver_max_validity;
     if expiry > now {
         let remaining: std::time::Duration =
             (expiry - now).try_into().unwrap_or_default();
         state
             .revocations
             .revoke(&revocation.approver_signature_hex, remaining);
+    }
+
+    // Forward to the central revocation service so a single submission
+    // covers the whole estate. The local pin above stands either way.
+    let mut message = "Approval revoked on this agent".to_string();
+    if let Some((client, base)) = &state.revocation_service {
+        let mut url = base.clone();
+        url.set_path("/revoke");
+        url.set_query(None);
+        let forward = async {
+            client
+                .post(url)
+                .timeout(std::time::Duration::from_secs(10))
+                .json(&req)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())
+        }
+        .await;
+        if let Err(e) = forward {
+            crate::audit::log_audit(
+                "error",
+                format!(
+                    "Revocation pinned locally but forwarding to revocation service failed: {}",
+                    e
+                ),
+                revoker_user.clone(),
+                ip.clone(),
+                hostname.clone(),
+                revoke_ctx(),
+            );
+            return Err(ErrorResponse {
+                error: "Revocation Service Unavailable (revoked on this agent only)".into(),
+            });
+        }
+        message = "Approval revoked on this agent and the revocation service".to_string();
     }
 
     crate::audit::log_audit(
@@ -896,7 +907,7 @@ async fn revoke_handler(
 
     Ok(Json(RevocationResponse {
         status: "revoked".to_string(),
-        message: "Approval revoked on this agent".to_string(),
+        message,
     }))
 }
 

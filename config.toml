@@ -72,6 +72,11 @@ description = "Server configuration file"
 # listen_address = "0.0.0.0:10022"
 # cors_allowed_origins = []  # empty = no CORS layer
 #
+# Optional central revocation service. FAIL-CLOSED: when set, the agent
+# checks it before every execution and denies if it is unreachable.
+# revocation_service_url = "https://revocations.example.com:10023"
+# revocation_service_ca_path = "certs/revocation-cert.pem"
+#
 # [agent.tls]
 # mode = "files"
 # chain = "certs/agent-cert.pem"
@@ -84,3 +89,16 @@ description = "Server configuration file"
 # email = ["ops@example.com"]
 # cache_dir = "certs/acme-cache"
 # # directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+# Central revocation service — required when running `remonce revocation-service`.
+# Persists revocations to a JSONL file so they survive restarts and apply
+# estate-wide from a single submission.
+#
+# [revocation_service]
+# listen_address = "0.0.0.0:10023"
+# persist_path = "revocations.jsonl"
+#
+# [revocation_service.tls]
+# mode = "files"
+# chain = "certs/revocation-cert.pem"
+# key = "certs/revocation-key.pem"

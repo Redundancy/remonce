@@ -11,6 +11,7 @@ pub mod insecure;
 pub mod opa;
 pub mod params;
 pub mod replay;
+pub mod revocation;
 pub mod tsa;
 
 #[cfg(test)]

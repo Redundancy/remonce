@@ -39,6 +39,8 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Run the central revocation service (persistent, estate-wide revocations)
+    RevocationService,
     /// Revoke an approver bundle on an agent (headless flow)
     Revoke {
         /// Path to the approver bundle (JSON or base64 token), or '-' for stdin
@@ -63,6 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Agent => {
             println!("Starting Execution Agent...");
             agent::run(cli.insecure).await
+        }
+        Commands::RevocationService => {
+            println!("Starting Revocation Service...");
+            remonce::revocation::run(cli.insecure).await
         }
         Commands::Cosign {
             bundle,

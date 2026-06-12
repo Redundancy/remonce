@@ -49,6 +49,10 @@ pub struct Config {
     /// connects to the agent (e.g. a self-signed agent cert). Added on top
     /// of the system trust store.
     pub agent_ca_path: Option<String>,
+
+    /// Central revocation service configuration. Required when running
+    /// `remonce revocation-service`.
+    pub revocation_service: Option<RevocationServiceConfig>,
 }
 
 fn default_agent_url() -> String {
@@ -69,10 +73,43 @@ pub struct AgentConfig {
     /// CORS origins the agent should allow. Empty = no CORS layer.
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+
+    /// Central revocation service this agent consults before every
+    /// execution. Must be https. FAIL-CLOSED: if set and the service is
+    /// unreachable, executions are denied.
+    pub revocation_service_url: Option<String>,
+
+    /// Optional PEM file with extra root CA(s) trusted when connecting to
+    /// the revocation service (e.g. a self-signed cert). Added on top of
+    /// the system trust store.
+    pub revocation_service_ca_path: Option<String>,
 }
 
 fn default_agent_listen_address() -> String {
     "0.0.0.0:10022".to_string()
+}
+
+/// Configuration for the central revocation service
+/// (`remonce revocation-service`). TLS is mandatory.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RevocationServiceConfig {
+    #[serde(default = "default_revocation_listen_address")]
+    pub listen_address: String,
+
+    /// TLS configuration (Files or ACME). There is no plaintext mode.
+    pub tls: TlsConfig,
+
+    /// JSONL file persisting revocations across restarts.
+    #[serde(default = "default_revocation_persist_path")]
+    pub persist_path: String,
+}
+
+fn default_revocation_listen_address() -> String {
+    "0.0.0.0:10023".to_string()
+}
+
+fn default_revocation_persist_path() -> String {
+    "revocations.jsonl".to_string()
 }
 
 fn default_logs_dir() -> String {

@@ -325,4 +325,35 @@ How it works:
 - The revoker attestation must be fresh within `operator_max_validity`.
 - A revoked approval is rejected by `/execute` until its natural expiry (`approver_max_validity`).
 
-Caveats: the revocation list is **in-memory and per-agent**. Submit the revocation to every agent the bundle targets, and note that an agent restart forgets it (see PRODUCTION_READINESS.md).
+Without a central revocation service (below), the revocation list is **in-memory and per-agent**: submit the revocation to every agent the bundle targets, and note that an agent restart forgets it.
+
+## Central revocation service (`remonce revocation-service`)
+
+For multi-agent estates, run a single revocation service so one submission revokes everywhere, durably:
+
+```toml
+[revocation_service]
+listen_address = "0.0.0.0:10023"
+persist_path = "revocations.jsonl"   # survives restarts; compacted on load
+
+[revocation_service.tls]
+mode = "files"                        # or "acme", same options as [agent.tls]
+chain = "certs/revocation-cert.pem"
+key = "certs/revocation-key.pem"
+```
+
+Then point each agent at it:
+
+```toml
+[agent]
+revocation_service_url = "https://revocations.example.com:10023"
+# revocation_service_ca_path = "certs/revocation-cert.pem"  # for self-signed certs
+```
+
+Semantics:
+
+- The service exposes the same `POST /revoke` endpoint as the agent and performs the **same full verification** (approver bundle genuineness, revoker attestation, self-vs-third-party OPA check) — it cannot be poisoned with unverified entries. `remonce revoke --agent https://revocations...` can therefore target it directly.
+- When `revocation_service_url` is set, the agent checks `GET /revoked/{sig}` before every execution and a revocation submitted to any agent is forwarded to the service.
+- **Fail-closed**: if the service is configured but unreachable, the agent denies execution (`Revocation Check Failed`). A configured revocation service must be available — there is deliberately no fail-open mode.
+- Revocations expire from the store when the underlying approval would have aged out of `approver_max_validity` anyway; expired entries are compacted out of the JSONL file on service restart.
+- The service reads the same `config.toml` sections as the agent (`[oidc]`, `[timestamp_authority]`, `[[commands]]`, `opa_url`), since it performs the same verification.
