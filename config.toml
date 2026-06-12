@@ -39,10 +39,21 @@ opa_rule = "data.remonce.authz.decision"
 
 [[commands]]
 name = "ping-test"
-description = "Pings localhost 10 times to test execution streaming."
+description = "Pings localhost a configurable number of times to test execution streaming."
 opa_rule = "data.remonce.authz.decision"
 executable = "ping"
-args = ["-n", "10", "127.0.0.1"]
+# {{count}} is substituted from the signed `params` after validation.
+args = ["-n", "{{count}}", "127.0.0.1"]
+
+# Declared parameters. Validation is fail-closed: a param with no `allowed`,
+# `pattern`, or `min`/`max` rule gets a conservative default pattern
+# (alphanumeric-ish, max 64 chars, no leading dash — prevents flag injection).
+[[commands.params]]
+name = "count"
+description = "Number of pings"
+default = "10"
+min = 1
+max = 100
 
 [[files]]
 path = "logs/*.log"

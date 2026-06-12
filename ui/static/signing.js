@@ -109,6 +109,13 @@ function describeConstraints(command) {
     if (command.not_after) {
         html += `<div><strong>Not After:</strong> ${new Date(command.not_after).toLocaleString()}</div>`;
     }
+    if (command.params && typeof command.params === 'object') {
+        const entries = Object.entries(command.params);
+        if (entries.length > 0) {
+            const parts = entries.map(([k, v]) => `<code>${escapeHtml(k)}=${escapeHtml(String(v))}</code>`);
+            html += `<div><strong>Parameters:</strong> ${parts.join(' , ')}</div>`;
+        }
+    }
     return html || '<span class="text-muted">None</span>';
 }
 
@@ -218,6 +225,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    const revokeTokenBtn = document.getElementById('revoke-token-btn');
+    if (revokeTokenBtn) revokeTokenBtn.addEventListener('click', handleRevokeToken);
+
     // Page: Cosign
     const cosignInspectBtn = document.getElementById('cosign-inspect-btn');
     if (cosignInspectBtn) cosignInspectBtn.addEventListener('click', handleCosignInspect);
@@ -244,6 +254,8 @@ async function loadCommandsForGenerate() {
         if (!res.ok) throw new Error(await res.text());
 
         const commands = await res.json();
+        window.registeredCommands = {};
+        commands.forEach(cmd => { window.registeredCommands[cmd.name] = cmd; });
 
         let html = '';
 
@@ -276,6 +288,7 @@ async function loadCommandsForGenerate() {
                             ${validity}
                         </div>
                         ${desc}
+                        ${renderParamInputs(cmd)}
                         <div class="mt-auto pt-3 d-flex justify-content-between align-items-center">
                              <button class="btn btn-sm btn-outline-success" onclick="generateToken('${escapeHtml(cmd.name)}')">Generate Command</button>
                         </div>
@@ -346,12 +359,73 @@ function getOperatorRequires() {
     return any_of.length > 0 ? { any_of: any_of } : null;
 }
 
+// --- command parameter inputs ---
+
+function renderParamInputs(cmd) {
+    if (!cmd.params || cmd.params.length === 0) return '';
+    let html = '<div class="mb-2 cmd-params">';
+    cmd.params.forEach(p => {
+        const label = `${escapeHtml(p.name)}${p.required ? ' *' : ''}`;
+        const title = p.description ? ` title="${escapeHtml(p.description)}"` : '';
+        let field;
+        if (p.allowed && p.allowed.length > 0) {
+            const blank = (p.required || p.default) ? '' : '<option value=""></option>';
+            const options = p.allowed.map(v => {
+                const sel = p.default === v ? ' selected' : '';
+                return `<option value="${escapeHtml(v)}"${sel}>${escapeHtml(v)}</option>`;
+            }).join('');
+            field = `<select class="form-select form-select-sm bg-dark text-light border-secondary param-input"
+                data-cmd="${escapeHtml(cmd.name)}" data-param="${escapeHtml(p.name)}"${title}>${blank}${options}</select>`;
+        } else {
+            const placeholder = p.description || (p.min != null || p.max != null
+                ? `${p.min ?? ''}..${p.max ?? ''}` : '');
+            field = `<input type="text" class="form-control form-control-sm bg-dark text-light border-secondary param-input"
+                data-cmd="${escapeHtml(cmd.name)}" data-param="${escapeHtml(p.name)}"${title}
+                placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(p.default || '')}">`;
+        }
+        html += `<div class="input-group input-group-sm mb-1">
+            <span class="input-group-text bg-dark text-secondary border-secondary"${title}>${label}</span>
+            ${field}
+        </div>`;
+    });
+    html += '</div>';
+    return html;
+}
+
+// Collect the param inputs for a command card. Returns null when there is
+// nothing to send; throws when a required param is left empty.
+function collectParams(commandName) {
+    const cmd = window.registeredCommands && window.registeredCommands[commandName];
+    if (!cmd || !cmd.params || cmd.params.length === 0) return null;
+
+    const params = {};
+    cmd.params.forEach(p => {
+        const input = document.querySelector(
+            `.param-input[data-cmd="${CSS.escape(commandName)}"][data-param="${CSS.escape(p.name)}"]`);
+        const value = input ? input.value.trim() : '';
+        if (value) {
+            params[p.name] = value;
+        } else if (p.required && !p.default) {
+            throw new Error(`Parameter '${p.name}' is required`);
+        }
+    });
+    return Object.keys(params).length > 0 ? params : null;
+}
+
 function generateToken(commandName) {
+    let params;
+    try {
+        params = collectParams(commandName);
+    } catch (e) {
+        alert(e.message);
+        return;
+    }
     const constraints = getConstraints();
     const draft = {
         command: {
             command: commandName,
             id: crypto.randomUUID(),
+            ...(params ? { params: params } : {}),
             ...constraints
         },
         operator_requires: getOperatorRequires()
@@ -507,6 +581,58 @@ async function handleExecuteToken() {
     } finally {
         btn.disabled = false;
         btn.textContent = 'Execute';
+    }
+}
+
+async function handleRevokeToken() {
+    const input = document.getElementById('signed-token-input');
+    const btn = document.getElementById('revoke-token-btn');
+
+    if (!input.value.trim()) {
+        alert('Please paste a token');
+        return;
+    }
+
+    let approver;
+    try {
+        approver = parseBundle(input.value).approver;
+    } catch (e) {
+        alert('Invalid token: ' + e.message);
+        return;
+    }
+
+    const cmdName = (approver.command && approver.command.command) || '(unknown)';
+    if (!confirm(`Revoke the approval for '${cmdName}' on this agent? This cannot be undone.`)) {
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Revoking...';
+
+    try {
+        const res = await fetch('/api/agent/revoke', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ agent_url: currentAgentUrl(), approver: approver })
+        });
+        const text = await res.text();
+        if (!res.ok) {
+            let msg = `Agent returned ${res.status}`;
+            try {
+                const data = JSON.parse(text);
+                if (data && data.error) msg = data.error;
+                else if (text.trim()) msg += `: ${text}`;
+            } catch (_) {
+                if (text.trim()) msg += `: ${text}`;
+            }
+            throw new Error(msg);
+        }
+        alert('Approval revoked. The agent will refuse this bundle from now on.');
+        btn.textContent = 'Revoked';
+    } catch (e) {
+        alert('Revocation Error: ' + e.message);
+        btn.disabled = false;
+        btn.textContent = 'Revoke Approval';
     }
 }
 

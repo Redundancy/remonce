@@ -39,6 +39,15 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Revoke an approver bundle on an agent (headless flow)
+    Revoke {
+        /// Path to the approver bundle (JSON or base64 token), or '-' for stdin
+        #[arg(long, short = 'b')]
+        bundle: String,
+        /// Agent URL to submit to (defaults to `agent_url` from config.toml)
+        #[arg(long)]
+        agent: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -68,6 +77,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     output,
                     submit,
                 },
+                cli.insecure,
+            )
+            .await
+        }
+        Commands::Revoke { bundle, agent } => {
+            remonce::cosign::run_revoke(
+                remonce::cosign::RevokeArgs { bundle, agent },
                 cli.insecure,
             )
             .await

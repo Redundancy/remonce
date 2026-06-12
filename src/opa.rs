@@ -10,6 +10,8 @@ pub struct SignerContext {
 
 #[derive(Serialize)]
 pub struct OpaInput {
+    /// "execute" for command execution, "revoke" for approval revocation.
+    pub action: String,
     pub command: serde_json::Value,
     pub approver: SignerContext,
     pub operator: SignerContext,
@@ -59,6 +61,7 @@ mod tests {
     #[test]
     fn test_opa_input_serialization() {
         let input = OpaInput {
+            action: "execute".into(),
             command: serde_json::json!({ "command": "test" }),
             approver: SignerContext {
                 username: "alice".into(),

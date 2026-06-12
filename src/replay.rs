@@ -46,9 +46,70 @@ impl ReplayCache {
     }
 }
 
+/// In-memory set of revoked approver-signature hashes. Each entry carries
+/// its own expiry: the moment the underlying bundle would have aged out of
+/// `approver_max_validity` anyway, after which keeping it is pointless.
+#[derive(Clone, Default)]
+pub struct RevocationCache {
+    inner: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+impl RevocationCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `sig_hex` as revoked for the next `remaining` duration.
+    pub fn revoke(&self, sig_hex: &str, remaining: Duration) {
+        let mut map = self.inner.lock().expect("revocation cache lock poisoned");
+        let now = Instant::now();
+        if map.len() > SWEEP_THRESHOLD {
+            map.retain(|_, expires_at| *expires_at > now);
+        }
+        let expires_at = now + remaining;
+        // Keep the later expiry if revoked twice.
+        match map.get(sig_hex) {
+            Some(existing) if *existing >= expires_at => {}
+            _ => {
+                map.insert(sig_hex.to_string(), expires_at);
+            }
+        }
+    }
+
+    pub fn is_revoked(&self, sig_hex: &str) -> bool {
+        let map = self.inner.lock().expect("revocation cache lock poisoned");
+        map.get(sig_hex)
+            .map(|expires_at| *expires_at > Instant::now())
+            .unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revoked_sig_is_reported() {
+        let cache = RevocationCache::new();
+        cache.revoke("abc", Duration::from_secs(60));
+        assert!(cache.is_revoked("abc"));
+        assert!(!cache.is_revoked("def"));
+    }
+
+    #[test]
+    fn expired_revocation_is_forgotten() {
+        let cache = RevocationCache::new();
+        cache.revoke("abc", Duration::from_secs(0));
+        assert!(!cache.is_revoked("abc"));
+    }
+
+    #[test]
+    fn re_revoke_keeps_later_expiry() {
+        let cache = RevocationCache::new();
+        cache.revoke("abc", Duration::from_secs(60));
+        cache.revoke("abc", Duration::from_secs(0));
+        assert!(cache.is_revoked("abc"));
+    }
 
     #[test]
     fn first_seen_wins_same_ttl() {

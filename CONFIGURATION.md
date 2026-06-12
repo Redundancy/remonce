@@ -208,6 +208,55 @@ approver_max_validity = "3d"
 operator_max_validity = "10m"
 ```
 
+### Command parameters (`[[commands.params]]`)
+
+Args templates may contain `{{name}}` placeholders, filled from a `params`
+object in the signed command payload. Because `params` sits inside the
+command object, it is covered by the approver's signature — the operator
+cannot alter values after approval.
+
+```toml
+[[commands]]
+name = "restart-service"
+opa_rule = "data.remonce.authz.decision"
+executable = "systemctl"
+args = ["restart", "{{service}}"]
+
+[[commands.params]]
+name = "service"                      # placeholder name: [A-Za-z_][A-Za-z0-9_]*
+description = "Service to restart"    # shown in the UI
+required = true                       # signer must supply a value
+allowed = ["nginx", "postgres"]       # exact allow-list (highest precedence)
+
+[[commands.params]]
+name = "count"
+default = "10"                        # used when omitted; must itself validate
+min = 1                               # integer range (value must parse as i64)
+max = 100
+
+[[commands.params]]
+name = "host"
+pattern = '[a-z0-9-]+\.internal'      # anchored regex the full value must match
+```
+
+Validation is **fail-closed** and runs on the agent at execution time:
+
+- Rule precedence per param: `allowed` > `min`/`max` > `pattern` > default rule.
+- The default rule (no explicit validation) allows short alphanumeric-ish
+  values (`[A-Za-z0-9._][A-Za-z0-9._-]{0,63}`) — notably **no leading dash**,
+  which prevents injecting flags into the executable's argv.
+- Unknown params, missing required params, type violations, and unresolved
+  `{{placeholders}}` all reject the execution.
+- Commands are spawned without a shell, so shell metacharacters are inert;
+  the validation rules exist to constrain *argv* content.
+
+> [!WARNING]
+> If you write a custom `pattern` that admits values starting with `-`, a
+> signer can inject flags into the executable's argv. Keep patterns tight.
+
+OPA sees the validated `params` via `input.command.params`, so policies can
+authorize per-value (e.g. only `oncall-managers` may restart `postgres`).
+
 ### Delegation & signing validity
 
 Remonce separates **authorization freshness** (approver) from **execution freshness** (operator):
@@ -253,3 +302,27 @@ The command reads `[oidc]` and `agent_url` / `agent_ca_path` from `config.toml`.
 - `--agent <url>` overrides `agent_url` for `--submit`. Must be `https://`.
 - The OIDC redirect listener binds the host/port from `oidc.redirect_uri`. If `remonce web` is already running on that port, use its Cosign page instead.
 - Note for CI: tokens minted by platform OIDC issuers (e.g. GitHub Actions) cannot carry a custom nonce, so they cannot bind an ephemeral key. CLI cosigning is for humans; machine flows need an issuer that honors the `nonce` parameter.
+
+## Revoking an approval (`remonce revoke`)
+
+An issued approval can be invalidated before it expires by submitting it to the agent's `POST /revoke` endpoint, together with a fresh, nonce-bound attestation from the revoker:
+
+```bash
+# Revoke a bundle (JSON file or base64 token; '-' reads stdin)
+remonce revoke --bundle approval.json
+
+# Target a specific agent
+remonce revoke -b approval.json --agent https://agent.example.com:10022
+```
+
+The same flow is available from the web UI's Execute page ("Revoke Approval" button) and via `POST /api/agent/revoke` on the web tier.
+
+How it works:
+
+- The revoker generates a fresh ephemeral keypair and runs the same nonce-bound OIDC login as cosigning, then signs a domain-separated payload (`REMONCE-REVOKE:` prefix) over the approver's signature — so a cosignature can never be replayed as a revocation, or vice versa.
+- The agent first re-verifies the approver bundle itself; only genuine approvals can be pinned to the revocation list (prevents cache poisoning).
+- **Self-revocation** (revoker has the same OIDC `sub` as the approver) is always allowed. **Third-party revocation** requires an OPA decision with `input.action == "revoke"` (see `policy/authz.rego`).
+- The revoker attestation must be fresh within `operator_max_validity`.
+- A revoked approval is rejected by `/execute` until its natural expiry (`approver_max_validity`).
+
+Caveats: the revocation list is **in-memory and per-agent**. Submit the revocation to every agent the bundle targets, and note that an agent restart forgets it (see PRODUCTION_READINESS.md).

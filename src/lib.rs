@@ -9,6 +9,7 @@ pub mod audit;
 pub mod tls;
 pub mod insecure;
 pub mod opa;
+pub mod params;
 pub mod replay;
 pub mod tsa;
 

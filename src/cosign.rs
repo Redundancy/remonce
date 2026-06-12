@@ -110,7 +110,7 @@ pub async fn run(args: CosignArgs, insecure: bool) -> Result<(), Error> {
 
     // 5. Optional submit.
     if args.submit {
-        let agent_url = submit_url(&config, args.agent.as_deref())?;
+        let agent_url = submit_url(&config, args.agent.as_deref(), "/execute")?;
         eprintln!("Submitting to {agent_url} ...");
         let client = crate::agent_proxy::build_agent_http(config.agent_ca_path.as_deref())
             .map_err(|e| -> Error { e.into() })?;
@@ -148,7 +148,7 @@ fn parse_approver_bundle(raw: &str) -> Result<ApproverBundle, Error> {
         .map_err(|e| format!("Failed to parse approver bundle: {e}").into())
 }
 
-fn submit_url(config: &Config, agent_override: Option<&str>) -> Result<url::Url, Error> {
+fn submit_url(config: &Config, agent_override: Option<&str>, path: &str) -> Result<url::Url, Error> {
     let raw = agent_override
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&config.agent_url);
@@ -156,9 +156,92 @@ fn submit_url(config: &Config, agent_override: Option<&str>) -> Result<url::Url,
     if parsed.scheme() != "https" {
         return Err(format!("Agent URL must be https (got '{raw}')").into());
     }
-    parsed.set_path("/execute");
+    parsed.set_path(path);
     parsed.set_query(None);
     Ok(parsed)
+}
+
+pub struct RevokeArgs {
+    /// Path to the approver bundle, or "-" for stdin.
+    pub bundle: String,
+    /// Agent URL override (defaults to config `agent_url`).
+    pub agent: Option<String>,
+}
+
+/// `remonce revoke` — revoke an approver bundle on an agent. Authenticates
+/// the revoker via the same nonce-bound OIDC flow as cosigning, signs the
+/// domain-separated revocation payload, and submits to the agent's /revoke.
+pub async fn run_revoke(args: RevokeArgs, insecure: bool) -> Result<(), Error> {
+    let config_str = std::fs::read_to_string("config.toml")
+        .map_err(|e| format!("Failed to read config.toml: {e}"))?;
+    let config: Config = toml::from_str(&config_str)?;
+
+    let insecure_mode = crate::insecure::validate(&config, insecure)
+        .map_err(|e| -> Error { e.to_string().into() })?;
+    crate::audit::set_insecure_mode(insecure_mode.as_bool());
+
+    let raw = if args.bundle == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(&args.bundle)
+            .map_err(|e| format!("Failed to read bundle '{}': {e}", args.bundle))?
+    };
+    let approver = parse_approver_bundle(raw.trim())?;
+
+    let command_str = serde_json::to_string_pretty(&approver.command)?;
+    eprintln!("Approver bundle loaded. Command to revoke:\n{command_str}");
+
+    let signing_key = SigningKey::random(&mut OsRng);
+    let public_key_pem = signing_key
+        .verifying_key()
+        .to_public_key_pem(spki::der::pem::LineEnding::LF)
+        .map_err(|e| format!("Failed to encode public key: {e}"))?;
+
+    let id_token = oidc_login(&config, &public_key_pem).await?;
+    eprintln!("OIDC login complete.");
+
+    let payload = crate::security::revocation_payload(&approver.signature, &public_key_pem);
+    let signature: p256::ecdsa::Signature = signing_key.sign(&payload);
+    let signature_bytes = signature.to_bytes();
+
+    let http_client = reqwest::Client::new();
+    let mut data_to_timestamp = signature_bytes.to_vec();
+    data_to_timestamp.extend_from_slice(id_token.as_bytes());
+    let timestamp_token_bytes = crate::tsa::request_timestamp(
+        &http_client,
+        &config.timestamp_authority.url,
+        &data_to_timestamp,
+    )
+    .await
+    .map_err(|e| format!("TSA error: {e}"))?;
+
+    let bundle = crate::security::RevocationBundle {
+        approver,
+        revoker: crate::security::RevokerAttestation {
+            signature: hex::encode(signature_bytes),
+            id_token,
+            public_key: public_key_pem,
+            timestamp_token: hex::encode(timestamp_token_bytes),
+        },
+    };
+
+    let agent_url = submit_url(&config, args.agent.as_deref(), "/revoke")?;
+    eprintln!("Submitting revocation to {agent_url} ...");
+    let client = crate::agent_proxy::build_agent_http(config.agent_ca_path.as_deref())
+        .map_err(|e| -> Error { e.into() })?;
+    let resp = client.post(agent_url).json(&bundle).send().await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        eprintln!("Agent accepted revocation:");
+        println!("{body}");
+        Ok(())
+    } else {
+        Err(format!("Agent rejected ({status}): {body}").into())
+    }
 }
 
 /// Authorization-code flow with PKCE and the nonce bound to the ephemeral key.

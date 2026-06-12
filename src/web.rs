@@ -197,6 +197,7 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         .route("/api/cosign", post(cosign_handler))
         .route("/api/commands", get(get_commands_handler))
         .route("/api/agent/execute", post(crate::agent_proxy::execute_proxy))
+        .route("/api/agent/revoke", post(crate::agent_proxy::revoke_proxy))
         .route("/api/agent/files", get(crate::agent_proxy::files_proxy))
         .route("/ws/exec", get(crate::agent_proxy::exec_stream_proxy))
         .route("/ws/file", get(crate::agent_proxy::file_stream_proxy))
@@ -484,7 +485,7 @@ struct CosignRequest {
 /// The key is stored raw in the server-side session (see `OidcFlowState`
 /// and `UserProfile`). The web tier is loopback-only so there is no
 /// cross-host exposure to encrypt at rest against.
-fn load_signing_key(profile: &UserProfile) -> Result<SigningKey, AppError> {
+pub(crate) fn load_signing_key(profile: &UserProfile) -> Result<SigningKey, AppError> {
     let bytes = hex::decode(&profile.signing_key_hex)
         .map_err(|_| AppError::Internal("Invalid signing key hex".into()))?;
     SigningKey::from_bytes(GenericArray::from_slice(&bytes))

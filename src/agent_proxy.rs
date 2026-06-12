@@ -122,6 +122,65 @@ pub async fn execute_proxy(
 }
 
 #[derive(Deserialize)]
+pub struct RevokeProxyRequest {
+    #[serde(default)]
+    pub agent_url: Option<String>,
+    pub approver: crate::security::ApproverBundle,
+}
+
+/// POST /api/agent/revoke — sign a revocation attestation with the session's
+/// ephemeral key and forward the RevocationBundle to the agent.
+pub async fn revoke_proxy(
+    State(state): State<AppState>,
+    session: Session,
+    axum::Json(req): axum::Json<RevokeProxyRequest>,
+) -> Result<Response, AppError> {
+    use p256::ecdsa::signature::Signer;
+
+    let profile = crate::web::require_profile(&session).await?;
+    let signing_key = crate::web::load_signing_key(&profile)?;
+
+    let payload =
+        crate::security::revocation_payload(&req.approver.signature, &profile.public_key_pem);
+    let signature: p256::ecdsa::Signature = signing_key.sign(&payload);
+    let signature_bytes = signature.to_bytes();
+
+    let mut data_to_timestamp = signature_bytes.to_vec();
+    data_to_timestamp.extend_from_slice(profile.id_token.as_bytes());
+    let timestamp_token_bytes = crate::tsa::request_timestamp(
+        &state.http_client,
+        &state.config.timestamp_authority.url,
+        &data_to_timestamp,
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("TSA Error: {e}")))?;
+
+    let bundle = crate::security::RevocationBundle {
+        approver: req.approver,
+        revoker: crate::security::RevokerAttestation {
+            signature: hex::encode(signature_bytes),
+            id_token: profile.id_token,
+            public_key: profile.public_key_pem,
+            timestamp_token: hex::encode(timestamp_token_bytes),
+        },
+    };
+
+    let url = resolve_agent_url(&state, req.agent_url.as_deref())?
+        .join("revoke")
+        .map_err(|e| AppError::Internal(format!("URL join: {e}")))?;
+
+    let resp = state
+        .agent_http
+        .post(url)
+        .json(&bundle)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Agent unreachable: {e}")))?;
+
+    passthrough(resp).await
+}
+
+#[derive(Deserialize)]
 pub struct FilesProxyParams {
     #[serde(default)]
     pub agent_url: Option<String>,

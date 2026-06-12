@@ -9,18 +9,25 @@ default reason = "Denied by default"
 # -------------------
 # For command execution requests, `input` contains:
 #
+#   input.action: string           - "execute" for command execution,
+#                                    "revoke" for third-party revocation
 #   input.command: object          - the approver's signed command payload
 #   input.approver:                - the authorizing identity
 #     .username: string
 #     .claims:   object            - the approver's OIDC JWT claims (groups, etc.)
 #     .signed_at: string           - RFC3339 approver TSA timestamp
 #   input.operator:                - the executing identity (equals approver
-#                                    when self-executing)
+#                                    when self-executing). For "revoke" this
+#                                    is the revoker's identity.
 #     .username: string
 #     .claims:   object
 #     .signed_at: string
 #   input.self_executed: bool      - true iff approver == operator
 #   input.host: string             - agent hostname
+#
+# Revocation note: an approver revoking their own bundle (same OIDC `sub`)
+# is always allowed by the agent without consulting OPA. Policy is only
+# asked when someone ELSE wants to revoke (action == "revoke").
 #
 # For file access / command listing, a simpler shape is used:
 #   input.action:  string   ("view_docs" | "read_file")
@@ -57,14 +64,23 @@ allow if {
 
 # test: any approver in `webapp-users` can authorize; no operator restriction.
 allow if {
+    input.action == "execute"
     input.command.command == "test"
     "webapp-users" in approver_groups
 }
 
 # ping-test: same.
 allow if {
+    input.action == "execute"
     input.command.command == "ping-test"
     "webapp-users" in approver_groups
+}
+
+# Third-party revocation: anyone in `webapp-users` may revoke another
+# user's approval. Tighten this (e.g. to an admin group) in production.
+allow if {
+    input.action == "revoke"
+    "webapp-users" in operator_groups
 }
 
 # Example (disabled — add your own rules below):

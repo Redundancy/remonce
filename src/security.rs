@@ -11,6 +11,7 @@
 
 use crate::tsa;
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
+use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use p256::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,10 @@ pub enum ValidationError {
     ExecutorStale { age_secs: u64, max_secs: u64 },
     #[error("Operator does not satisfy operator_requires")]
     OperatorConstraintUnsatisfied,
+    #[error("Revoker signature verification failed")]
+    RevokerSignatureFailed,
+    #[error("Revoker is not authorized to revoke this approval")]
+    RevokerNotAuthorized,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -108,6 +113,26 @@ pub struct ExecutionBundle {
     pub operator: Option<OperatorCosign>,
 }
 
+/// A request to revoke a previously-issued approver bundle before its
+/// natural expiry. The revoker presents the full bundle being revoked plus
+/// their own fresh attestation (same shape as an operator cosign, but over
+/// a domain-separated payload so the two can never be confused).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RevocationBundle {
+    /// The approver bundle being revoked.
+    pub approver: ApproverBundle,
+    pub revoker: RevokerAttestation,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RevokerAttestation {
+    /// Signature over `revocation_payload(approver_sig, revoker_pubkey)`.
+    pub signature: String,
+    pub id_token: String,
+    pub public_key: String,
+    pub timestamp_token: String,
+}
+
 pub struct VerifierConfig {
     pub client_id: String,
     pub issuer_url: String,
@@ -160,18 +185,39 @@ fn operator_payload(approver_sig_hex: &str, operator_public_key_pem: &str) -> Ve
     bytes
 }
 
-pub fn verify_execution(
-    bundle: &ExecutionBundle,
+/// Build the bytes a revoker signs over. The `REMONCE-REVOKE:` prefix
+/// domain-separates this from `operator_payload`, so a revocation signature
+/// can never be replayed as a cosign or vice versa.
+pub fn revocation_payload(approver_sig_hex: &str, revoker_public_key_pem: &str) -> Vec<u8> {
+    let mut bytes = b"REMONCE-REVOKE:".to_vec();
+    bytes.extend_from_slice(approver_sig_hex.as_bytes());
+    bytes.extend_from_slice(revoker_public_key_pem.as_bytes());
+    bytes
+}
+
+fn username_from_claims(claims: &serde_json::Value) -> String {
+    claims
+        .get("username")
+        .and_then(|v| v.as_str())
+        .or_else(|| claims.get("sub").and_then(|v| v.as_str()))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Verify the approver leg of a bundle: signature over the canonical payload,
+/// TSA timestamp, and nonce-bound JWT. Returns the approver's identity.
+fn verify_approver(
+    approver: &ApproverBundle,
     config: &VerifierConfig,
-) -> Result<AuthorizedExecution, ValidationError> {
+) -> Result<SignerIdentity, ValidationError> {
     // ---- 1. Verify approver signature over canonical(command + operator_requires) ----
     let approver_payload =
-        canonical_approver_payload(&bundle.approver.command, &bundle.approver.operator_requires);
+        canonical_approver_payload(&approver.command, &approver.operator_requires);
 
-    let approver_pubkey = VerifyingKey::from_public_key_pem(&bundle.approver.public_key)
+    let approver_pubkey = VerifyingKey::from_public_key_pem(&approver.public_key)
         .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
 
-    let approver_sig_bytes = hex::decode(&bundle.approver.signature)
+    let approver_sig_bytes = hex::decode(&approver.signature)
         .map_err(|_| ValidationError::InvalidSignatureFormat("approver: invalid hex".into()))?;
 
     let approver_sig = Signature::from_slice(&approver_sig_bytes)
@@ -183,34 +229,36 @@ pub fn verify_execution(
         .map_err(|_| ValidationError::ApproverSignatureFailed)?;
 
     // ---- 2. Verify approver TSA over (sig_bytes || id_token) ----
-    let approver_tsa_bytes = hex::decode(&bundle.approver.timestamp_token).map_err(|_| {
+    let approver_tsa_bytes = hex::decode(&approver.timestamp_token).map_err(|_| {
         ValidationError::TimestampVerificationFailed("approver TSA: invalid hex".into())
     })?;
     let mut approver_tsa_data = approver_sig_bytes.clone();
-    approver_tsa_data.extend_from_slice(bundle.approver.id_token.as_bytes());
+    approver_tsa_data.extend_from_slice(approver.id_token.as_bytes());
     let approver_signed_at =
         tsa::verify_timestamp(&approver_tsa_bytes, &approver_tsa_data, &config.trusted_roots)
             .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
 
     // ---- 3. Verify approver JWT ----
     let approver_claims_obj = verify_oidc_jwt(
-        &bundle.approver.id_token,
-        &bundle.approver.public_key,
+        &approver.id_token,
+        &approver.public_key,
         approver_signed_at,
         config,
     )?;
-    let approver_username = approver_claims_obj
-        .get("username")
-        .and_then(|v| v.as_str())
-        .or_else(|| approver_claims_obj.get("sub").and_then(|v| v.as_str()))
-        .unwrap_or("unknown")
-        .to_string();
 
-    let approver = SignerIdentity {
-        username: approver_username,
+    Ok(SignerIdentity {
+        username: username_from_claims(&approver_claims_obj),
         claims: approver_claims_obj,
         signed_at: approver_signed_at,
-    };
+    })
+}
+
+pub fn verify_execution(
+    bundle: &ExecutionBundle,
+    config: &VerifierConfig,
+) -> Result<AuthorizedExecution, ValidationError> {
+    let approver = verify_approver(&bundle.approver, config)?;
+    let approver_signed_at = approver.signed_at;
 
     // ---- 4. Delegated vs self-execute branch ----
     let now = time::OffsetDateTime::now_utc();
@@ -295,6 +343,91 @@ pub fn verify_execution(
             })
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthorizedRevocation {
+    pub approver: SignerIdentity,
+    pub revoker: SignerIdentity,
+    /// Whether the revoker is the approver themselves (same `sub`). If false,
+    /// the caller must consult policy (OPA) before honoring the revocation.
+    pub self_revoked: bool,
+    /// Hex signature of the approver bundle being revoked — the revocation
+    /// cache key.
+    pub approver_signature_hex: String,
+}
+
+/// Verify a revocation request: the approver bundle must be genuine and the
+/// revoker's attestation fresh (within `operator_max_validity`), signed with
+/// a nonce-bound ephemeral key. Authorization (who may revoke) is split:
+/// same-`sub` is decided here via `self_revoked`; anything else is the
+/// caller's policy decision.
+pub fn verify_revocation(
+    req: &RevocationBundle,
+    config: &VerifierConfig,
+) -> Result<AuthorizedRevocation, ValidationError> {
+    // 1. The bundle being revoked must itself be genuine — otherwise anyone
+    //    could poison the revocation cache with signatures they invented.
+    let approver = verify_approver(&req.approver, config)?;
+
+    // 2. Verify revoker signature over the domain-separated payload.
+    let revoker_pubkey = VerifyingKey::from_public_key_pem(&req.revoker.public_key)
+        .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
+
+    let revoker_sig_bytes = hex::decode(&req.revoker.signature)
+        .map_err(|_| ValidationError::InvalidSignatureFormat("revoker: invalid hex".into()))?;
+    let revoker_sig = Signature::from_slice(&revoker_sig_bytes)
+        .map_err(|e| ValidationError::InvalidSignatureFormat(e.to_string()))?;
+
+    let payload = revocation_payload(&req.approver.signature, &req.revoker.public_key);
+    use p256::ecdsa::signature::Verifier;
+    revoker_pubkey
+        .verify(&payload, &revoker_sig)
+        .map_err(|_| ValidationError::RevokerSignatureFailed)?;
+
+    // 3. Revoker TSA + JWT (nonce bound to revoker's ephemeral key).
+    let revoker_tsa_bytes = hex::decode(&req.revoker.timestamp_token).map_err(|_| {
+        ValidationError::TimestampVerificationFailed("revoker TSA: invalid hex".into())
+    })?;
+    let mut revoker_tsa_data = revoker_sig_bytes.clone();
+    revoker_tsa_data.extend_from_slice(req.revoker.id_token.as_bytes());
+    let revoker_signed_at =
+        tsa::verify_timestamp(&revoker_tsa_bytes, &revoker_tsa_data, &config.trusted_roots)
+            .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
+
+    let revoker_claims = verify_oidc_jwt(
+        &req.revoker.id_token,
+        &req.revoker.public_key,
+        revoker_signed_at,
+        config,
+    )?;
+
+    // 4. Revocation is an "act now" signature — hold it to the short window.
+    check_age(
+        time::OffsetDateTime::now_utc(),
+        revoker_signed_at,
+        config.operator_max_validity,
+        true,
+    )?;
+
+    let same_sub = match (
+        approver.claims.get("sub").and_then(|v| v.as_str()),
+        revoker_claims.get("sub").and_then(|v| v.as_str()),
+    ) {
+        (Some(a), Some(r)) => a == r,
+        _ => false,
+    };
+
+    Ok(AuthorizedRevocation {
+        revoker: SignerIdentity {
+            username: username_from_claims(&revoker_claims),
+            claims: revoker_claims,
+            signed_at: revoker_signed_at,
+        },
+        self_revoked: same_sub,
+        approver_signature_hex: req.approver.signature.clone(),
+        approver,
+    })
 }
 
 /// Shared JWT verification: signature against JWKS, issuer, audience, and

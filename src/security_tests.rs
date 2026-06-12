@@ -2,7 +2,8 @@
 mod tests {
     use crate::security::{
         ApproverBundle, ClaimPredicate, ExecutionBundle, OperatorConstraint, OperatorCosign,
-        ValidationError, VerifierConfig, canonical_approver_payload, verify_execution,
+        RevocationBundle, RevokerAttestation, ValidationError, VerifierConfig,
+        canonical_approver_payload, revocation_payload, verify_execution, verify_revocation,
     };
     use crate::tsa::{MessageImprint, TSTInfo};
     use base64::Engine;
@@ -397,6 +398,40 @@ mod tests {
         }
     }
 
+    fn build_revoker_attestation(
+        env: &Env,
+        revoker_keys: &TestKeys,
+        subject: &str,
+        approver_sig_hex: &str,
+        revoker_signed_at: OffsetDateTime,
+    ) -> RevokerAttestation {
+        let payload = revocation_payload(approver_sig_hex, &revoker_keys.public_key_pem);
+        let sig: p256::ecdsa::Signature = revoker_keys.signing_key.sign(&payload);
+        let sig_bytes = sig.to_bytes();
+
+        let nonce = hex::encode(Sha256::digest(revoker_keys.public_key_pem.as_bytes()));
+        let id_token = create_valid_jwt(
+            revoker_keys,
+            "https://issuer.example",
+            "remonce",
+            subject,
+            &nonce,
+            revoker_signed_at + Duration::minutes(30),
+            serde_json::json!({}),
+        );
+
+        let mut tsa_data = sig_bytes.to_vec();
+        tsa_data.extend_from_slice(id_token.as_bytes());
+        let timestamp_token = create_mock_timestamp(&tsa_data, revoker_signed_at, &env.tsa_keys);
+
+        RevokerAttestation {
+            signature: hex::encode(sig_bytes),
+            id_token,
+            public_key: revoker_keys.public_key_pem.clone(),
+            timestamp_token,
+        }
+    }
+
     fn verifier_config(env: &Env) -> VerifierConfig {
         VerifierConfig {
             client_id: "remonce".into(),
@@ -615,6 +650,151 @@ mod tests {
         assert!(
             matches!(result, Err(ValidationError::OperatorSignatureFailed)),
             "expected OperatorSignatureFailed, got {:?}",
+            result
+        );
+    }
+
+    // --- Revocation tests ---
+
+    #[test]
+    fn self_revocation_is_recognized() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        // Alice revokes her own approval with a fresh attestation. Her
+        // original ephemeral key is gone, so the test uses a new key bound
+        // to a fresh token — but the same `sub`.
+        let fresh_keys = setup_keys("alice-fresh-kid");
+        let mut jwks = env.jwks.clone();
+        jwks.keys.push(keys_to_jwk(&fresh_keys));
+        let revoker =
+            build_revoker_attestation(&env, &fresh_keys, "alice", &approver.signature, now);
+        let sig_hex = approver.signature.clone();
+        let req = RevocationBundle { approver, revoker };
+
+        let config = VerifierConfig {
+            jwks,
+            ..verifier_config(&env)
+        };
+        let result = verify_revocation(&req, &config);
+        assert!(result.is_ok(), "expected ok, got {:?}", result.err());
+        let r = result.unwrap();
+        assert!(r.self_revoked);
+        assert_eq!(r.approver.username, "alice");
+        assert_eq!(r.revoker.username, "alice");
+        assert_eq!(r.approver_signature_hex, sig_hex);
+    }
+
+    #[test]
+    fn third_party_revocation_not_self() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        let revoker =
+            build_revoker_attestation(&env, &env.operator, "bob", &approver.signature, now);
+        let req = RevocationBundle { approver, revoker };
+
+        let result = verify_revocation(&req, &verifier_config(&env));
+        assert!(result.is_ok(), "expected ok, got {:?}", result.err());
+        let r = result.unwrap();
+        assert!(!r.self_revoked, "bob is not alice — must not be self_revoked");
+        assert_eq!(r.revoker.username, "bob");
+    }
+
+    #[test]
+    fn stale_revoker_attestation_rejected() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        // Revoker signed 30 minutes ago — past the 10m short window.
+        let revoker = build_revoker_attestation(
+            &env,
+            &env.operator,
+            "bob",
+            &approver.signature,
+            now - Duration::minutes(30),
+        );
+        let req = RevocationBundle { approver, revoker };
+
+        let result = verify_revocation(&req, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::ExecutorStale { .. })),
+            "expected ExecutorStale, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn tampered_approver_bundle_cannot_be_revoked() {
+        // The bundle being revoked must itself verify — otherwise anyone
+        // could poison the revocation cache with fabricated signatures.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let mut approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        approver.command = json!({ "command": "something-else" });
+        let revoker =
+            build_revoker_attestation(&env, &env.operator, "bob", &approver.signature, now);
+        let req = RevocationBundle { approver, revoker };
+
+        let result = verify_revocation(&req, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::ApproverSignatureFailed)),
+            "expected ApproverSignatureFailed, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn operator_cosign_signature_cannot_be_replayed_as_revocation() {
+        // Domain separation: an operator cosign signs (approver_sig || pubkey)
+        // without the REMONCE-REVOKE: prefix, so it must not verify as a
+        // revocation attestation.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        let cosign = build_operator_cosign(&env, &approver.signature, now, vec!["noc-l2"]);
+        let revoker = RevokerAttestation {
+            signature: cosign.signature,
+            id_token: cosign.id_token,
+            public_key: cosign.public_key,
+            timestamp_token: cosign.timestamp_token,
+        };
+        let req = RevocationBundle { approver, revoker };
+
+        let result = verify_revocation(&req, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::RevokerSignatureFailed)),
+            "expected RevokerSignatureFailed, got {:?}",
             result
         );
     }

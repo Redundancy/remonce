@@ -213,6 +213,43 @@ pub struct CommandConfig {
     /// through. Empty by default; add `PATH` here if your executable needs it.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+
+    /// Parameters the signer may supply with this command. Each `{{name}}`
+    /// placeholder in `args` is replaced with the validated value at
+    /// execution time. Validation is fail-closed: a param with no explicit
+    /// rule gets a conservative default pattern (no leading dash, short,
+    /// alphanumeric-ish). See `crate::params`.
+    #[serde(default)]
+    pub params: Vec<ParamConfig>,
+}
+
+/// A declared, validated parameter for a command.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ParamConfig {
+    /// Placeholder name; must match `[A-Za-z_][A-Za-z0-9_]*`.
+    pub name: String,
+
+    /// Human-readable description for the UI.
+    pub description: Option<String>,
+
+    /// Whether the signer must supply a value (no `default` fallback).
+    #[serde(default)]
+    pub required: bool,
+
+    /// Value used when the signer omits the param. Must itself pass validation.
+    pub default: Option<String>,
+
+    /// Validation: exact allow-list of values. Takes precedence over `pattern`.
+    pub allowed: Option<Vec<String>>,
+
+    /// Validation: regex the full value must match (implicitly anchored).
+    /// CAUTION: if your pattern admits values starting with `-`, a signer can
+    /// inject flags into the executable's argv.
+    pub pattern: Option<String>,
+
+    /// Validation: integer range (value must parse as i64 within bounds).
+    pub min: Option<i64>,
+    pub max: Option<i64>,
 }
 
 impl CommandConfig {

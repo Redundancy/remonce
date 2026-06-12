@@ -30,6 +30,7 @@ pub struct AgentState {
     pub hostname: String,
     pub trusted_roots: Vec<Vec<u8>>,
     pub replay_cache: crate::replay::ReplayCache,
+    pub revocations: crate::replay::RevocationCache,
 }
 
 // ExecutionRequest is imported from security module
@@ -133,10 +134,12 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         hostname,
         trusted_roots,
         replay_cache: crate::replay::ReplayCache::new(),
+        revocations: crate::replay::RevocationCache::new(),
     };
 
     let mut app = Router::new()
         .route("/execute", post(execute_handler))
+        .route("/revoke", post(revoke_handler))
         .route("/stream/{id}", get(stream_logs_handler))
         .route("/api/files", get(list_files_handler))
         .route("/api/files/stream", get(stream_file_handler))
@@ -284,7 +287,23 @@ async fn execute_handler(
         ..Default::default()
     };
 
-    // 3. Replay check — executor signature (operator if delegated, else approver).
+    // 3. Revocation check — the approver's signature may have been revoked
+    //    after the bundle was issued.
+    if state.revocations.is_revoked(&bundle.approver.signature) {
+        crate::audit::log_audit(
+            "deny",
+            "Approval has been revoked".into(),
+            approver_user.clone(),
+            ip.clone(),
+            hostname.clone(),
+            full_ctx(),
+        );
+        return Err(ErrorResponse {
+            error: "Approval Revoked".into(),
+        });
+    }
+
+    // 4. Replay check — executor signature (operator if delegated, else approver).
     if state
         .replay_cache
         .check_and_insert(&authz.executor_signature_hex, operator_max)
@@ -303,7 +322,8 @@ async fn execute_handler(
         });
     }
 
-    // 4. Command-level constraints (target machines, not_before/not_after).
+    // 5. Command-level constraints (target machines, not_before/not_after,
+    //    declared parameters).
     let now = time::OffsetDateTime::now_utc();
 
     let target_machines = command_json
@@ -392,8 +412,46 @@ async fn execute_handler(
         }
     }
 
-    // 5. OPA authorization with both identities.
+    // Validate signed params against the command's declarations and render
+    // the args template. Fail-closed: any violation rejects the execution.
+    let resolved_params =
+        match crate::params::validate_params(&cmd_config, command_json.get("params")) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::audit::log_audit(
+                    "deny",
+                    format!("Parameter validation failed: {}", e),
+                    approver_user.clone(),
+                    ip.clone(),
+                    hostname.clone(),
+                    full_ctx(),
+                );
+                return Err(ErrorResponse {
+                    error: "Invalid Parameters".into(),
+                });
+            }
+        };
+
+    let rendered_args = match crate::params::render_args(&cmd_config.args, &resolved_params) {
+        Ok(a) => a,
+        Err(e) => {
+            crate::audit::log_audit(
+                "deny",
+                format!("Argument rendering failed: {}", e),
+                approver_user.clone(),
+                ip.clone(),
+                hostname.clone(),
+                full_ctx(),
+            );
+            return Err(ErrorResponse {
+                error: "Invalid Parameters".into(),
+            });
+        }
+    };
+
+    // 6. OPA authorization with both identities.
     let opa_input = crate::opa::OpaInput {
+        action: "execute".into(),
         command: command_json.clone(),
         approver: crate::opa::SignerContext {
             username: approver_user.clone(),
@@ -511,7 +569,7 @@ async fn execute_handler(
         gen_time_str,
         command_name,
         executable,
-        cmd_config.args.join(" ")
+        rendered_args.join(" ")
     );
 
     if let Err(e) = log_file.write_all(header.as_bytes()).await {
@@ -527,7 +585,7 @@ async fn execute_handler(
 
     let mut spawn_cmd = tokio::process::Command::new(&executable);
     spawn_cmd
-        .args(&cmd_config.args)
+        .args(&rendered_args)
         .current_dir(cmd_config.cwd.clone().unwrap_or_else(|| ".".to_string()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -647,6 +705,198 @@ async fn execute_handler(
         // Return the UUID here so client knows what to stream
         message: execution_id.clone(),
         execution_time: Some(gen_time_str),
+    }))
+}
+
+#[derive(Serialize)]
+pub struct RevocationResponse {
+    pub status: String,
+    pub message: String,
+}
+
+/// Revoke an approver bundle. The revoker submits the full approver bundle
+/// plus a fresh, nonce-bound attestation signing the domain-separated
+/// revocation payload. Authorized when the revoker is the original approver
+/// (same OIDC `sub`) or when OPA allows `action = "revoke"`. Idempotent.
+async fn revoke_handler(
+    State(state): State<AgentState>,
+    ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
+    Json(req): Json<crate::security::RevocationBundle>,
+) -> Result<Json<RevocationResponse>, ErrorResponse> {
+    use crate::audit::AuditContext;
+
+    let ip = addr.ip_string();
+    let hostname = state.hostname.clone();
+    let command_json = req.approver.command.clone();
+
+    let audit_ctx = || AuditContext {
+        command: Some(command_json.clone()),
+        ..Default::default()
+    };
+
+    // Resolve the command config: it supplies the validity windows and the
+    // OPA rule governing third-party revocation.
+    let command_name = match command_json.get("command").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            crate::audit::log_audit(
+                "deny",
+                "Revocation rejected: missing 'command' field".into(),
+                "unauthenticated".into(),
+                ip.clone(),
+                hostname.clone(),
+                audit_ctx(),
+            );
+            return Err(ErrorResponse {
+                error: "Invalid Request".into(),
+            });
+        }
+    };
+
+    let cmd_config = match state.config.commands.iter().find(|c| c.name == command_name) {
+        Some(c) => c.clone(),
+        None => {
+            crate::audit::log_audit(
+                "deny",
+                format!("Revocation rejected: command '{}' not configured", command_name),
+                "unauthenticated".into(),
+                ip.clone(),
+                hostname.clone(),
+                audit_ctx(),
+            );
+            return Err(ErrorResponse {
+                error: "Invalid Request".into(),
+            });
+        }
+    };
+
+    let verifier_config = crate::security::VerifierConfig {
+        client_id: state.config.oidc.client_id.clone(),
+        issuer_url: state.config.oidc.issuer_url.clone(),
+        jwks: state.jwks.clone(),
+        trusted_roots: state.trusted_roots.clone(),
+        approver_max_validity: cmd_config.approver_max_validity_or_default(),
+        operator_max_validity: cmd_config.operator_max_validity_or_default(),
+    };
+
+    let revocation = match crate::security::verify_revocation(&req, &verifier_config) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::audit::log_audit(
+                "deny",
+                format!("Revocation verification failed: {}", e),
+                "unauthenticated".into(),
+                ip.clone(),
+                hostname.clone(),
+                audit_ctx(),
+            );
+            return Err(ErrorResponse {
+                error: "Verification Failed".into(),
+            });
+        }
+    };
+
+    let revoker_user = revocation.revoker.username.clone();
+    let approver_user = revocation.approver.username.clone();
+
+    let revoke_ctx = || AuditContext {
+        command: Some(command_json.clone()),
+        operator_user: Some(approver_user.clone()),
+        ..Default::default()
+    };
+
+    // Authorization: self-revocation is always allowed; anyone else needs an
+    // explicit OPA decision for action = "revoke".
+    if !revocation.self_revoked {
+        let opa_input = crate::opa::OpaInput {
+            action: "revoke".into(),
+            command: command_json.clone(),
+            approver: crate::opa::SignerContext {
+                username: approver_user.clone(),
+                claims: revocation.approver.claims.clone(),
+                signed_at: revocation
+                    .approver
+                    .signed_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown_time".to_string()),
+            },
+            operator: crate::opa::SignerContext {
+                username: revoker_user.clone(),
+                claims: revocation.revoker.claims.clone(),
+                signed_at: revocation
+                    .revoker
+                    .signed_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown_time".to_string()),
+            },
+            self_executed: false,
+            host: hostname.clone(),
+        };
+
+        let decision = crate::opa::check_authorization(
+            &state.http_client,
+            &state.config.opa_url,
+            &cmd_config.opa_rule,
+            opa_input,
+        )
+        .await
+        .map_err(|e| {
+            crate::audit::log_audit(
+                "error",
+                format!("OPA evaluation failed during revocation: {}", e),
+                revoker_user.clone(),
+                ip.clone(),
+                hostname.clone(),
+                revoke_ctx(),
+            );
+            ErrorResponse {
+                error: "Internal Error".into(),
+            }
+        })?;
+
+        if !decision.allow {
+            crate::audit::log_audit(
+                "deny",
+                format!("Third-party revocation denied: {}", decision.reason),
+                revoker_user.clone(),
+                ip.clone(),
+                hostname.clone(),
+                revoke_ctx(),
+            );
+            return Err(ErrorResponse {
+                error: "Authorization Denied".into(),
+            });
+        }
+    }
+
+    // Pin the revocation until the approval would have expired anyway.
+    let now = time::OffsetDateTime::now_utc();
+    let expiry = revocation.approver.signed_at + cmd_config.approver_max_validity_or_default();
+    if expiry > now {
+        let remaining: std::time::Duration =
+            (expiry - now).try_into().unwrap_or_default();
+        state
+            .revocations
+            .revoke(&revocation.approver_signature_hex, remaining);
+    }
+
+    crate::audit::log_audit(
+        "allow",
+        format!(
+            "Approval by '{}' revoked by '{}'{}",
+            approver_user,
+            revoker_user,
+            if revocation.self_revoked { " (self)" } else { "" }
+        ),
+        revoker_user.clone(),
+        ip.clone(),
+        hostname.clone(),
+        revoke_ctx(),
+    );
+
+    Ok(Json(RevocationResponse {
+        status: "revoked".to_string(),
+        message: "Approval revoked on this agent".to_string(),
     }))
 }
 
