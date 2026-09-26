@@ -87,8 +87,11 @@ function copyButtonFeedback(btn, label) {
 }
 
 function describeOperatorRequires(req) {
-    if (!req || !req.any_of || req.any_of.length === 0) {
-        return '<span class="text-muted">Any authorized operator</span>';
+    if (!req) {
+        return '<span class="text-muted">Self-execute only — cannot be co-signed</span>';
+    }
+    if (!req.any_of || req.any_of.length === 0) {
+        return '<span class="text-muted">Delegated — any authorized operator may co-sign</span>';
     }
     const parts = req.any_of.map(p => {
         const v = typeof p.value === 'string' ? p.value : JSON.stringify(p.value);
@@ -217,11 +220,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const urlParams = new URLSearchParams(window.location.search);
         const signedToken = urlParams.get('signed_token');
         if (signedToken) {
+            // Prefill only: a link must never execute on the user's behalf.
             const input = document.getElementById('signed-token-input');
-            if (input) {
-                input.value = signedToken;
-                executeTokenBtn.click();
-            }
+            if (input) input.value = signedToken;
         }
     }
 
@@ -290,13 +291,16 @@ async function loadCommandsForGenerate() {
                         ${desc}
                         ${renderParamInputs(cmd)}
                         <div class="mt-auto pt-3 d-flex justify-content-between align-items-center">
-                             <button class="btn btn-sm btn-outline-success" onclick="generateToken('${escapeHtml(cmd.name)}')">Generate Command</button>
+                             <button class="btn btn-sm btn-outline-success" data-generate="${escapeHtml(cmd.name)}">Generate Command</button>
                         </div>
                     </div>
                 </div>
             </div>`;
         });
         list.innerHTML = html;
+        list.querySelectorAll('[data-generate]').forEach(btn => {
+            btn.addEventListener('click', () => generateToken(btn.dataset.generate));
+        });
     } catch (e) {
         list.innerHTML = `<div style="color:red">Error loading commands: ${escapeHtml(e.message)}</div>`;
     }
@@ -356,7 +360,11 @@ function getOperatorRequires() {
         try { value = JSON.parse(rawValue); } catch (_) { value = rawValue; }
         any_of.push({ op: op, claim: claim, value: value });
     });
-    return any_of.length > 0 ? { any_of: any_of } : null;
+    if (any_of.length > 0) return { any_of: any_of };
+    // Signed delegation mode: an empty requirement list still means
+    // "delegated to any operator"; null means self-execute only.
+    const delegate = document.getElementById('delegate-checkbox');
+    return delegate && delegate.checked ? { any_of: [] } : null;
 }
 
 // --- command parameter inputs ---
@@ -707,8 +715,9 @@ function initMonitorPage() {
     const id = urlParams.get('id');
     const fileName = urlParams.get('file_name');
     const filePath = urlParams.get('file_path');
-    const agentUrl = urlParams.get('agent_url');
-    if (agentUrl) setAgentUrl(agentUrl);
+    // Used for this page's stream only. Persisting it would let a crafted
+    // link silently redirect all later actions to another agent.
+    window.monitorAgentUrl = urlParams.get('agent_url') || getAgentUrl();
 
     const startBtn = document.getElementById('start-monitor-btn');
     if (startBtn) {
@@ -765,7 +774,7 @@ function startStreaming(target) {
     agentOutput.innerHTML = '';
 
     const params = new URLSearchParams();
-    const agent = getAgentUrl();
+    const agent = window.monitorAgentUrl || getAgentUrl();
     if (agent) params.set('agent_url', agent);
 
     let wsUrl = '';
@@ -850,7 +859,7 @@ async function refreshFiles() {
         });
 
         let html = '';
-        Object.keys(groups).sort().forEach(key => {
+        Object.keys(groups).sort().forEach((key, idx) => {
             const g = groups[key];
             const isMulti = g.paths.length > 1;
             const displayName = g.name || g.paths[0];
@@ -865,12 +874,11 @@ async function refreshFiles() {
                 content = `
                     <div class="mb-2">
                          <label class="form-label text-secondary small">Select File (${g.paths.length}):</label>
-                         <select id="select-${escapeHtml(key)}" class="form-select form-select-sm bg-dark text-light border-secondary">
+                         <select id="file-select-${idx}" class="form-select form-select-sm bg-dark text-light border-secondary">
                              ${options}
                          </select>
                     </div>
-                    <button class="btn btn-sm btn-outline-info w-100"
-                        onclick="viewSelectedFile('select-${escapeHtml(key)}')">
+                    <button class="btn btn-sm btn-outline-info w-100" data-select-id="file-select-${idx}">
                         Read Selected
                     </button>`;
             } else {
@@ -878,8 +886,7 @@ async function refreshFiles() {
                 const subText = g.name ? `<small class="text-secondary d-block text-truncate mb-2" title="${escapeHtml(path)}">${escapeHtml(path)}</small>` : '';
                 content = `
                     ${subText}
-                    <button class="btn btn-sm btn-outline-info w-100"
-                        onclick="viewFile(null, '${escapeHtml(path.replace(/\\/g, '\\\\'))}')">
+                    <button class="btn btn-sm btn-outline-info w-100" data-file-path="${escapeHtml(path)}">
                         Read File
                     </button>`;
             }
@@ -899,6 +906,14 @@ async function refreshFiles() {
             </div>`;
         });
         list.innerHTML = html;
+        // Agent-supplied paths only ever land in HTML attributes (escaped)
+        // and are read back via dataset — never spliced into inline JS.
+        list.querySelectorAll('[data-file-path]').forEach(btn => {
+            btn.addEventListener('click', () => viewFile(null, btn.dataset.filePath));
+        });
+        list.querySelectorAll('[data-select-id]').forEach(btn => {
+            btn.addEventListener('click', () => viewSelectedFile(btn.dataset.selectId));
+        });
 
     } catch (e) {
         list.innerHTML = `<div class="col-12 text-danger">Failed to load files: ${escapeHtml(e.message)}. Is the agent reachable?</div>`;

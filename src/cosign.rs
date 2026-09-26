@@ -50,6 +50,11 @@ pub async fn run(args: CosignArgs, insecure: bool) -> Result<(), Error> {
             .map_err(|e| format!("Failed to read bundle '{}': {e}", args.bundle))?
     };
     let approver = parse_approver_bundle(raw.trim())?;
+    if approver.operator_requires.is_none() {
+        return Err("This approval is self-execute only (no operator_requires); it cannot be \
+                    co-signed. Ask the approver for a delegated approval."
+            .into());
+    }
 
     let command_str = serde_json::to_string_pretty(&approver.command)?;
     eprintln!("Approver bundle loaded. Command:\n{command_str}");
@@ -77,7 +82,7 @@ pub async fn run(args: CosignArgs, insecure: bool) -> Result<(), Error> {
     let signature_bytes = signature.to_bytes();
 
     // 4. TSA timestamp over (sig_bytes || id_token).
-    let http_client = reqwest::Client::new();
+    let http_client = crate::http_client();
     let mut data_to_timestamp = signature_bytes.to_vec();
     data_to_timestamp.extend_from_slice(id_token.as_bytes());
     let timestamp_token_bytes = crate::tsa::request_timestamp(
@@ -207,7 +212,7 @@ pub async fn run_revoke(args: RevokeArgs, insecure: bool) -> Result<(), Error> {
     let signature: p256::ecdsa::Signature = signing_key.sign(&payload);
     let signature_bytes = signature.to_bytes();
 
-    let http_client = reqwest::Client::new();
+    let http_client = crate::http_client();
     let mut data_to_timestamp = signature_bytes.to_vec();
     data_to_timestamp.extend_from_slice(id_token.as_bytes());
     let timestamp_token_bytes = crate::tsa::request_timestamp(
@@ -249,7 +254,7 @@ pub async fn run_revoke(args: RevokeArgs, insecure: bool) -> Result<(), Error> {
 /// the authorization URL for the operator to open, and returns the validated
 /// ID token.
 async fn oidc_login(config: &Config, public_key_pem: &str) -> Result<String, Error> {
-    let http_client = reqwest::Client::new();
+    let http_client = crate::http_client();
     let discovery_url = format!(
         "{}/.well-known/openid-configuration",
         config.oidc.issuer_url
@@ -279,6 +284,19 @@ async fn oidc_login(config: &Config, public_key_pem: &str) -> Result<String, Err
         .port_or_known_default()
         .ok_or("redirect_uri has no port")?;
     let callback_path = redirect_parsed.path().to_string();
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if !is_loopback {
+        return Err(format!(
+            "oidc.redirect_uri host '{host}' is not loopback; the CLI only listens on \
+             loopback for the OIDC callback"
+        )
+        .into());
+    }
 
     let mut auth_url: url::Url = metadata.authorization_endpoint.parse()?;
     auth_url
@@ -414,18 +432,20 @@ async fn wait_for_callback(
             )
         };
 
-        if let Some(err) = error {
-            let _ = stream
-                .write_all(respond("<h1>Login failed</h1>You can close this tab.").as_bytes())
-                .await;
-            return Err(format!("OIDC error: {err}").into());
-        }
-
+        // State first: without it, any web page could abort the login by
+        // sending the browser to `/callback?error=x`.
         if state_param.as_deref() != Some(expected_state) {
             let _ = stream
                 .write_all(respond("<h1>State mismatch</h1>Ignoring request.").as_bytes())
                 .await;
             continue;
+        }
+
+        if let Some(err) = error {
+            let _ = stream
+                .write_all(respond("<h1>Login failed</h1>You can close this tab.").as_bytes())
+                .await;
+            return Err(format!("OIDC error: {err}").into());
         }
 
         let Some(code) = code else {

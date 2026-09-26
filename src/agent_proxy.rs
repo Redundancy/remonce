@@ -51,7 +51,12 @@ pub fn build_agent_tls(agent_ca_path: Option<&str>) -> Result<Arc<rustls::Client
 /// Build the reqwest client used for HTTP calls to the agent, trusting the
 /// optional `agent_ca_path` PEM in addition to the system store.
 pub fn build_agent_http(agent_ca_path: Option<&str>) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder();
+    // No redirects: a redirect would carry our request (and bearer token) to
+    // a host nobody configured.
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60));
     if let Some(path) = agent_ca_path {
         let certs = crate::tls::load_certs(path)
             .map_err(|e| format!("Failed to read agent_ca_path '{path}': {e}"))?;
@@ -66,12 +71,9 @@ pub fn build_agent_http(agent_ca_path: Option<&str>) -> Result<reqwest::Client, 
         .map_err(|e| format!("Failed to build agent HTTP client: {e}"))
 }
 
-/// Resolve and validate the target agent URL. Only https is accepted —
-/// the agent has no plaintext mode.
-fn resolve_agent_url(state: &AppState, override_url: Option<&str>) -> Result<url::Url, AppError> {
-    let raw = override_url
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(&state.config.agent_url);
+/// Normalize an agent URL to its origin (`https://host:port/`). Only https is
+/// accepted — the agent has no plaintext mode.
+fn normalize_agent_url(raw: &str) -> Result<url::Url, AppError> {
     let mut parsed: url::Url = raw
         .trim()
         .parse()
@@ -89,6 +91,64 @@ fn resolve_agent_url(state: &AppState, override_url: Option<&str>) -> Result<url
     parsed.set_query(None);
     parsed.set_fragment(None);
     Ok(parsed)
+}
+
+/// Resolve the target agent URL. A browser-supplied override must be one of
+/// the configured agents (`agent_url` or `allowed_agent_urls`): the proxy
+/// attaches the user's ID token and signs on their behalf, so an arbitrary
+/// host would receive credentials and could answer with hostile content.
+fn resolve_agent_url(state: &AppState, override_url: Option<&str>) -> Result<url::Url, AppError> {
+    let default = normalize_agent_url(&state.config.agent_url)?;
+    let Some(raw) = override_url.filter(|s| !s.trim().is_empty()) else {
+        return Ok(default);
+    };
+    let requested = normalize_agent_url(raw)?;
+    let allowed = std::iter::once(Ok(default))
+        .chain(state.config.allowed_agent_urls.iter().map(|u| normalize_agent_url(u)))
+        .filter_map(Result::ok)
+        .any(|a| a.origin() == requested.origin());
+    if !allowed {
+        return Err(AppError::Forbidden(format!(
+            "Agent '{raw}' is not configured; add it to allowed_agent_urls in config.toml"
+        )));
+    }
+    Ok(requested)
+}
+
+/// Reject cross-origin WebSocket upgrades. Cookies are not port-scoped, so a
+/// page on another localhost port is "same-site" and would get the session
+/// cookie; the browser-set `Origin` header is what tells the two apart.
+fn require_same_origin(headers: &axum::http::HeaderMap) -> Result<(), AppError> {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AppError::Forbidden("Missing Host header".into()))?;
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|o| o.parse::<url::Url>().ok())
+        .ok_or_else(|| AppError::Forbidden("Missing or invalid Origin header".into()))?;
+    if origin_matches_host(&origin, host) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("Cross-origin WebSocket request rejected".into()))
+    }
+}
+
+fn origin_matches_host(origin: &url::Url, host: &str) -> bool {
+    let (Some(o_host), Some(o_port)) = (origin.host_str(), origin.port_or_known_default()) else {
+        return false;
+    };
+    let default_port = if origin.scheme() == "https" { 443 } else { 80 };
+    // Host may be "name", "name:port", "[v6]" or "[v6]:port".
+    let (h_host, h_port) = match host.rsplit_once(':') {
+        Some((h, p)) if !p.contains(']') => match p.parse::<u16>() {
+            Ok(port) => (h, port),
+            Err(_) => return false,
+        },
+        _ => (host, default_port),
+    };
+    o_host.eq_ignore_ascii_case(h_host) && o_port == h_port
 }
 
 #[derive(Deserialize)]
@@ -116,7 +176,7 @@ pub async fn execute_proxy(
         .json(&req.bundle)
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("Agent unreachable: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Agent unreachable: {}", e.without_url())))?;
 
     passthrough(resp).await
 }
@@ -175,7 +235,7 @@ pub async fn revoke_proxy(
         .json(&bundle)
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("Agent unreachable: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Agent unreachable: {}", e.without_url())))?;
 
     passthrough(resp).await
 }
@@ -195,37 +255,43 @@ pub async fn files_proxy(
 ) -> Result<Response, AppError> {
     let profile = crate::web::require_profile(&session).await?;
 
-    let mut url = resolve_agent_url(&state, params.agent_url.as_deref())?
+    let url = resolve_agent_url(&state, params.agent_url.as_deref())?
         .join("api/files")
         .map_err(|e| AppError::Internal(format!("URL join: {e}")))?;
-    url.query_pairs_mut().append_pair("token", &profile.id_token);
 
     let resp = state
         .agent_http
         .get(url)
+        .bearer_auth(&profile.id_token)
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("Agent unreachable: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Agent unreachable: {}", e.without_url())))?;
 
     passthrough(resp).await
 }
 
+/// Relay an agent response. The body is always served as JSON with
+/// `nosniff`: the agent only speaks JSON, and echoing its Content-Type would
+/// let a misbehaving agent inject HTML/script into the signer's origin.
 async fn passthrough(resp: reqwest::Response) -> Result<Response, AppError> {
     let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| AppError::Internal(format!("Agent response read failed: {e}")))?;
+    let body = resp.bytes().await.map_err(|e| {
+        AppError::Internal(format!("Agent response read failed: {}", e.without_url()))
+    })?;
+    let body = if serde_json::from_slice::<serde_json::Value>(&body).is_ok() {
+        body.to_vec()
+    } else {
+        // Plain-text agent errors (e.g. "OPA Denied") become a JSON error.
+        serde_json::to_vec(&serde_json::json!({ "error": String::from_utf8_lossy(&body) }))
+            .unwrap_or_default()
+    };
     Ok((
         status,
-        [(axum::http::header::CONTENT_TYPE, content_type)],
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
         body,
     )
         .into_response())
@@ -247,10 +313,12 @@ pub struct StreamProxyParams {
 pub async fn exec_stream_proxy(
     State(state): State<AppState>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Query(params): Query<StreamProxyParams>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
-    crate::web::require_profile(&session).await?;
+    require_same_origin(&headers)?;
+    let profile = crate::web::require_profile(&session).await?;
 
     let id = params
         .id
@@ -265,7 +333,8 @@ pub async fn exec_stream_proxy(
         .map_err(|_| AppError::Internal("Failed to build wss URL".into()))?;
 
     let tls = state.agent_tls.clone();
-    Ok(ws.on_upgrade(move |client| proxy_ws(client, url, tls)))
+    let token = profile.id_token;
+    Ok(ws.on_upgrade(move |client| proxy_ws(client, url, tls, token)))
 }
 
 /// GET /ws/file?name=…|path=… — proxy the agent's file-stream WebSocket.
@@ -273,9 +342,11 @@ pub async fn exec_stream_proxy(
 pub async fn file_stream_proxy(
     State(state): State<AppState>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Query(params): Query<StreamProxyParams>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
+    require_same_origin(&headers)?;
     let profile = crate::web::require_profile(&session).await?;
 
     if params.name.is_none() && params.path.is_none() {
@@ -287,7 +358,6 @@ pub async fn file_stream_proxy(
         .map_err(|e| AppError::Internal(format!("URL join: {e}")))?;
     {
         let mut qp = url.query_pairs_mut();
-        qp.append_pair("token", &profile.id_token);
         if let Some(name) = &params.name {
             qp.append_pair("name", name);
         }
@@ -302,14 +372,46 @@ pub async fn file_stream_proxy(
         .map_err(|_| AppError::Internal("Failed to build wss URL".into()))?;
 
     let tls = state.agent_tls.clone();
-    Ok(ws.on_upgrade(move |client| proxy_ws(client, url, tls)))
+    let token = profile.id_token;
+    Ok(ws.on_upgrade(move |client| proxy_ws(client, url, tls, token)))
 }
 
 /// Bidirectional pipe between the browser WebSocket and the agent WebSocket.
-async fn proxy_ws(mut client: WebSocket, upstream_url: url::Url, tls: Arc<rustls::ClientConfig>) {
+async fn proxy_ws(
+    mut client: WebSocket,
+    upstream_url: url::Url,
+    tls: Arc<rustls::ClientConfig>,
+    id_token: String,
+) {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    // The ID token rides in a header, never the URL (URLs end up in logs).
+    let request = upstream_url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| e.to_string())
+        .and_then(|mut req| {
+            let value = format!("Bearer {id_token}")
+                .parse()
+                .map_err(|_| "Invalid token for header".to_string())?;
+            req.headers_mut()
+                .insert(axum::http::header::AUTHORIZATION, value);
+            Ok(req)
+        });
+    let request = match request {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = client
+                .send(AxumMessage::Text(format!("[proxy] Bad upstream request: {e}").into()))
+                .await;
+            let _ = client.close().await;
+            return;
+        }
+    };
+
     let connector = tokio_tungstenite::Connector::Rustls(tls);
     let upstream = match tokio_tungstenite::connect_async_tls_with_config(
-        upstream_url.as_str(),
+        request,
         None,
         false,
         Some(connector),
@@ -361,5 +463,30 @@ async fn proxy_ws(mut client: WebSocket, upstream_url: url::Url, tls: Arc<rustls
                 Some(Err(_)) => break,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(s: &str) -> url::Url {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn same_origin_accepts_matching_host_and_port() {
+        assert!(origin_matches_host(&url("http://localhost:8080"), "localhost:8080"));
+        assert!(origin_matches_host(&url("http://127.0.0.1:8080"), "127.0.0.1:8080"));
+        assert!(origin_matches_host(&url("https://signer.local"), "signer.local"));
+    }
+
+    #[test]
+    fn same_origin_rejects_other_ports_and_hosts() {
+        // Another app on a different localhost port is "same-site" for
+        // cookies but must not reach the WebSocket proxies.
+        assert!(!origin_matches_host(&url("http://localhost:3000"), "localhost:8080"));
+        assert!(!origin_matches_host(&url("http://evil.example:8080"), "localhost:8080"));
+        assert!(!origin_matches_host(&url("http://localhost"), "localhost:8080"));
     }
 }

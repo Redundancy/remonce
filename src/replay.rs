@@ -44,6 +44,13 @@ impl ReplayCache {
         map.insert(sig_hex.to_string(), now);
         Ok(())
     }
+
+    /// Forget `sig_hex`, e.g. when execution failed before the process
+    /// started, so the signer can retry without re-signing.
+    pub fn release(&self, sig_hex: &str) {
+        let mut map = self.inner.lock().expect("replay cache lock poisoned");
+        map.remove(sig_hex);
+    }
 }
 
 /// In-memory set of revoked approver-signature hashes. Each entry carries
@@ -117,6 +124,15 @@ mod tests {
         let ttl = Duration::from_secs(60);
         assert!(cache.check_and_insert("abc", ttl).is_ok());
         assert!(cache.check_and_insert("abc", ttl).is_err());
+    }
+
+    #[test]
+    fn released_sig_can_be_used_again() {
+        let cache = ReplayCache::new();
+        let ttl = Duration::from_secs(60);
+        assert!(cache.check_and_insert("abc", ttl).is_ok());
+        cache.release("abc");
+        assert!(cache.check_and_insert("abc", ttl).is_ok());
     }
 
     #[test]

@@ -70,7 +70,18 @@ pub fn validate(config: &Config, insecure_flag: bool) -> Result<InsecureMode, In
         }
     }
 
-    // Gate 4: agent CORS wildcard.
+    // Gate 4: OPA reached over plaintext on the network. OPA's answer is
+    // the authorization decision; a MITM could simply return allow.
+    if let Ok(url) = Url::parse(&config.opa_url) {
+        if url.scheme() == "http" && !host_is_loopback(&url) {
+            violations.push(format!(
+                "opa_url is http:// and non-loopback ({}); a MITM can forge authorization decisions",
+                config.opa_url
+            ));
+        }
+    }
+
+    // Gate 5: agent CORS wildcard.
     if let Some(agent) = &config.agent {
         if agent.cors_allowed_origins.iter().any(|o| o == "*") {
             violations.push(
@@ -144,6 +155,7 @@ mod tests {
             agent: None,
             agent_url: "https://localhost:10022".into(),
             agent_ca_path: None,
+            allowed_agent_urls: vec![],
             revocation_service: None,
         }
     }
@@ -189,6 +201,16 @@ mod tests {
             env: Default::default(),
             params: vec![],
         });
+        assert!(matches!(
+            validate(&cfg, false),
+            Err(InsecureError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn http_non_loopback_opa_rejected_without_insecure() {
+        let mut cfg = base_config();
+        cfg.opa_url = "http://opa.internal:8181".into();
         assert!(matches!(
             validate(&cfg, false),
             Err(InsecureError::Refused(_))

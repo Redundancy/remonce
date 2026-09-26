@@ -37,6 +37,8 @@ pub enum AppError {
     Config(String),
     #[error("Authentication error: {0}")]
     Auth(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
@@ -47,9 +49,33 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        let body = format!("Error: {self}");
-        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+        use axum::http::StatusCode;
+        let status = match &self {
+            AppError::Auth(_) => StatusCode::UNAUTHORIZED,
+            AppError::Forbidden(_) => StatusCode::FORBIDDEN,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let body = match self {
+            // reqwest errors embed the request URL, which may carry secrets.
+            AppError::Reqwest(e) => format!("Error: {}", e.without_url()),
+            other => format!("Error: {other}"),
+        };
+        (status, body).into_response()
     }
+}
+
+/// Baseline response hardening for every web-tier response.
+async fn security_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    resp
 }
 
 // Represents the application's configuration.
@@ -127,7 +153,7 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
     crate::audit::set_insecure_mode(insecure_mode.as_bool());
 
     // Create shared HTTP client and AppState
-    let http_client = Client::new();
+    let http_client = crate::http_client();
     let discovery_url = format!("{}/.well-known/openid-configuration", config.oidc.issuer_url);
     let discovery_response_text = http_client.get(&discovery_url).send().await?.text().await?;
 
@@ -206,9 +232,11 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         .nest_service("/static", ServeDir::new("ui/static"))
         .with_state(app_state)
         .layer(session_layer)
+        .layer(axum::middleware::from_fn(security_headers))
         .layer(
+            // Headers stay out of spans: they carry the session cookie.
             TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::default().include_headers(true)),
+                .make_span_with(DefaultMakeSpan::default().include_headers(false)),
         );
 
     tracing::info!("listening on {}", addr);
@@ -377,7 +405,12 @@ async fn callback_handler(
     Query(query): Query<CallbackQuery>,
     session: Session,
 ) -> Result<Redirect, AppError> {
-    tracing::info!("Callback: Received OIDC callback. Query: {:?}", query);
+    // The query holds the single-use authorization code: log its shape only.
+    tracing::info!(
+        has_code = query.code.is_some(),
+        has_error = query.error.is_some(),
+        "Callback: Received OIDC callback"
+    );
 
     // 0. Check for OIDC errors
     if let Some(err) = &query.error {
@@ -463,6 +496,9 @@ async fn callback_handler(
         signing_key_hex: flow_state.signing_key_hex,
         public_key_pem: flow_state.ephemeral_public_key_pem,
     };
+    // New session id at privilege change: a session id planted before login
+    // (e.g. by another local app) must not end up holding the signing key.
+    session.cycle_id().await?;
     session.insert(SESSION_KEY, user_profile).await?;
 
     Ok(Redirect::to("/ui"))
@@ -548,6 +584,14 @@ async fn cosign_handler(
         .get(SESSION_KEY)
         .await?
         .ok_or(AppError::Auth("Not logged in".into()))?;
+
+    if req.approver.operator_requires.is_none() {
+        return Err(AppError::Forbidden(
+            "This approval is self-execute only and cannot be co-signed; ask the approver \
+             for a delegated approval"
+                .into(),
+        ));
+    }
 
     let signing_key = load_signing_key(&profile)?;
 

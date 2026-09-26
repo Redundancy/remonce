@@ -29,7 +29,21 @@ pub struct RevocationCtx<'a> {
     pub trusted_roots: &'a [Vec<u8>],
     pub http_client: &'a reqwest::Client,
     pub hostname: &'a str,
+    /// Lower bound on the approver validity used for verification and for
+    /// how long the revocation is kept. The central service sets this to its
+    /// retention period: agents may allow longer approver validity than the
+    /// service's own `[[commands]]` say, and a revocation must not lapse
+    /// while any agent would still accept the bundle.
+    pub min_approver_validity: Option<std::time::Duration>,
+    /// Accept revocations for commands missing from this process's config
+    /// (verified with default windows, third parties judged by the default
+    /// OPA rule). The central service serves agents whose command sets it
+    /// may not mirror; an agent only needs its own commands.
+    pub allow_unknown_commands: bool,
 }
+
+/// Default OPA rule for revocations of commands this process doesn't know.
+const DEFAULT_OPA_RULE: &str = "data.remonce.authz.decision";
 
 pub struct VerifiedRevocation {
     pub authorized: crate::security::AuthorizedRevocation,
@@ -49,6 +63,7 @@ pub async fn verify_and_authorize(
 
     let command_json = req.approver.command.clone();
     let audit_ctx = || AuditContext {
+        event_type: Some("approval_revocation"),
         command: Some(command_json.clone()),
         ..Default::default()
     };
@@ -70,28 +85,39 @@ pub async fn verify_and_authorize(
         }
     };
 
-    let cmd_config = match ctx.config.commands.iter().find(|c| c.name == command_name) {
-        Some(c) => c.clone(),
-        None => {
-            crate::audit::log_audit(
-                "deny",
-                format!("Revocation rejected: command '{}' not configured", command_name),
-                "unauthenticated".into(),
-                ip.to_string(),
-                ctx.hostname.to_string(),
-                audit_ctx(),
-            );
-            return Err("Invalid Request");
-        }
-    };
+    let (approver_max, operator_max, opa_rule) =
+        match ctx.config.commands.iter().find(|c| c.name == command_name) {
+            Some(c) => (
+                c.approver_max_validity_or_default(),
+                c.operator_max_validity_or_default(),
+                c.opa_rule.clone(),
+            ),
+            None if ctx.allow_unknown_commands => (
+                crate::config::DEFAULT_APPROVER_MAX_VALIDITY,
+                crate::config::DEFAULT_OPERATOR_MAX_VALIDITY,
+                DEFAULT_OPA_RULE.to_string(),
+            ),
+            None => {
+                crate::audit::log_audit(
+                    "deny",
+                    format!("Revocation rejected: command '{}' not configured", command_name),
+                    "unauthenticated".into(),
+                    ip.to_string(),
+                    ctx.hostname.to_string(),
+                    audit_ctx(),
+                );
+                return Err("Invalid Request");
+            }
+        };
+    let approver_max = approver_max.max(ctx.min_approver_validity.unwrap_or_default());
 
     let verifier_config = crate::security::VerifierConfig {
         client_id: ctx.config.oidc.client_id.clone(),
         issuer_url: ctx.config.oidc.issuer_url.clone(),
         jwks: ctx.jwks.clone(),
         trusted_roots: ctx.trusted_roots.to_vec(),
-        approver_max_validity: cmd_config.approver_max_validity_or_default(),
-        operator_max_validity: cmd_config.operator_max_validity_or_default(),
+        approver_max_validity: approver_max,
+        operator_max_validity: operator_max,
     };
 
     let revocation = match crate::security::verify_revocation(req, &verifier_config) {
@@ -113,6 +139,7 @@ pub async fn verify_and_authorize(
     let approver_user = revocation.approver.username.clone();
 
     let revoke_ctx = || AuditContext {
+        event_type: Some("approval_revocation"),
         command: Some(command_json.clone()),
         operator_user: Some(approver_user.clone()),
         ..Default::default()
@@ -149,7 +176,7 @@ pub async fn verify_and_authorize(
         let decision = match crate::opa::check_authorization(
             ctx.http_client,
             &ctx.config.opa_url,
-            &cmd_config.opa_rule,
+            &opa_rule,
             opa_input,
         )
         .await
@@ -183,7 +210,7 @@ pub async fn verify_and_authorize(
 
     Ok(VerifiedRevocation {
         authorized: revocation,
-        approver_max_validity: cmd_config.approver_max_validity_or_default(),
+        approver_max_validity: approver_max,
     })
 }
 
@@ -216,13 +243,32 @@ impl PersistentRevocationStore {
         if path.exists() {
             let contents = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
-            for line in contents.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let entry: StoredRevocation = serde_json::from_str(line)
-                    .map_err(|e| format!("Corrupt revocation entry in '{}': {e}", path.display()))?;
+            let lines: Vec<&str> = contents
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            for (idx, line) in lines.iter().enumerate() {
+                let entry: StoredRevocation = match serde_json::from_str(line) {
+                    Ok(e) => e,
+                    // A crash mid-append leaves a torn final line. Refusing
+                    // to start would halt every agent (they fail closed), and
+                    // the torn write was never acknowledged to a client.
+                    Err(e) if idx == lines.len() - 1 => {
+                        tracing::warn!(
+                            "Ignoring torn final entry in '{}': {e}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "Corrupt revocation entry in '{}' (line {}): {e}",
+                            path.display(),
+                            idx + 1
+                        ));
+                    }
+                };
                 if entry.expires_at_unix <= now {
                     continue;
                 }
@@ -268,8 +314,10 @@ impl PersistentRevocationStore {
             Some(existing) if *existing >= expires_at_unix => return Ok(()),
             _ => {}
         }
-        inner.map.insert(sig_hex.to_string(), expires_at_unix);
 
+        // Durable first, then visible: if the append fails, the in-memory map
+        // must not claim the revocation exists (a retry would short-circuit
+        // above and the revocation would vanish on restart).
         let line = serde_json::to_string(&StoredRevocation {
             sig: sig_hex.to_string(),
             expires_at_unix,
@@ -283,6 +331,7 @@ impl PersistentRevocationStore {
         writeln!(file, "{line}").map_err(|e| format!("Failed to append revocation: {e}"))?;
         file.sync_data()
             .map_err(|e| format!("Failed to sync revocation log: {e}"))?;
+        inner.map.insert(sig_hex.to_string(), expires_at_unix);
         Ok(())
     }
 
@@ -307,6 +356,7 @@ pub struct ServiceState {
     pub hostname: String,
     pub trusted_roots: Vec<Vec<u8>>,
     pub store: PersistentRevocationStore,
+    pub retention: std::time::Duration,
 }
 
 #[derive(Serialize)]
@@ -337,7 +387,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         "Missing [revocation_service] section in config.toml — the revocation service requires a `[revocation_service]` block with TLS configuration. See CONFIGURATION.md.",
     )?;
 
-    let http_client = reqwest::Client::new();
+    let http_client = crate::http_client();
 
     // The service performs the same bundle verification as the agent, so it
     // needs the OIDC keys and TSA trust anchors too.
@@ -378,6 +428,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         hostname,
         trusted_roots,
         store,
+        retention: svc_config.retention_or_default(),
     };
 
     let app = Router::new()
@@ -412,6 +463,8 @@ async fn revoke_handler(
         trusted_roots: &state.trusted_roots,
         http_client: &state.http_client,
         hostname: &state.hostname,
+        min_approver_validity: Some(state.retention),
+        allow_unknown_commands: true,
     };
 
     let verified = verify_and_authorize(&ctx, &req, &ip)
@@ -419,7 +472,9 @@ async fn revoke_handler(
         .map_err(|e| ErrorResponse { error: e.into() })?;
     let revocation = &verified.authorized;
 
-    let expiry = revocation.approver.signed_at + verified.approver_max_validity;
+    let expiry = revocation
+        .approver
+        .usable_until(verified.approver_max_validity);
     if expiry > time::OffsetDateTime::now_utc() {
         state
             .store
@@ -432,6 +487,7 @@ async fn revoke_handler(
                     ip.clone(),
                     state.hostname.clone(),
                     crate::audit::AuditContext {
+                        event_type: Some("approval_revocation"),
                         command: Some(req.approver.command.clone()),
                         ..Default::default()
                     },
@@ -454,6 +510,7 @@ async fn revoke_handler(
         ip,
         state.hostname.clone(),
         crate::audit::AuditContext {
+            event_type: Some("approval_revocation"),
             command: Some(req.approver.command.clone()),
             operator_user: Some(revocation.approver.username.clone()),
             ..Default::default()
@@ -542,10 +599,44 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_log_is_rejected() {
+    fn corrupt_middle_entry_is_rejected() {
         let path = temp_path("corrupt");
-        std::fs::write(&path, "not json\n").unwrap();
+        let live = format!(
+            "{{\"sig\":\"abc\",\"expires_at_unix\":{}}}",
+            far_future()
+        );
+        std::fs::write(&path, format!("not json\n{live}\n")).unwrap();
         assert!(PersistentRevocationStore::load(path.clone()).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn torn_final_entry_is_ignored() {
+        // A crash mid-append must not stop the service from starting.
+        let path = temp_path("torn");
+        let live = format!(
+            "{{\"sig\":\"abc\",\"expires_at_unix\":{}}}",
+            far_future()
+        );
+        std::fs::write(&path, format!("{live}\n{{\"sig\":\"de")).unwrap();
+        let store = PersistentRevocationStore::load(path.clone()).unwrap();
+        assert!(store.is_revoked("abc"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_persist_is_not_remembered() {
+        // Point the log at a directory so the append fails.
+        let dir = temp_path("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PersistentRevocationStore {
+            inner: Arc::new(Mutex::new(StoreInner {
+                map: HashMap::new(),
+                path: dir.clone(),
+            })),
+        };
+        assert!(store.revoke("abc", far_future()).is_err());
+        assert!(!store.is_revoked("abc"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

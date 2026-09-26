@@ -363,23 +363,46 @@ mod tests {
         }
     }
 
+    /// Delegated to any operator: signed `operator_requires` with no predicates.
+    fn any_operator() -> Option<OperatorConstraint> {
+        Some(OperatorConstraint::default())
+    }
+
     fn build_operator_cosign(
         env: &Env,
         approver_sig_hex: &str,
         operator_signed_at: OffsetDateTime,
         operator_groups: Vec<&str>,
     ) -> OperatorCosign {
+        build_operator_cosign_as(
+            env,
+            &env.operator,
+            "bob",
+            approver_sig_hex,
+            operator_signed_at,
+            operator_groups,
+        )
+    }
+
+    fn build_operator_cosign_as(
+        env: &Env,
+        keys: &TestKeys,
+        subject: &str,
+        approver_sig_hex: &str,
+        operator_signed_at: OffsetDateTime,
+        operator_groups: Vec<&str>,
+    ) -> OperatorCosign {
         let mut payload = approver_sig_hex.as_bytes().to_vec();
-        payload.extend_from_slice(env.operator.public_key_pem.as_bytes());
-        let sig: p256::ecdsa::Signature = env.operator.signing_key.sign(&payload);
+        payload.extend_from_slice(keys.public_key_pem.as_bytes());
+        let sig: p256::ecdsa::Signature = keys.signing_key.sign(&payload);
         let sig_bytes = sig.to_bytes();
 
-        let nonce = hex::encode(Sha256::digest(env.operator.public_key_pem.as_bytes()));
+        let nonce = hex::encode(Sha256::digest(keys.public_key_pem.as_bytes()));
         let id_token = create_valid_jwt(
-            &env.operator,
+            keys,
             "https://issuer.example",
             "remonce",
-            "bob",
+            subject,
             &nonce,
             operator_signed_at + Duration::minutes(30),
             serde_json::json!({ "groups": operator_groups }),
@@ -393,7 +416,7 @@ mod tests {
             approver_sig: approver_sig_hex.to_string(),
             signature: hex::encode(sig_bytes),
             id_token,
-            public_key: env.operator.public_key_pem.clone(),
+            public_key: keys.public_key_pem.clone(),
             timestamp_token,
         }
     }
@@ -532,7 +555,7 @@ mod tests {
         let approver = build_approver_bundle(
             &env,
             json!({ "command": "ping-test" }),
-            None,
+            any_operator(),
             now - Duration::minutes(1),
             vec!["approvers"],
         );
@@ -563,7 +586,7 @@ mod tests {
         let approver = build_approver_bundle(
             &env,
             json!({ "command": "ping-test" }),
-            None,
+            any_operator(),
             now - Duration::days(10),
             vec!["approvers"],
         );
@@ -619,7 +642,7 @@ mod tests {
         let approver_a = build_approver_bundle(
             &env,
             json!({ "command": "ping-test" }),
-            None,
+            any_operator(),
             now - Duration::minutes(1),
             vec!["approvers"],
         );
@@ -629,7 +652,7 @@ mod tests {
         let approver_b = build_approver_bundle(
             &env,
             json!({ "command": "dangerous-thing" }),
-            None,
+            any_operator(),
             now - Duration::minutes(1),
             vec!["approvers"],
         );
@@ -808,7 +831,7 @@ mod tests {
         let approver_a = build_approver_bundle(
             &env,
             json!({ "command": "ping-test" }),
-            None,
+            any_operator(),
             now - Duration::minutes(1),
             vec!["approvers"],
         );
@@ -816,7 +839,7 @@ mod tests {
         let approver_b = build_approver_bundle(
             &env,
             json!({ "command": "dangerous-thing" }),
-            None,
+            any_operator(),
             now - Duration::minutes(1),
             vec!["approvers"],
         );
@@ -831,5 +854,223 @@ mod tests {
             "expected OperatorStapling, got {:?}",
             result
         );
+    }
+
+    // --- Delegation mode (signed operator_requires) ---
+
+    #[test]
+    fn delegated_bundle_cannot_be_self_executed() {
+        // A bundle meant for a noc-l2 operator must not run by dropping the
+        // (unsigned) operator field.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            Some(OperatorConstraint {
+                any_of: vec![ClaimPredicate::Contains {
+                    claim: "groups".into(),
+                    value: serde_json::json!("noc-l2"),
+                }],
+            }),
+            now,
+            vec!["approvers"],
+        );
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::CosignRequired)),
+            "expected CosignRequired, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn self_only_bundle_cannot_be_cosigned() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        let op = build_operator_cosign(&env, &approver.signature, now, vec!["noc-l2"]);
+        let bundle = ExecutionBundle {
+            approver,
+            operator: Some(op),
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::CosignNotAllowed)),
+            "expected CosignNotAllowed, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn approver_cosigning_own_delegation_is_self_executed() {
+        // Four-eyes policies rely on `self_executed`; the approver must not
+        // satisfy them by cosigning their own delegated bundle.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            any_operator(),
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        let fresh_keys = setup_keys("alice-fresh-kid");
+        let mut jwks = env.jwks.clone();
+        jwks.keys.push(keys_to_jwk(&fresh_keys));
+        let op = build_operator_cosign_as(
+            &env,
+            &fresh_keys,
+            "alice",
+            &approver.signature,
+            now,
+            vec!["approvers"],
+        );
+        let bundle = ExecutionBundle {
+            approver,
+            operator: Some(op),
+        };
+        let config = VerifierConfig {
+            jwks,
+            ..verifier_config(&env)
+        };
+        let a = verify_execution(&bundle, &config).expect("should verify");
+        assert!(a.self_executed);
+    }
+
+    // --- Canonical signature hex ---
+
+    #[test]
+    fn uppercase_approver_signature_rejected() {
+        // Case variants decode to the same bytes but would miss the replay
+        // and revocation caches, which key on the hex string.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let mut approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now,
+            vec!["approvers"],
+        );
+        approver.signature = approver.signature.to_uppercase();
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::InvalidSignatureFormat(_))),
+            "expected InvalidSignatureFormat, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn uppercase_operator_signature_rejected() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            any_operator(),
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        let mut op = build_operator_cosign(&env, &approver.signature, now, vec!["noc-l2"]);
+        op.signature = op.signature.to_uppercase();
+        let bundle = ExecutionBundle {
+            approver,
+            operator: Some(op),
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::InvalidSignatureFormat(_))),
+            "expected InvalidSignatureFormat, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn revocation_of_uppercased_approver_signature_rejected() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let mut approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        approver.signature = approver.signature.to_uppercase();
+        let revoker =
+            build_revoker_attestation(&env, &env.operator, "bob", &approver.signature, now);
+        let req = RevocationBundle { approver, revoker };
+        let result = verify_revocation(&req, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::InvalidSignatureFormat(_))),
+            "expected InvalidSignatureFormat, got {:?}",
+            result
+        );
+    }
+
+    // --- Timestamp bounds ---
+
+    #[test]
+    fn far_future_timestamp_rejected() {
+        let env = new_env();
+        let future = OffsetDateTime::now_utc() + Duration::hours(1);
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            future,
+            vec!["approvers"],
+        );
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::TimestampInFuture { .. })),
+            "expected TimestampInFuture, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn usable_until_covers_retimestamping_to_token_expiry() {
+        // The test JWTs expire 30 minutes after signing. A holder can
+        // re-timestamp until then, so the executor signature stays usable
+        // until token_exp + window — well past signed_at + window.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now,
+            vec!["approvers"],
+        );
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
+        };
+        let a = verify_execution(&bundle, &verifier_config(&env)).expect("should verify");
+        let window = StdDuration::from_secs(10 * 60);
+        let until = a.operator.usable_until(window);
+        assert!(until >= a.operator.signed_at + Duration::minutes(39));
+        assert_eq!(until, a.operator.token_exp + window);
     }
 }

@@ -176,14 +176,65 @@ impl AcceptTls for tokio_rustls::TlsAcceptor {
     }
 }
 
-pub struct TlsListener<A> {
-    pub listener: TcpListener,
-    pub acceptor: A,
+/// Upper bound on a single TLS handshake. A client that connects and then
+/// stalls is dropped after this.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum number of handshakes in flight at once. Connections beyond this
+/// are dropped immediately rather than queued, so a flood of idle sockets
+/// cannot pile up unbounded tasks.
+const MAX_CONCURRENT_HANDSHAKES: usize = 512;
+
+/// A TLS listener for `axum::serve`. Handshakes run concurrently in their
+/// own tasks (with a timeout), never inline in `accept()` — otherwise one
+/// client that opens a TCP connection and sends nothing would block every
+/// later connection.
+pub struct TlsListener<A: AcceptTls> {
+    ready: tokio::sync::mpsc::Receiver<(A::Stream, SocketAddr)>,
+    local_addr: Result<SocketAddr, String>,
 }
 
-impl<A> TlsListener<A> {
+impl<A: AcceptTls> TlsListener<A> {
     pub fn new(listener: TcpListener, acceptor: A) -> Self {
-        Self { listener, acceptor }
+        let local_addr = listener.local_addr().map_err(|e| e.to_string());
+        let (tx, ready) = tokio::sync::mpsc::channel(64);
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+
+        tokio::spawn(async move {
+            loop {
+                let (socket, addr) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("TCP accept error: {}", e);
+                        // Back off briefly: accept errors (e.g. EMFILE) tend
+                        // to repeat immediately.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    tracing::warn!("Too many concurrent TLS handshakes; dropping {}", addr);
+                    continue;
+                };
+                if tx.is_closed() {
+                    break;
+                }
+                let acceptor = acceptor.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept_tls(socket)).await {
+                        Ok(Ok(stream)) => {
+                            let _ = tx.send((stream, addr)).await;
+                        }
+                        Ok(Err(e)) => tracing::debug!("TLS handshake failed from {}: {}", addr, e),
+                        Err(_) => tracing::debug!("TLS handshake timed out from {}", addr),
+                    }
+                });
+            }
+        });
+
+        Self { ready, local_addr }
     }
 }
 
@@ -195,27 +246,17 @@ where
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (socket, addr) = match self.listener.accept().await {
-                Ok(v) => v,
-                Err(e) => {
-                     tracing::debug!("TCP accept error: {}", e);
-                     continue;
-                }
-            };
-            
-            match self.acceptor.accept_tls(socket).await {
-                Ok(stream) => return (stream, addr),
-                Err(e) => {
-                    tracing::debug!("TLS handshake failed: {}", e);
-                    continue;
-                }
-            }
+        match self.ready.recv().await {
+            Some(conn) => conn,
+            // The accept task only exits when this listener is dropped.
+            None => std::future::pending().await,
         }
     }
-    
+
     fn local_addr(&self) -> io::Result<Self::Addr> {
-        self.listener.local_addr()
+        self.local_addr
+            .clone()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 }
 
@@ -325,19 +366,29 @@ pub async fn serve_with_tls(
             let mut incoming = acme_config
                 .incoming(listener_stream, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
 
-            // ACME per-connection path bypasses `axum::serve`, so `ConnectInfo<PeerAddr>`
-            // isn't populated automatically. Install a mock so extractors still work.
-            let app = app.layer(axum::extract::connect_info::MockConnectInfo(PeerAddr(
-                SocketAddr::from(([0, 0, 0, 0], 0)),
-            )));
-
             while let Some(tls) = incoming.next().await {
                 match tls {
                     Ok(tls_stream) => {
+                        // This path drives hyper directly rather than
+                        // `axum::serve`, so nothing inserts `ConnectInfo`.
+                        // Recover the peer from the underlying TCP socket so
+                        // audit records carry the real source address.
+                        let peer_addr = tls_stream
+                            .get_ref()
+                            .0
+                            .get_ref()
+                            .peer_addr()
+                            .unwrap_or_else(|e| {
+                                tracing::debug!("Could not read peer address: {}", e);
+                                SocketAddr::from(([0, 0, 0, 0], 0))
+                            });
+
                         let compat_tls = tls_stream.compat();
                         let io = TokioIo::new(compat_tls);
 
-                        let app = app.clone();
+                        let app = app.clone().layer(axum::Extension(
+                            axum::extract::ConnectInfo(PeerAddr(peer_addr)),
+                        ));
                         let service = TowerToHyperService::new(app);
 
                         tokio::spawn(async move {

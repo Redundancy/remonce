@@ -28,9 +28,15 @@
                     <div class="col-12">
                         <label class="form-label small text-secondary mb-1">Operator Requirements
                             (delegation)</label>
-                        <p class="small text-muted mb-2">Restrict who may co-sign and run this command. The
-                            executing operator's identity token must match <strong>at least one</strong> of these
-                            requirements. Leave empty for a normal (self or single-signer) token.</p>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="delegate-checkbox">
+                            <label class="form-check-label small text-light" for="delegate-checkbox">
+                                Delegate: another operator will co-sign and run this command</label>
+                        </div>
+                        <p class="small text-muted mb-2">Without delegation the token is self-execute only
+                            and must be run within minutes of signing. With delegation it must be co-signed
+                            (and cannot be self-executed); adding requirements restricts who may co-sign —
+                            the operator's identity token must match <strong>at least one</strong> of them.</p>
                         <div id="opreq-rows"></div>
                         <button type="button" class="btn btn-sm btn-outline-secondary"
                             onclick="addOpReqRow()">+ Add requirement</button>

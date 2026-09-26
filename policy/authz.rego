@@ -29,10 +29,11 @@ default reason = "Denied by default"
 # is always allowed by the agent without consulting OPA. Policy is only
 # asked when someone ELSE wants to revoke (action == "revoke").
 #
-# For file access / command listing, a simpler shape is used:
-#   input.action:  string   ("view_docs" | "read_file")
-#   input.jwt:     string   (file-access legacy path)
-#   input.file:    object   (when action == "read_file")
+# For file access / log streaming / command listing, a simpler shape is used:
+#   input.action:       string  ("view_docs" | "read_file" | "view_execution")
+#   input.jwt:          string  (the caller's bearer ID token)
+#   input.file:         object  (when action == "read_file")
+#   input.execution_id: string  (when action == "view_execution")
 #
 # The agent enforces cryptographic checks (signatures, TSA freshness, operator
 # claim predicates) BEFORE calling OPA. Policy here encodes business-level
@@ -57,6 +58,12 @@ allow if {
 
 allow if {
     input.action == "read_file"
+    "webapp-users" in legacy_user_groups
+}
+
+# Streaming an execution's output log.
+allow if {
+    input.action == "view_execution"
     "webapp-users" in legacy_user_groups
 }
 
@@ -88,6 +95,7 @@ allow if {
 # require a distinct operator (four-eyes).
 #
 # allow if {
+#     input.action == "execute"
 #     input.command.command == "restart-service"
 #     "oncall-managers" in approver_groups
 #     not input.self_executed

@@ -60,6 +60,8 @@ pub struct AuditContext {
     pub operator_user: Option<String>,
     pub operator_signed_at: Option<String>,
     pub self_executed: Option<bool>,
+    /// Overrides the event type inferred from which fields are set.
+    pub event_type: Option<&'static str>,
 }
 
 pub fn log_audit(
@@ -75,7 +77,9 @@ pub fn log_audit(
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown_time".to_string());
 
-    let event_type = if ctx.command.is_some() {
+    let event_type = if let Some(t) = ctx.event_type {
+        t
+    } else if ctx.command.is_some() {
         "command_execution"
     } else if ctx.file.is_some() {
         "file_access"

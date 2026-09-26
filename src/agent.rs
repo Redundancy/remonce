@@ -72,6 +72,26 @@ fn verify_query_token(
     Ok(token_data.claims)
 }
 
+/// How long to keep draining a command's output after it exits or is killed.
+const LOG_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Parse an optional RFC 3339 time bound from the signed command. `Ok(None)`
+/// when absent; `Err(field)` when present but not a valid RFC 3339 string.
+fn parse_time_bound(
+    command: &serde_json::Value,
+    field: &'static str,
+) -> Result<Option<time::OffsetDateTime>, &'static str> {
+    match command.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                .map(Some)
+                .map_err(|_| field)
+        }
+        Some(_) => Err(field),
+    }
+}
+
 #[derive(Serialize)]
 pub struct ExecutionResponse {
     pub status: String,
@@ -104,7 +124,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .ok_or("Missing [agent] section in config.toml — the agent requires an `[agent]` block with TLS configuration. See CONFIGURATION.md.")?;
 
-    let http_client = Client::new();
+    let http_client = crate::http_client();
 
     // 2. Fetch OIDC Metadata and Keys (Agent needs to verify JWTs)
     let discovery_url = format!("{}/.well-known/openid-configuration", config.oidc.issuer_url);
@@ -131,10 +151,18 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     let revocation_service = match &agent_config.revocation_service_url {
         Some(raw) => {
-            let parsed: url::Url = raw
+            let mut parsed: url::Url = raw
                 .trim()
                 .parse()
                 .map_err(|e| format!("Invalid agent.revocation_service_url: {e}"))?;
+            // Treat the path as a base directory so the service can sit
+            // behind a path prefix: endpoints are joined relative to it.
+            if !parsed.path().ends_with('/') {
+                let with_slash = format!("{}/", parsed.path());
+                parsed.set_path(&with_slash);
+            }
+            parsed.set_query(None);
+            parsed.set_fragment(None);
             if parsed.scheme() != "https" {
                 return Err(format!(
                     "agent.revocation_service_url must be https (got '{raw}')"
@@ -364,27 +392,9 @@ async fn execute_handler(
         }
     }
 
-    // 4. Replay check — executor signature (operator if delegated, else approver).
-    if state
-        .replay_cache
-        .check_and_insert(&authz.executor_signature_hex, operator_max)
-        .is_err()
-    {
-        crate::audit::log_audit(
-            "deny",
-            "Replay detected: executor signature already used".into(),
-            approver_user.clone(),
-            ip.clone(),
-            hostname.clone(),
-            full_ctx(),
-        );
-        return Err(ErrorResponse {
-            error: "Replay Detected".into(),
-        });
-    }
-
-    // 5. Command-level constraints (target machines, not_before/not_after,
-    //    declared parameters).
+    // 4. Command-level constraints (target machines, not_before/not_after,
+    //    declared parameters). The replay check comes last, just before
+    //    spawning, so a rejection here doesn't burn the signature.
     let now = time::OffsetDateTime::now_utc();
 
     let target_machines = command_json
@@ -396,19 +406,27 @@ async fn execute_handler(
                 .collect::<Vec<_>>()
         });
 
-    let not_before = command_json
-        .get("not_before")
-        .and_then(|v| v.as_str())
-        .and_then(|s| {
-            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
-        });
-
-    let not_after = command_json
-        .get("not_after")
-        .and_then(|v| v.as_str())
-        .and_then(|s| {
-            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
-        });
+    // A time bound that is present but unparsable must deny, not vanish:
+    // the approver believes the command is time-limited.
+    let (not_before, not_after) = match (
+        parse_time_bound(&command_json, "not_before"),
+        parse_time_bound(&command_json, "not_after"),
+    ) {
+        (Ok(nbf), Ok(naf)) => (nbf, naf),
+        (Err(field), _) | (_, Err(field)) => {
+            crate::audit::log_audit(
+                "deny",
+                format!("Malformed '{}' (expected an RFC 3339 string)", field),
+                approver_user.clone(),
+                ip.clone(),
+                hostname.clone(),
+                full_ctx(),
+            );
+            return Err(ErrorResponse {
+                error: "Invalid Time Constraint".into(),
+            });
+        }
+    };
 
     let targets = match target_machines {
         Some(t) => t,
@@ -510,7 +528,7 @@ async fn execute_handler(
         }
     };
 
-    // 6. OPA authorization with both identities.
+    // 5. OPA authorization with both identities.
     let opa_input = crate::opa::OpaInput {
         action: "execute".into(),
         command: command_json.clone(),
@@ -563,6 +581,34 @@ async fn execute_handler(
         });
     }
 
+    // 6. Replay check — executor signature (operator if delegated, else
+    //    approver). The entry must outlive every way the signature could
+    //    still pass freshness, including re-timestamping up to token expiry.
+    let replay_ttl: std::time::Duration = (authz.operator.usable_until(operator_max)
+        - time::OffsetDateTime::now_utc())
+    .try_into()
+    .unwrap_or(operator_max)
+    .max(operator_max);
+    if state
+        .replay_cache
+        .check_and_insert(&authz.executor_signature_hex, replay_ttl)
+        .is_err()
+    {
+        crate::audit::log_audit(
+            "deny",
+            "Replay detected: executor signature already used".into(),
+            approver_user.clone(),
+            ip.clone(),
+            hostname.clone(),
+            full_ctx(),
+        );
+        return Err(ErrorResponse {
+            error: "Replay Detected".into(),
+        });
+    }
+    // Released again if we fail before the process actually starts.
+    let release_replay = || state.replay_cache.release(&authz.executor_signature_hex);
+
     // Preserve legacy locals used below.
     let authenticated_user = approver_user.clone();
     let gen_time_str = approver_signed_at.clone();
@@ -578,22 +624,17 @@ async fn execute_handler(
     // execution_id forms the log filename, so we must reject anything that
     // isn't a canonical UUID — otherwise a signed payload could path-traverse
     // out of `logs_dir`.
-    let execution_id = req_command
+    let mut execution_id = req_command
         .get("id")
         .and_then(|v| v.as_str())
         .and_then(|s| uuid::Uuid::parse_str(s).ok().map(|u| u.to_string()))
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    tracing::info!(
-        "Executing command '{}' with ID {}",
-        command_name,
-        execution_id
-    );
-
     // Prepare Log File
     let logs_dir = PathBuf::from(&state.config.logs_dir);
     if !logs_dir.exists() {
         tokio::fs::create_dir_all(&logs_dir).await.map_err(|e| {
+            release_replay();
             crate::audit::log_audit(
                 "error",
                 format!("Failed to create logs dir: {}", e),
@@ -607,8 +648,29 @@ async fn execute_handler(
             }
         })?;
     }
-    let log_path = logs_dir.join(format!("{}.log", execution_id));
-    let mut log_file = tokio::fs::File::create(&log_path).await.map_err(|e| {
+
+    // `create_new`: one approval can legitimately run several times (e.g.
+    // multiple operator cosigns), and each run must keep its own log. If the
+    // signed id is taken, fall back to a fresh one.
+    let open_new = |path: PathBuf| async move {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await
+    };
+    let mut log_path = logs_dir.join(format!("{}.log", execution_id));
+    let first_try = open_new(log_path.clone()).await;
+    let log_result = match first_try {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            execution_id = uuid::Uuid::new_v4().to_string();
+            log_path = logs_dir.join(format!("{}.log", execution_id));
+            open_new(log_path.clone()).await
+        }
+        other => other,
+    };
+    let mut log_file = log_result.map_err(|e| {
+        release_replay();
         crate::audit::log_audit(
             "error",
             format!("Failed to create log file: {}", e),
@@ -621,6 +683,12 @@ async fn execute_handler(
             error: "Internal Error".into(),
         }
     })?;
+
+    tracing::info!(
+        "Executing command '{}' with ID {}",
+        command_name,
+        execution_id
+    );
 
     // Write Audit Header
     let header = format!(
@@ -657,6 +725,7 @@ async fn execute_handler(
     }
 
     let mut child = spawn_cmd.spawn().map_err(|e| {
+        release_replay();
         crate::audit::log_audit(
             "error",
             format!("Failed to spawn command: {}", e),
@@ -674,9 +743,9 @@ async fn execute_handler(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let exec_id_for_log = execution_id.clone();
+    let log_path_for_task = log_path.clone();
 
     tokio::spawn(async move {
-        let mut file_out = log_file;
         let mut stdout_reader = tokio::io::BufReader::new(stdout);
         let mut stderr_reader = tokio::io::BufReader::new(stderr);
 
@@ -708,13 +777,16 @@ async fn execute_handler(
         });
 
         // Pipe writer (terminates when both pump tasks drop their senders).
-        let writer = async {
+        // Runs as its own task so output drains while the child runs; if it
+        // only ran after exit, a full channel would stall the child's pipes.
+        let mut writer = tokio::spawn(async move {
+            let mut file_out = log_file;
             while let Some(msg) = rx.recv().await {
                 let _ = file_out.write_all(msg.as_bytes()).await;
                 let _ = file_out.flush().await;
             }
             file_out
-        };
+        });
 
         // Race the child's exit against the timeout. If the timer fires first,
         // SIGKILL the child and continue draining its remaining output.
@@ -730,7 +802,31 @@ async fn execute_handler(
             }
         };
 
-        let mut file_out = writer.await;
+        // Grandchildren that inherited stdout/stderr keep the pipes open
+        // after the direct child exits or is killed, so bound the drain and
+        // reopen the log to write the trailer if we had to give up on it.
+        let mut file_out = match tokio::time::timeout(LOG_DRAIN_TIMEOUT, &mut writer).await {
+            Ok(Ok(f)) => f,
+            _ => {
+                writer.abort();
+                tracing::warn!(
+                    "Command {}: output still open {:?} after exit (orphaned child processes?)",
+                    exec_id_for_log,
+                    LOG_DRAIN_TIMEOUT
+                );
+                match tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log_path_for_task)
+                    .await
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("Failed to reopen log for trailer: {}", e);
+                        return;
+                    }
+                }
+            }
+        };
         match wait_result {
             Some(Ok(status)) => {
                 let _ = file_out
@@ -788,9 +884,9 @@ async fn check_revocation_service(
     base: &url::Url,
     sig_hex: &str,
 ) -> Result<bool, String> {
-    let mut url = base.clone();
-    url.set_path(&format!("/revoked/{}", sig_hex));
-    url.set_query(None);
+    let url = base
+        .join(&format!("revoked/{}", sig_hex))
+        .map_err(|e| e.to_string())?;
     let resp = client
         .get(url)
         .timeout(std::time::Duration::from_secs(5))
@@ -826,6 +922,8 @@ async fn revoke_handler(
         trusted_roots: &state.trusted_roots,
         http_client: &state.http_client,
         hostname: &hostname,
+        min_approver_validity: None,
+        allow_unknown_commands: false,
     };
 
     let verified = crate::revocation::verify_and_authorize(&ctx, &req, &ip)
@@ -837,14 +935,18 @@ async fn revoke_handler(
     let approver_user = revocation.approver.username.clone();
 
     let revoke_ctx = || AuditContext {
+        event_type: Some("approval_revocation"),
         command: Some(command_json.clone()),
         operator_user: Some(approver_user.clone()),
         ..Default::default()
     };
 
-    // Pin the revocation until the approval would have expired anyway.
+    // Pin the revocation until the approval would have expired anyway —
+    // allowing for the approval being re-timestamped up to its token expiry.
     let now = time::OffsetDateTime::now_utc();
-    let expiry = revocation.approver.signed_at + verified.approver_max_validity;
+    let expiry = revocation
+        .approver
+        .usable_until(verified.approver_max_validity);
     if expiry > now {
         let remaining: std::time::Duration =
             (expiry - now).try_into().unwrap_or_default();
@@ -857,10 +959,8 @@ async fn revoke_handler(
     // covers the whole estate. The local pin above stands either way.
     let mut message = "Approval revoked on this agent".to_string();
     if let Some((client, base)) = &state.revocation_service {
-        let mut url = base.clone();
-        url.set_path("/revoke");
-        url.set_query(None);
         let forward = async {
+            let url = base.join("revoke").map_err(|e| e.to_string())?;
             client
                 .post(url)
                 .timeout(std::time::Duration::from_secs(10))
@@ -914,28 +1014,117 @@ async fn revoke_handler(
 async fn stream_logs_handler(
     Path(id): Path<String>,
     State(state): State<AgentState>,
+    ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
     // Path traversal guard: only allow canonical UUIDs through.
     if uuid::Uuid::parse_str(&id).is_err() {
         return (axum::http::StatusCode::BAD_REQUEST, "Invalid log id").into_response();
     }
+
+    // Execution output can contain anything the command printed, so it gets
+    // the same bearer-token + OPA gate as file streaming.
+    let token = match bearer_token(&headers) {
+        Some(t) => t,
+        None => return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response(),
+    };
+    let claims = match verify_query_token(
+        &token,
+        &state.jwks,
+        &state.config.oidc.issuer_url,
+        &state.config.oidc.client_id,
+    ) {
+        Ok(c) => c,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+    let user = claims
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let allowed = opa_allows(
+        &state,
+        serde_json::json!({ "action": "view_execution", "execution_id": id, "jwt": token }),
+    )
+    .await;
+    let exec_info = Some(serde_json::json!({ "execution_id": id }));
+    if !allowed {
+        crate::audit::log_audit(
+            "deny",
+            "Execution log access denied by OPA".into(),
+            user,
+            addr.ip_string(),
+            state.hostname.clone(),
+            crate::audit::AuditContext {
+                file: exec_info,
+                event_type: Some("execution_log_access"),
+                ..Default::default()
+            },
+        );
+        return (axum::http::StatusCode::FORBIDDEN, "OPA Denied").into_response();
+    }
+    crate::audit::log_audit(
+        "allow",
+        "Execution Log Stream Started".into(),
+        user,
+        addr.ip_string(),
+        state.hostname.clone(),
+        crate::audit::AuditContext {
+            file: exec_info,
+            ..Default::default()
+        },
+    );
+
     let log_path = PathBuf::from(&state.config.logs_dir).join(format!("{}.log", id));
     ws.on_upgrade(move |socket| tail_file(socket, log_path, None))
 }
 
-#[derive(Deserialize)]
-struct ListFilesParams {
-    token: String,
+/// Extract `Authorization: Bearer <token>`. Tokens are never accepted in the
+/// query string: URLs end up in logs, proxies and error messages.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Ask OPA's `remonce/authz/decision` for a legacy-shape input. Any error
+/// (unreachable, malformed response) denies.
+async fn opa_allows(state: &AgentState, input: serde_json::Value) -> bool {
+    let opa_url = format!("{}/v1/data/remonce/authz/decision", state.config.opa_url);
+    let res = state
+        .http_client
+        .post(&opa_url)
+        .json(&serde_json::json!({ "input": input }))
+        .send()
+        .await;
+    let body: serde_json::Value = match res {
+        Ok(r) => r.json().await.unwrap_or(serde_json::json!({})),
+        Err(e) => {
+            tracing::warn!("OPA request failed: {}", e.without_url());
+            return false;
+        }
+    };
+    body.pointer("/result/allow")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 async fn list_files_handler(
     State(state): State<AgentState>,
-    Query(params): Query<ListFilesParams>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     // Same auth posture as `/api/files/stream` — bearer ID token required.
+    let Some(token) = bearer_token(&headers) else {
+        return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
+    };
     match verify_query_token(
-        &params.token,
+        &token,
         &state.jwks,
         &state.config.oidc.issuer_url,
         &state.config.oidc.client_id,
@@ -947,7 +1136,6 @@ async fn list_files_handler(
 
 #[derive(Deserialize)]
 struct StreamFileParams {
-    token: String,
     name: Option<String>,
     path: Option<String>,
     #[serde(default = "default_tail_lines")]
@@ -961,6 +1149,7 @@ fn default_tail_lines() -> Option<usize> {
 async fn stream_file_handler(
     State(state): State<AgentState>,
     ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<StreamFileParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -982,8 +1171,12 @@ async fn stream_file_handler(
     };
 
     // 1. Verify Token via shared helper.
+    let Some(token) = bearer_token(&headers) else {
+        log_audit("deny", "Missing bearer token".into(), "unknown".into(), None);
+        return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
+    };
     let claims = match verify_query_token(
-        &params.token,
+        &token,
         &state.jwks,
         &state.config.oidc.issuer_url,
         &state.config.oidc.client_id,
@@ -1025,24 +1218,11 @@ async fn stream_file_handler(
     };
 
     // 3. Check OPA
-    let check_input = serde_json::json!({
-        "input": {
-            "action": "read_file",
-            "file": file_info_json,
-            "jwt": params.token
-        }
-    });
-    
-    let opa_url = format!("{}/v1/data/remonce/authz/decision", state.config.opa_url);
-    let opa_res: serde_json::Value = match state.http_client.post(&opa_url).json(&check_input).send().await {
-        Ok(r) => r.json().await.unwrap_or(serde_json::json!({})),
-        Err(e) => {
-            log_audit("error", format!("OPA Error: {}", e), user.clone(), Some(file_info_json));
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "OPA Error").into_response();
-        }
-    };
-
-    let allowed = opa_res.pointer("/result/allow").and_then(|v| v.as_bool()).unwrap_or(false);
+    let allowed = opa_allows(
+        &state,
+        serde_json::json!({ "action": "read_file", "file": file_info_json, "jwt": token }),
+    )
+    .await;
     if !allowed {
          log_audit("deny", "OPA Denied".into(), user.clone(), Some(file_info_json));
          return (axum::http::StatusCode::FORBIDDEN, "OPA Denied").into_response();
@@ -1090,8 +1270,7 @@ async fn tail_file(mut socket: WebSocket, path: PathBuf, tail_lines: Option<usiz
         // 2. If small (< 1MB), read all, take last N lines.
         // 3. If large, seek to end - (N * 200 bytes?), read, split lines, take last N.
         
-        let metadata = file.metadata().await.unwrap();
-        let len = metadata.len();
+        let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
         
         // Arbitrary buffer size estimate: 200 chars per line?
         let est_bytes = (n as u64) * 200;
@@ -1109,21 +1288,37 @@ async fn tail_file(mut socket: WebSocket, path: PathBuf, tail_lines: Option<usiz
         // Wait, current logic sends chunks.
     }
 
+    // Stream until the client goes away. Watching the socket matters: at EOF
+    // we otherwise only sleep and re-read, never send, and so would never
+    // notice a disconnect — leaking the task and the file handle forever.
     let mut buf = [0u8; 1024];
     loop {
-        let n = match file.read(&mut buf).await {
-            Ok(n) => n,
-            Err(_) => break,
-        };
-
-        if n > 0 {
-            let s = String::from_utf8_lossy(&buf[..n]);
-            if socket.send(Message::Text(s.to_string().into())).await.is_err() {
-                break;
+        tokio::select! {
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+            r = file.read(&mut buf) => {
+                let n = match r {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n > 0 {
+                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if socket.send(Message::Text(s.into())).await.is_err() {
+                        break;
+                    }
+                } else {
+                    // EOF: wait for more output, but keep listening for close.
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                        msg = socket.recv() => match msg {
+                            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                            Some(Ok(_)) => {}
+                        },
+                    }
+                }
             }
-        } else {
-             // EOF. Wait.
-             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 }

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Application configuration structure, verified against `config.toml` at startup.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// OIDC Configuration
     #[serde(default)]
@@ -50,6 +51,12 @@ pub struct Config {
     /// of the system trust store.
     pub agent_ca_path: Option<String>,
 
+    /// Additional agents the signer UI may target besides `agent_url`. The
+    /// web tier refuses any other browser-supplied agent URL, since it sends
+    /// the user's ID token and signatures to whichever agent is chosen.
+    #[serde(default)]
+    pub allowed_agent_urls: Vec<String>,
+
     /// Central revocation service configuration. Required when running
     /// `remonce revocation-service`.
     pub revocation_service: Option<RevocationServiceConfig>,
@@ -63,6 +70,7 @@ fn default_agent_url() -> String {
 /// one network-facing component, and all command-execution requests must
 /// travel over TLS.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default = "default_agent_listen_address")]
     pub listen_address: String,
@@ -92,6 +100,7 @@ fn default_agent_listen_address() -> String {
 /// Configuration for the central revocation service
 /// (`remonce revocation-service`). TLS is mandatory.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RevocationServiceConfig {
     #[serde(default = "default_revocation_listen_address")]
     pub listen_address: String,
@@ -102,6 +111,20 @@ pub struct RevocationServiceConfig {
     /// JSONL file persisting revocations across restarts.
     #[serde(default = "default_revocation_persist_path")]
     pub persist_path: String,
+
+    /// Minimum time a revocation is kept (counted from the revoked bundle's
+    /// token expiry), whatever this service's own `[[commands]]` say. Must
+    /// be at least the longest `approver_max_validity` any agent allows.
+    /// Default: 30 days.
+    #[serde(default, with = "humantime_serde")]
+    pub retention: Option<std::time::Duration>,
+}
+
+impl RevocationServiceConfig {
+    pub fn retention_or_default(&self) -> std::time::Duration {
+        self.retention
+            .unwrap_or(std::time::Duration::from_secs(30 * 24 * 60 * 60))
+    }
 }
 
 fn default_revocation_listen_address() -> String {
@@ -125,6 +148,7 @@ fn default_opa_url() -> String {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// The allowed path, supports glob patterns (e.g., "/var/log/*.log").
     pub path: String,
@@ -137,6 +161,7 @@ pub struct FileConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TsaConfig {
     /// The URL of the RFC 3161 Timestamp Authority (TSA).
     /// Used to cryptographically timestamp command signatures.
@@ -173,6 +198,7 @@ fn default_tsa_url() -> String {
 
 /// OIDC Configuration parameters.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct OidcConfig {
     /// The base URL of the OpenID Connect provider (e.g., Vault).
     /// Used for OIDC discovery (.well-known/openid-configuration).
@@ -205,6 +231,7 @@ impl Default for OidcConfig {
 
 /// Configuration for a specific executable command.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CommandConfig {
     /// The unique reference name for this command (used in API requests).
     pub name: String,
@@ -262,6 +289,7 @@ pub struct CommandConfig {
 
 /// A declared, validated parameter for a command.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ParamConfig {
     /// Placeholder name; must match `[A-Za-z_][A-Za-z0-9_]*`.
     pub name: String,
@@ -289,15 +317,20 @@ pub struct ParamConfig {
     pub max: Option<i64>,
 }
 
+pub const DEFAULT_APPROVER_MAX_VALIDITY: std::time::Duration =
+    std::time::Duration::from_secs(3 * 24 * 60 * 60);
+pub const DEFAULT_OPERATOR_MAX_VALIDITY: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
 impl CommandConfig {
     pub fn approver_max_validity_or_default(&self) -> std::time::Duration {
         self.approver_max_validity
-            .unwrap_or_else(|| std::time::Duration::from_secs(3 * 24 * 60 * 60))
+            .unwrap_or(DEFAULT_APPROVER_MAX_VALIDITY)
     }
 
     pub fn operator_max_validity_or_default(&self) -> std::time::Duration {
         self.operator_max_validity
-            .unwrap_or_else(|| std::time::Duration::from_secs(10 * 60))
+            .unwrap_or(DEFAULT_OPERATOR_MAX_VALIDITY)
     }
 
     pub fn command_timeout_or_default(&self) -> std::time::Duration {
@@ -332,5 +365,35 @@ impl Config {
             Some(uri) => uri.clone(),
             None => format!("http://{}/oidc/callback", self.listen_address),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_config_parses() {
+        let cfg: Config = toml::from_str(include_str!("../config.toml"))
+            .expect("config.toml must parse with deny_unknown_fields");
+        let test = cfg.commands.iter().find(|c| c.name == "test").unwrap();
+        assert_eq!(
+            test.approver_max_validity_or_default(),
+            std::time::Duration::from_secs(24 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn misspelled_field_is_rejected() {
+        // A typo must fail loudly rather than silently fall back to a default.
+        let r: Result<Config, _> = toml::from_str(
+            r#"
+            [[commands]]
+            name = "x"
+            opa_rule = "data.x"
+            max_validity = "1d"
+            "#,
+        );
+        assert!(r.is_err());
     }
 }

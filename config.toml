@@ -30,7 +30,7 @@ redirect_uri = "http://localhost:8080/oidc/callback"
 name = "test"
 description = "A basic test command to verify connectivity."
 opa_rule = "data.remonce.authz.decision"
-max_validity = "1d" # Optional: Override default 3 day validity (e.g. 1h, 30m)
+approver_max_validity = "1d" # Optional: override the default 3-day approver validity (e.g. 1h, 30m)
 
 [[commands]]
 name = "fail"

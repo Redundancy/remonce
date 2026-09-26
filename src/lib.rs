@@ -14,6 +14,16 @@ pub mod replay;
 pub mod revocation;
 pub mod tsa;
 
+/// HTTP client for OIDC discovery, JWKS, TSA and OPA calls. Bounded
+/// timeouts: a hung dependency must not pin request tasks forever.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("static HTTP client configuration is valid")
+}
+
 #[cfg(test)]
 mod golden_tests;
 #[cfg(test)]

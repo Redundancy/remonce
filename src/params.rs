@@ -10,9 +10,10 @@
 use crate::config::{CommandConfig, ParamConfig};
 use std::collections::BTreeMap;
 
-/// Default rule for params with no explicit validation: short, no leading
-/// dash (prevents argv flag injection), conservative charset.
-const DEFAULT_PATTERN: &str = "[A-Za-z0-9._][A-Za-z0-9._-]{0,63}";
+/// Default rule for params with no explicit validation: short, conservative
+/// charset, and no leading dash (argv flag injection) or leading dot (so no
+/// `.`/`..` path segments when a template splices the value into a path).
+const DEFAULT_PATTERN: &str = "[A-Za-z0-9_][A-Za-z0-9._-]{0,63}";
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ParamError {
@@ -208,7 +209,7 @@ mod tests {
     #[test]
     fn default_pattern_rejects_flag_injection_and_shell_chars() {
         let c = cmd(vec![param("target")], vec!["{{target}}"]);
-        for bad in ["-rf", "--force", "a;b", "a b", "$(reboot)", "../etc"] {
+        for bad in ["-rf", "--force", "a;b", "a b", "$(reboot)", "../etc", "..", ".", ".hidden"] {
             let r = validate_params(&c, Some(&serde_json::json!({ "target": bad })));
             assert!(r.is_err(), "expected rejection for {bad:?}");
         }

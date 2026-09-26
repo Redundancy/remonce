@@ -8,6 +8,13 @@
 //!   Short validity (minutes). Provides attribution + at-execution-time freshness.
 //! - **Self-execute shortcut**: if no operator is present, the approver's own
 //!   signature must be within the short window — they're acting as both roles.
+//!
+//! The signed `operator_requires` field doubles as the delegation mode:
+//! `None` = self-execute only (a cosign is rejected); `Some(_)` = delegated
+//! (self-execute is rejected), with an empty `any_of` meaning "any operator".
+//!
+//! Signature hex must be canonical lowercase: caches key on the hex string,
+//! and `hex::decode` would otherwise accept case variants of the same bytes.
 
 use crate::tsa;
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
@@ -50,7 +57,16 @@ pub enum ValidationError {
     RevokerSignatureFailed,
     #[error("Revoker is not authorized to revoke this approval")]
     RevokerNotAuthorized,
+    #[error("Timestamp is too far in the future ({ahead_secs}s ahead)")]
+    TimestampInFuture { ahead_secs: u64 },
+    #[error("Bundle is delegated (operator_requires set) and needs an operator cosign")]
+    CosignRequired,
+    #[error("Bundle is self-execute only (no operator_requires) and cannot be cosigned")]
+    CosignNotAllowed,
 }
+
+/// Tolerated clock skew between the TSA and this host.
+const MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Claims {
@@ -147,6 +163,18 @@ pub struct SignerIdentity {
     pub username: String,
     pub claims: serde_json::Value,
     pub signed_at: time::OffsetDateTime,
+    /// The ID token's `exp`. Anyone holding a bundle can obtain a fresh TSA
+    /// timestamp over the same signature + token until this instant, so it
+    /// bounds how late `signed_at` can be pushed. Size cache TTLs from it.
+    pub token_exp: time::OffsetDateTime,
+}
+
+impl SignerIdentity {
+    /// Latest instant a signature by this signer can still pass a freshness
+    /// check of `window`, allowing for re-timestamping up to `token_exp`.
+    pub fn usable_until(&self, window: Duration) -> time::OffsetDateTime {
+        self.token_exp.max(self.signed_at) + window
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +223,28 @@ pub fn revocation_payload(approver_sig_hex: &str, revoker_public_key_pem: &str) 
     bytes
 }
 
+/// Decode a signature hex string, rejecting anything but canonical lowercase.
+fn decode_canonical_hex(s: &str, what: &str) -> Result<Vec<u8>, ValidationError> {
+    let bytes = hex::decode(s)
+        .map_err(|_| ValidationError::InvalidSignatureFormat(format!("{what}: invalid hex")))?;
+    if hex::encode(&bytes) != s {
+        return Err(ValidationError::InvalidSignatureFormat(format!(
+            "{what}: hex must be lowercase"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn same_subject(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (
+        a.get("sub").and_then(|v| v.as_str()),
+        b.get("sub").and_then(|v| v.as_str()),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn username_from_claims(claims: &serde_json::Value) -> String {
     claims
         .get("username")
@@ -217,8 +267,7 @@ fn verify_approver(
     let approver_pubkey = VerifyingKey::from_public_key_pem(&approver.public_key)
         .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
 
-    let approver_sig_bytes = hex::decode(&approver.signature)
-        .map_err(|_| ValidationError::InvalidSignatureFormat("approver: invalid hex".into()))?;
+    let approver_sig_bytes = decode_canonical_hex(&approver.signature, "approver")?;
 
     let approver_sig = Signature::from_slice(&approver_sig_bytes)
         .map_err(|e| ValidationError::InvalidSignatureFormat(e.to_string()))?;
@@ -239,7 +288,7 @@ fn verify_approver(
             .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
 
     // ---- 3. Verify approver JWT ----
-    let approver_claims_obj = verify_oidc_jwt(
+    let (approver_claims_obj, token_exp) = verify_oidc_jwt(
         &approver.id_token,
         &approver.public_key,
         approver_signed_at,
@@ -250,6 +299,7 @@ fn verify_approver(
         username: username_from_claims(&approver_claims_obj),
         claims: approver_claims_obj,
         signed_at: approver_signed_at,
+        token_exp,
     })
 }
 
@@ -264,6 +314,12 @@ pub fn verify_execution(
     let now = time::OffsetDateTime::now_utc();
 
     match &bundle.operator {
+        Some(_) if bundle.approver.operator_requires.is_none() => {
+            Err(ValidationError::CosignNotAllowed)
+        }
+        None if bundle.approver.operator_requires.is_some() => {
+            Err(ValidationError::CosignRequired)
+        }
         Some(op) => {
             // 4a. Re-check the stated approver_sig matches the bundle.
             if op.approver_sig != bundle.approver.signature {
@@ -274,9 +330,7 @@ pub fn verify_execution(
             let operator_pubkey = VerifyingKey::from_public_key_pem(&op.public_key)
                 .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
 
-            let op_sig_bytes = hex::decode(&op.signature).map_err(|_| {
-                ValidationError::InvalidSignatureFormat("operator: invalid hex".into())
-            })?;
+            let op_sig_bytes = decode_canonical_hex(&op.signature, "operator")?;
             let op_sig = Signature::from_slice(&op_sig_bytes)
                 .map_err(|e| ValidationError::InvalidSignatureFormat(e.to_string()))?;
 
@@ -296,18 +350,13 @@ pub fn verify_execution(
                     .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
 
             // 4d. Operator JWT + nonce bound to operator pubkey.
-            let operator_claims_obj = verify_oidc_jwt(
+            let (operator_claims_obj, operator_token_exp) = verify_oidc_jwt(
                 &op.id_token,
                 &op.public_key,
                 operator_signed_at,
                 config,
             )?;
-            let operator_username = operator_claims_obj
-                .get("username")
-                .and_then(|v| v.as_str())
-                .or_else(|| operator_claims_obj.get("sub").and_then(|v| v.as_str()))
-                .unwrap_or("unknown")
-                .to_string();
+            let operator_username = username_from_claims(&operator_claims_obj);
 
             // 4e. Freshness — operator (short) + approver (long).
             check_age(now, operator_signed_at, config.operator_max_validity, true)?;
@@ -320,14 +369,19 @@ pub fn verify_execution(
                 }
             }
 
+            // An approver cosigning their own delegated bundle is still one
+            // person — report it as self-executed so four-eyes policies hold.
+            let self_executed = same_subject(&approver.claims, &operator_claims_obj);
+
             Ok(AuthorizedExecution {
                 approver,
                 operator: SignerIdentity {
                     username: operator_username,
                     claims: operator_claims_obj,
                     signed_at: operator_signed_at,
+                    token_exp: operator_token_exp,
                 },
-                self_executed: false,
+                self_executed,
                 executor_signature_hex: op.signature.clone(),
             })
         }
@@ -374,8 +428,7 @@ pub fn verify_revocation(
     let revoker_pubkey = VerifyingKey::from_public_key_pem(&req.revoker.public_key)
         .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
 
-    let revoker_sig_bytes = hex::decode(&req.revoker.signature)
-        .map_err(|_| ValidationError::InvalidSignatureFormat("revoker: invalid hex".into()))?;
+    let revoker_sig_bytes = decode_canonical_hex(&req.revoker.signature, "revoker")?;
     let revoker_sig = Signature::from_slice(&revoker_sig_bytes)
         .map_err(|e| ValidationError::InvalidSignatureFormat(e.to_string()))?;
 
@@ -395,7 +448,7 @@ pub fn verify_revocation(
         tsa::verify_timestamp(&revoker_tsa_bytes, &revoker_tsa_data, &config.trusted_roots)
             .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
 
-    let revoker_claims = verify_oidc_jwt(
+    let (revoker_claims, revoker_token_exp) = verify_oidc_jwt(
         &req.revoker.id_token,
         &req.revoker.public_key,
         revoker_signed_at,
@@ -410,19 +463,14 @@ pub fn verify_revocation(
         true,
     )?;
 
-    let same_sub = match (
-        approver.claims.get("sub").and_then(|v| v.as_str()),
-        revoker_claims.get("sub").and_then(|v| v.as_str()),
-    ) {
-        (Some(a), Some(r)) => a == r,
-        _ => false,
-    };
+    let same_sub = same_subject(&approver.claims, &revoker_claims);
 
     Ok(AuthorizedRevocation {
         revoker: SignerIdentity {
             username: username_from_claims(&revoker_claims),
             claims: revoker_claims,
             signed_at: revoker_signed_at,
+            token_exp: revoker_token_exp,
         },
         self_revoked: same_sub,
         approver_signature_hex: req.approver.signature.clone(),
@@ -432,13 +480,14 @@ pub fn verify_revocation(
 
 /// Shared JWT verification: signature against JWKS, issuer, audience, and
 /// nonce bound to the caller's ephemeral public key. Also checks the JWT's
-/// own `exp` against the TSA timestamp (not wall clock).
+/// own `exp` against the TSA timestamp (not wall clock). Returns the claims
+/// and the token's expiry.
 fn verify_oidc_jwt(
     id_token: &str,
     signer_public_key_pem: &str,
     signed_at: time::OffsetDateTime,
     config: &VerifierConfig,
-) -> Result<serde_json::Value, ValidationError> {
+) -> Result<(serde_json::Value, time::OffsetDateTime), ValidationError> {
     let header =
         decode_header(id_token).map_err(|e| ValidationError::InvalidJwtHeader(e.to_string()))?;
     let kid = header
@@ -479,7 +528,7 @@ fn verify_oidc_jwt(
         return Err(ValidationError::JwtExpired);
     }
 
-    Ok(claims)
+    Ok((claims, exp_time))
 }
 
 fn check_age(
@@ -489,7 +538,12 @@ fn check_age(
     is_executor: bool,
 ) -> Result<(), ValidationError> {
     if signed_at > now {
-        // Clock skew or TSA returned a future time. Treat as zero age.
+        // Small clock skew is treated as zero age; anything larger would let
+        // a skewed TSA extend a signature's life past the replay-cache TTL.
+        let ahead_secs = (signed_at - now).whole_seconds().max(0) as u64;
+        if ahead_secs > MAX_FUTURE_SKEW.as_secs() {
+            return Err(ValidationError::TimestampInFuture { ahead_secs });
+        }
         return Ok(());
     }
     let age = now - signed_at;
