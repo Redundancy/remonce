@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::security::Claims;
 use axum::{
     extract::{Query, State},
     response::{Html, IntoResponse, Redirect},
@@ -7,16 +6,9 @@ use axum::{
     Router,
 };
 
-use p256::{
-    ecdsa::{SigningKey, signature::Signer},
-    pkcs8::EncodePublicKey,
-};
-use p256::elliptic_curve::generic_array::GenericArray;
-use rand::{RngCore, rngs::OsRng};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tower_http::{
@@ -26,7 +18,10 @@ use tower_http::{
 use tower_sessions::MemoryStore;
 use tower_sessions::{Expiry, Session, SessionManagerLayer, cookie::SameSite};
 
-const SESSION_KEY: &str = "remonce.session";
+/// Logged-in (viewer) profile.
+const PROFILE_KEY: &str = "remonce.profile";
+/// In-flight viewer login.
+const LOGIN_FLOW_KEY: &str = "remonce.login_flow";
 
 // Application-wide error type.
 #[derive(Debug, thiserror::Error)]
@@ -103,34 +98,30 @@ pub struct AppState {
     pub agent_tls: std::sync::Arc<rustls::ClientConfig>,
 }
 
-/// Data stored in the session during the OIDC login flow.
-///
-/// `signing_key_hex` is the raw P-256 scalar (hex-encoded for JSON session
-/// serialization). The web tier is loopback-only and uses an in-memory session
-/// store, so the key never leaves this process; there is no cross-host exposure
-/// to encrypt against.
+/// Data stored in the session during a viewer login.
 #[derive(Serialize, Deserialize)]
-struct OidcFlowState {
-    pkce_verifier: String,
+struct LoginFlow {
     state: String,
-    ephemeral_public_key_pem: String,
-    signing_key_hex: String,
+    pkce_verifier: String,
+    nonce: String,
 }
 
-/// Data stored in the session after a user has logged in.
+/// Data stored in the session after a user has logged in. Holds only the
+/// *viewer* token — a bearer credential for files and logs. No signing key
+/// or signing token lives here: every signature gets its own login (see
+/// `web_sign`).
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct UserProfile {
     pub(crate) subject: String,
-    pub(crate) id_token: String,
-    pub(crate) signing_key_hex: String,
-    pub(crate) public_key_pem: String,
+    pub(crate) username: String,
+    pub(crate) viewer_id_token: String,
 }
 
 /// Fetch the logged-in user's profile from the session, or fail with an
 /// auth error. Shared by the signing endpoints and the agent proxy.
 pub(crate) async fn require_profile(session: &Session) -> Result<UserProfile, AppError> {
     let profile: UserProfile = session
-        .get(SESSION_KEY)
+        .get(PROFILE_KEY)
         .await?
         .ok_or(AppError::Auth("Not logged in".into()))?;
     if profile.subject.is_empty() {
@@ -151,6 +142,14 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
     let insecure_mode = crate::insecure::validate(&config, insecure)
         .map_err(|e| AppError::Config(format!("{e}")))?;
     crate::audit::set_insecure_mode(insecure_mode.as_bool());
+
+    if config.oidc.viewer_client_id.is_none() {
+        return Err(AppError::Config(
+            "oidc.viewer_client_id must be set: the local signer logs you in with the viewer \
+             client and uses the signing client only for per-signature logins"
+                .into(),
+        ));
+    }
 
     // Create shared HTTP client and AppState
     let http_client = crate::http_client();
@@ -219,11 +218,10 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         .route("/", get(|| async { Redirect::to("/auth/login") }))
         .route("/auth/login", get(login_handler))
         .route("/oidc/callback", get(callback_handler))
-        .route("/api/sign", post(sign_handler))
-        .route("/api/cosign", post(cosign_handler))
+        .route("/api/sign/begin", post(crate::web_sign::begin_handler))
+        .route("/api/sign/result/{id}", get(crate::web_sign::result_handler))
         .route("/api/commands", get(get_commands_handler))
         .route("/api/agent/execute", post(crate::agent_proxy::execute_proxy))
-        .route("/api/agent/revoke", post(crate::agent_proxy::revoke_proxy))
         .route("/api/agent/files", get(crate::agent_proxy::files_proxy))
         .route("/ws/exec", get(crate::agent_proxy::exec_stream_proxy))
         .route("/ws/file", get(crate::agent_proxy::file_stream_proxy))
@@ -287,7 +285,7 @@ async fn render_template(
     state: &AppState,
 ) -> Result<Html<String>, AppError> {
     let hostname = &state.hostname;
-    let profile: UserProfile = session.get(SESSION_KEY).await?.unwrap_or_default();
+    let profile: UserProfile = session.get(PROFILE_KEY).await?.unwrap_or_default();
 
     if profile.subject.is_empty() {
         // Redirect to home if not logged in, or show friendly message?
@@ -318,88 +316,71 @@ async fn render_template(
     // Replace Variables
     let body = full_body
         .replace("{{subject}}", &profile.subject)
-        .replace("{{id_token}}", &profile.id_token)
-        .replace("{{public_key}}", &profile.public_key_pem)
         .replace("{{hostname}}", hostname)
         .replace("{{agent_url}}", &state.config.agent_url);
 
     Ok(Html(body))
 }
 
-/// Initiates the OIDC login flow.
+/// Initiates a viewer login (the browsing session). Signing never uses
+/// this token; it has its own per-signature login in `web_sign`.
 async fn login_handler(
     State(state): State<AppState>,
     session: Session,
 ) -> Result<Redirect, AppError> {
-    // 1. Generate ephemeral keypair for signing. Lives entirely in the
-    //    server-side session; we are loopback-only so there is no cross-host
-    //    exposure to encrypt against.
-    let signing_key = SigningKey::random(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
-    let signing_key_hex = hex::encode(signing_key.to_bytes());
+    let viewer_client_id = viewer_client_id(&state)?;
+    let oidc_state = crate::oidc_client::random_token();
+    let nonce = crate::oidc_client::random_token();
+    let (pkce_challenge, pkce_verifier) = crate::oidc_client::pkce_pair();
 
-    // 2. Hash public key to create the OIDC nonce (binds the IdP-issued JWT
-    //    to this specific ephemeral key — the core OIDC+ephemeral pattern).
-    let public_key_pem = verifying_key
-        .to_public_key_pem(spki::der::pem::LineEnding::LF)
-        .map_err(|e| AppError::Internal(format!("Failed to encode public key to PEM: {e}")))?;
-    let oidc_nonce = hex::encode(Sha256::digest(public_key_pem.as_bytes()));
+    // Starting a login doesn't touch an existing profile; the callback
+    // replaces it only once the new login succeeds.
+    session
+        .insert(
+            LOGIN_FLOW_KEY,
+            LoginFlow {
+                state: oidc_state.clone(),
+                pkce_verifier,
+                nonce: nonce.clone(),
+            },
+        )
+        .await?;
 
-    // 3. Generate OIDC state and PKCE
-    let oidc_state = {
-        let mut state_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut state_bytes);
-        hex::encode(state_bytes)
-    };
+    let url = crate::oidc_client::authorize_url(
+        &state.oidc_metadata,
+        &crate::oidc_client::AuthorizeParams {
+            client_id: viewer_client_id,
+            redirect_uri: &state.config.get_redirect_uri(),
+            state: &oidc_state,
+            nonce: &nonce,
+            pkce_challenge: &pkce_challenge,
+            reauth: None,
+        },
+    )
+    .map_err(AppError::Internal)?;
+    Ok(Redirect::to(url.as_ref()))
+}
 
-    let (pkce_challenge, pkce_verifier) = pkce::generate_pkce_challenge();
-
-    // 4. Store flow state in session.
-    let flow_state = OidcFlowState {
-        pkce_verifier,
-        state: oidc_state.clone(),
-        ephemeral_public_key_pem: public_key_pem,
-        signing_key_hex,
-    };
-    session.insert(SESSION_KEY, flow_state).await?;
-    tracing::info!("Login: Session state inserted. Redirecting to auth provider.");
-
-    // 5. Build the redirect URL.
-    let mut auth_url: url::Url = state
-        .oidc_metadata
-        .authorization_endpoint
-        .parse()
-        .map_err(|_| AppError::Internal("Invalid authorization_endpoint URL".to_string()))?;
-    auth_url
-        .query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", &state.config.oidc.client_id)
-        .append_pair("redirect_uri", &state.config.get_redirect_uri())
-        .append_pair("scope", "openid groups user_profile")
-        .append_pair("state", &oidc_state)
-        .append_pair("nonce", &oidc_nonce)
-        .append_pair("code_challenge", &pkce_challenge)
-        .append_pair("code_challenge_method", "S256");
-
-    Ok(Redirect::to(auth_url.as_ref()))
+fn viewer_client_id(state: &AppState) -> Result<&str, AppError> {
+    state
+        .config
+        .oidc
+        .viewer_client_id
+        .as_deref()
+        .ok_or_else(|| AppError::Config("oidc.viewer_client_id is not set".into()))
 }
 
 #[derive(Debug, Deserialize)]
-struct CallbackQuery {
-    code: Option<String>,
-    state: String,
-    error: Option<String>,
-    error_description: Option<String>,
+pub(crate) struct CallbackQuery {
+    pub(crate) code: Option<String>,
+    pub(crate) state: String,
+    pub(crate) error: Option<String>,
+    pub(crate) error_description: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
-struct TokenResponse {
-    id_token: String,
-}
-
-// Claims imported from security module
-
-/// Handles the OIDC callback after the user authenticates with Vault.
+/// Handles every OIDC callback. Both clients share the redirect URI; the
+/// `state` decides whether this completes a viewer login or a pending
+/// signature. Either way the `state` must be one this session issued.
 async fn callback_handler(
     State(state): State<AppState>,
     Query(query): Query<CallbackQuery>,
@@ -412,229 +393,75 @@ async fn callback_handler(
         "Callback: Received OIDC callback"
     );
 
-    // 0. Check for OIDC errors
-    if let Some(err) = &query.error {
-        let desc = query
-            .error_description
-            .as_deref()
-            .unwrap_or("No description");
-        return Err(AppError::Auth(format!("OIDC Error: {err} - {desc}")));
+    if crate::web_sign::is_pending(&session, &query.state).await? {
+        return crate::web_sign::complete(&state, &session, query).await;
     }
 
+    let flow: LoginFlow = session
+        .get(LOGIN_FLOW_KEY)
+        .await?
+        .ok_or_else(|| AppError::Auth("No login in progress. Please login again.".into()))?;
+    if query.state != flow.state {
+        return Err(AppError::Auth("OIDC state mismatch (CSRF detection)".into()));
+    }
+    session.remove::<LoginFlow>(LOGIN_FLOW_KEY).await?;
+
+    if let Some(err) = &query.error {
+        let desc = query.error_description.as_deref().unwrap_or("No description");
+        return Err(AppError::Auth(format!("OIDC Error: {err} - {desc}")));
+    }
     let code = query
         .code
         .as_deref()
         .ok_or(AppError::Auth("Missing authorization code".into()))?;
 
-    // 1. Get OIDC flow state from session and validate CSRF token
-    let flow_state: OidcFlowState = match session.get(SESSION_KEY).await? {
-        Some(s) => s,
-        None => {
-            tracing::error!("Callback: No session state found in session store!");
-            return Err(AppError::Auth(
-                "No session state found. Please login again.".into(),
-            ));
-        }
-    };
-    tracing::info!("Callback: Session found. Validating state.");
-    if query.state != flow_state.state {
-        return Err(AppError::Auth(
-            "OIDC state mismatch (CSRF detection)".into(),
-        ));
-    }
+    let viewer_client_id = viewer_client_id(&state)?;
+    let id_token = crate::oidc_client::exchange_code(
+        &state.http_client,
+        &state.oidc_metadata,
+        viewer_client_id,
+        &state.config.get_redirect_uri(),
+        code,
+        &flow.pkce_verifier,
+    )
+    .await
+    .map_err(AppError::Auth)?;
+    let claims = crate::oidc_client::validate_id_token(
+        &id_token,
+        &state.jwks,
+        &state.config.oidc.issuer_url,
+        viewer_client_id,
+        &flow.nonce,
+        None,
+    )
+    .map_err(AppError::Auth)?;
 
-    // 2. Exchange authorization code for an ID token
-    let token_response: TokenResponse = state
-        .http_client
-        .post(&state.oidc_metadata.token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", &state.config.get_redirect_uri()),
-            ("client_id", &state.config.oidc.client_id),
-            ("code_verifier", &flow_state.pkce_verifier),
-        ])
-        .send()
-        .await?
-        .json()
+    let subject = claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .ok_or(AppError::Auth("ID token has no sub".into()))?
+        .to_string();
+    let username = claims
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&subject)
+        .to_string();
+
+    // New session id at privilege change: a session id planted before login
+    // (e.g. by another local app) must not end up holding the profile.
+    session.cycle_id().await?;
+    session
+        .insert(
+            PROFILE_KEY,
+            UserProfile {
+                subject,
+                username,
+                viewer_id_token: id_token,
+            },
+        )
         .await?;
 
-    // 3. Decode and validate the ID token
-    let header = jsonwebtoken::decode_header(&token_response.id_token)?;
-    let kid = header
-        .kid
-        .ok_or(AppError::Auth("Token missing 'kid' in header".into()))?;
-    let jwk = state
-        .jwks
-        .find(&kid)
-        .ok_or(AppError::Auth("No matching JWK found for token".into()))?;
-    let mut validation = jsonwebtoken::Validation::new(header.alg);
-    validation.set_audience(&[&state.config.oidc.client_id]);
-    validation.set_issuer(&[&state.config.oidc.issuer_url]);
-
-    let token_data = jsonwebtoken::decode::<Claims>(
-        &token_response.id_token,
-        &jsonwebtoken::DecodingKey::from_jwk(jwk)?,
-        &validation,
-    )?;
-
-    // 4. *** THE CORE VERIFICATION STEP ***
-    // Verify the nonce in the token matches the hash of our ephemeral public key.
-    let expected_nonce = hex::encode(Sha256::digest(
-        flow_state.ephemeral_public_key_pem.as_bytes(),
-    ));
-    if token_data.claims.nonce != expected_nonce {
-        return Err(AppError::Auth(
-            "Nonce mismatch! This token is not bound to our ephemeral key.".into(),
-        ));
-    }
-
-    // 5. Success! Upgrade the session to a logged-in user profile.
-    let user_profile = UserProfile {
-        subject: token_data.claims.sub,
-        id_token: token_response.id_token,
-        signing_key_hex: flow_state.signing_key_hex,
-        public_key_pem: flow_state.ephemeral_public_key_pem,
-    };
-    // New session id at privilege change: a session id planted before login
-    // (e.g. by another local app) must not end up holding the signing key.
-    session.cycle_id().await?;
-    session.insert(SESSION_KEY, user_profile).await?;
-
     Ok(Redirect::to("/ui"))
-}
-
-#[derive(Deserialize)]
-struct SignRequest {
-    command: serde_json::Value,
-    #[serde(default)]
-    operator_requires: Option<crate::security::OperatorConstraint>,
-}
-
-#[derive(Deserialize)]
-struct CosignRequest {
-    approver: crate::security::ApproverBundle,
-}
-
-/// Load the session's ephemeral signing key.
-///
-/// The key is stored raw in the server-side session (see `OidcFlowState`
-/// and `UserProfile`). The web tier is loopback-only so there is no
-/// cross-host exposure to encrypt at rest against.
-pub(crate) fn load_signing_key(profile: &UserProfile) -> Result<SigningKey, AppError> {
-    let bytes = hex::decode(&profile.signing_key_hex)
-        .map_err(|_| AppError::Internal("Invalid signing key hex".into()))?;
-    SigningKey::from_bytes(GenericArray::from_slice(&bytes))
-        .map_err(|_| AppError::Internal("Invalid signing key bytes".into()))
-}
-
-/// Approver signs a command + optional `operator_requires` constraint.
-/// Returns an `ExecutionBundle` with `operator: null`. If the approver also
-/// plans to execute themselves immediately (same-person + fresh TSA), this
-/// bundle can be submitted directly to the agent.
-async fn sign_handler(
-    State(state): State<AppState>,
-    session: Session,
-    axum::Json(req): axum::Json<SignRequest>,
-) -> Result<axum::Json<crate::security::ExecutionBundle>, AppError> {
-    let profile: UserProfile = session
-        .get(SESSION_KEY)
-        .await?
-        .ok_or(AppError::Auth("Not logged in".into()))?;
-
-    let signing_key = load_signing_key(&profile)?;
-
-    let canonical =
-        crate::security::canonical_approver_payload(&req.command, &req.operator_requires);
-    let signature: p256::ecdsa::Signature = signing_key.sign(canonical.as_bytes());
-    let signature_bytes = signature.to_bytes();
-
-    let mut data_to_timestamp = signature_bytes.to_vec();
-    data_to_timestamp.extend_from_slice(profile.id_token.as_bytes());
-    let timestamp_token_bytes = crate::tsa::request_timestamp(
-        &state.http_client,
-        &state.config.timestamp_authority.url,
-        &data_to_timestamp,
-    )
-    .await
-    .map_err(|e| AppError::Internal(format!("TSA Error: {e}")))?;
-
-    Ok(axum::Json(crate::security::ExecutionBundle {
-        approver: crate::security::ApproverBundle {
-            command: req.command,
-            operator_requires: req.operator_requires,
-            signature: hex::encode(signature_bytes),
-            id_token: profile.id_token,
-            public_key: profile.public_key_pem,
-            timestamp_token: hex::encode(timestamp_token_bytes),
-        },
-        operator: None,
-    }))
-}
-
-/// Operator co-signs an existing approver bundle. Produces an `ExecutionBundle`
-/// ready to submit to the agent. No validity check is done here — the agent is
-/// the enforcement point. The server simply signs `approver_sig || operator_pubkey`.
-async fn cosign_handler(
-    State(state): State<AppState>,
-    session: Session,
-    axum::Json(req): axum::Json<CosignRequest>,
-) -> Result<axum::Json<crate::security::ExecutionBundle>, AppError> {
-    let profile: UserProfile = session
-        .get(SESSION_KEY)
-        .await?
-        .ok_or(AppError::Auth("Not logged in".into()))?;
-
-    if req.approver.operator_requires.is_none() {
-        return Err(AppError::Forbidden(
-            "This approval is self-execute only and cannot be co-signed; ask the approver \
-             for a delegated approval"
-                .into(),
-        ));
-    }
-
-    let signing_key = load_signing_key(&profile)?;
-
-    let mut payload = req.approver.signature.as_bytes().to_vec();
-    payload.extend_from_slice(profile.public_key_pem.as_bytes());
-    let signature: p256::ecdsa::Signature = signing_key.sign(&payload);
-    let signature_bytes = signature.to_bytes();
-
-    let mut data_to_timestamp = signature_bytes.to_vec();
-    data_to_timestamp.extend_from_slice(profile.id_token.as_bytes());
-    let timestamp_token_bytes = crate::tsa::request_timestamp(
-        &state.http_client,
-        &state.config.timestamp_authority.url,
-        &data_to_timestamp,
-    )
-    .await
-    .map_err(|e| AppError::Internal(format!("TSA Error: {e}")))?;
-
-    Ok(axum::Json(crate::security::ExecutionBundle {
-        operator: Some(crate::security::OperatorCosign {
-            approver_sig: req.approver.signature.clone(),
-            signature: hex::encode(signature_bytes),
-            id_token: profile.id_token,
-            public_key: profile.public_key_pem,
-            timestamp_token: hex::encode(timestamp_token_bytes),
-        }),
-        approver: req.approver,
-    }))
-}
-
-/// A simple PKCE implementation.
-pub(crate) mod pkce {
-    use super::{Digest, OsRng, RngCore, Sha256};
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-
-    pub fn generate_pkce_challenge() -> (String, String) {
-        let mut bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut bytes);
-        let verifier = URL_SAFE_NO_PAD.encode(&bytes);
-        let digest = Sha256::digest(verifier.as_bytes());
-        let challenge = URL_SAFE_NO_PAD.encode(&digest);
-        (challenge, verifier)
-    }
 }
 
 // Custom (de)serialization for session data
@@ -657,16 +484,13 @@ async fn get_commands_handler(
     State(state): State<AppState>,
     session: Session,
 ) -> Result<axum::Json<Vec<crate::config::CommandConfig>>, AppError> {
-    let profile: UserProfile = session
-        .get(SESSION_KEY)
-        .await?
-        .ok_or(AppError::Auth("Not logged in".into()))?;
+    let profile = require_profile(&session).await?;
 
     // Query OPA for "view_docs" permission
     let check_input = json!({
         "input": {
             "action": "view_docs",
-            "jwt": profile.id_token
+            "jwt": profile.viewer_id_token
         }
     });
 

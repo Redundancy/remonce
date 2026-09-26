@@ -37,6 +37,14 @@ Currently gated settings:
 
 Loopback HTTP for OIDC (e.g., local Vault in dev) is **not** gated — it stays fine without the flag.
 
+A few settings are refused outright, even with `--insecure`, because they are wrong rather than risky:
+
+| Setting | Why it's refused |
+|---------|------------------|
+| `oidc.client_id` empty | There is no signing client |
+| `oidc.viewer_client_id` equal to `oidc.client_id` (or empty) | Every signing token would also be a file/log viewing bearer token |
+| `oidc.signing_max_age` above 5 minutes | Agents reject logins older than that, so no signature could verify |
+
 ### Web tier settings (`remonce web`)
 
 Loopback-only binding and storage paths.
@@ -53,13 +61,13 @@ logs_dir = "logs"
 
 # Agent the web UI talks to. The browser never contacts the agent directly:
 # the signer proxies /api/agent/* and the /ws/* log streams to this URL over
-# TLS. Must be https://.
+# TLS, and submits revocations there. Must be https://.
 # Default: "https://localhost:10022"
 agent_url = "https://agent.example.com:10022"
 
 # Other agents the UI may be pointed at. The agent box in the UI can only
 # select agent_url or one of these; any other URL is refused, because the
-# signer sends the user's ID token and signatures to whichever agent is used.
+# signer sends the user's viewer token and signatures to whichever agent is used.
 allowed_agent_urls = ["https://db01.example.com:10022", "https://web01.example.com:10022"]
 
 # Optional: PEM file with extra CA roots trusted when the signer connects to
@@ -131,7 +139,10 @@ cache_dir = "./certs/acme-cache"
 
 ### Identity (OIDC)
 
-These settings connect the agent to your OIDC provider (Vault, Keycloak, etc.).
+These settings connect the signer, agent and revocation service to your OIDC provider (Vault, Keycloak, etc.). Remonce uses **two clients**:
+
+- the **signing** client (`client_id`): every approval, cosign and revocation is a fresh login to it, with a new ephemeral key bound through the `nonce` and forced re-authentication. Agents accept its tokens only on the signing path.
+- the **viewer** client (`viewer_client_id`): the ordinary login for browsing. Its tokens are bearer credentials that agents accept only on the read-only file and log endpoints.
 
 ```toml
 [oidc]
@@ -139,14 +150,32 @@ These settings connect the agent to your OIDC provider (Vault, Keycloak, etc.).
 # Must match the 'iss' claim in your JWTs.
 issuer_url = "http://127.0.0.1:8200/v1/identity/oidc/provider/vaultprovider"
 
-# The Client ID registered with the OIDC provider.
-client_id = "your_client_id"
+# The signing client.
+client_id = "your_signing_client_id"
 
-# Redirect URI for the OIDC callback.
+# The viewer client. Must differ from client_id. Required by `remonce web`;
+# an agent without it disables file and log viewing.
+viewer_client_id = "your_viewer_client_id"
+
+# max_age sent on signing logins. Default "1s": always re-authenticate
+# (Vault rejects max_age=0). At most 5 minutes.
+#signing_max_age = "1s"
+
+# Also send prompt=login on signing logins, for IdPs that ignore max_age.
+#signing_prompt_login = false
+
+# Redirect URI for the OIDC callback, shared by both clients.
 # Ensure this matches exactly what is registered in your OIDC provider.
 redirect_uri = "http://localhost:8080/oidc/callback"
 ```
 
+#### IdP requirements
+
+- **Two clients**, both allowed to use the redirect URI and both permitted by the provider.
+- **A single audience**: each token's `aud` must be exactly its client ID (a string, or a one-element array); `azp`, if present, must match. Tokens issued to several audiences are rejected, so don't add audience mappers to these clients.
+- **`iat` and `auth_time`** in the ID token. OIDC requires `auth_time` whenever `max_age` is requested. Agents require a signing token to be timestamped within 5 minutes of its `iat`, and its `auth_time` to be within 5 minutes before `iat`.
+- **`max_age` honored**, or `signing_prompt_login = true`. The signer checks a returned signing token and fails the flow with a clear error if the IdP didn't actually re-authenticate.
+- **Token lifetime is up to you.** A signature's validity is measured from the login, not the token's `exp`, so long-lived tokens no longer widen any window. Keep viewer-token lifetimes short, though: those are bearer credentials.
 ### Authorization (OPA)
 
 These settings determine how the agent checks permissions.
@@ -165,8 +194,9 @@ Policy decisions requested by the agent (`input.action`):
 | `revoke` | Someone other than the approver revokes an approval | approver identity, revoker as `operator` |
 | `read_file` | Streaming an allowed file | `jwt`, `file` |
 | `view_execution` | Streaming an execution's output log | `jwt`, `execution_id` |
+| `view_docs` | Listing commands in the signer UI | `jwt` |
 
-The agent's file and log-stream endpoints take the caller's ID token as an `Authorization: Bearer` header (never a query parameter). The web tier attaches it when proxying.
+The agent's file and log-stream endpoints take the caller's **viewer** ID token as an `Authorization: Bearer` header (never a query parameter), and reject tokens for any other audience. The signer attaches it when proxying.
 
 ### Security & TSA (RFC 3161)
 
@@ -283,9 +313,9 @@ Remonce separates **authorization freshness** (approver) from **execution freshn
 | Setting | Default | Controls |
 |---------|---------|----------|
 | `approver_max_validity` | 3 days | How long a signed approval stays usable. A pre-authorized command can sit until the NOC picks it up, up to this limit. |
-| `operator_max_validity` | 10 minutes | How recent the executor's signature must be. In a delegated flow this is the operator's cosign TSA timestamp; in self-execute it's the approver's own. |
+| `operator_max_validity` | 10 minutes | How recent the executor's signature must be. In a delegated flow this is the operator's cosign; in self-execute it's the approver's own. |
 
-Because anyone holding a signature and its ID token can re-timestamp it until the token expires, a signature effectively stays fresh until `token_exp + max_validity`. The replay cache and revocation list size their retention to match, and short ID token lifetimes (5–15 minutes) keep the window tight.
+Both windows are measured from the signing login — the ID token's IdP-signed `iat` — as well as the TSA time. A TSA will timestamp any bytes, so a holder can always get a fresh timestamp over an old signature; the agent therefore also requires the TSA time to be within 5 minutes of `iat`, which a re-timestamp can't satisfy. A signature is usable until `iat + max_validity`, whatever lifetime the IdP gives its tokens, and the replay cache and revocation list keep their entries exactly that long.
 
 **Self-execute vs delegated**: when the approver submits their own bundle immediately (no operator cosign), they must be within `operator_max_validity`. If you want longer self-execute windows, raise `operator_max_validity` — but remember this also lengthens the replay-cache window and the operator-side freshness bound.
 
@@ -328,7 +358,7 @@ remonce cosign --bundle approval.json --submit
 remonce cosign -b approval.json -o execution-bundle.json
 ```
 
-The command reads `[oidc]` and `agent_url` / `agent_ca_path` from `config.toml`. It generates a fresh ephemeral keypair, runs a browser-based OIDC authorization-code flow (PKCE, with the nonce bound to the ephemeral key — same pattern as the web UI), obtains an RFC 3161 timestamp on the cosignature, and produces an ExecutionBundle.
+The command reads `[oidc]` and `agent_url` / `agent_ca_path` from `config.toml`. It generates a fresh ephemeral keypair, runs a browser-based OIDC authorization-code flow against the signing client (PKCE, the nonce bound to the ephemeral key, and forced re-authentication — same pattern as the web UI), obtains an RFC 3161 timestamp on the cosignature, and produces an ExecutionBundle.
 
 - `--agent <url>` overrides `agent_url` for `--submit`. Must be `https://`.
 - The OIDC redirect listener binds the host/port from `oidc.redirect_uri`. If `remonce web` is already running on that port, use its Cosign page instead.
@@ -346,11 +376,12 @@ remonce revoke --bundle approval.json
 remonce revoke -b approval.json --agent https://agent.example.com:10022
 ```
 
-The same flow is available from the web UI's Execute page ("Revoke Approval" button) and via `POST /api/agent/revoke` on the web tier.
+The same flow is available from the web UI's Execute page ("Revoke Approval" button), which runs its own re-authenticating login and submits the revocation to the agent.
 
 How it works:
 
-- The revoker generates a fresh ephemeral keypair and runs the same nonce-bound OIDC login as cosigning, then signs a domain-separated payload (`REMONCE-REVOKE:` prefix) over the approver's signature — so a cosignature can never be replayed as a revocation, or vice versa.
+- The revoker generates a fresh ephemeral keypair and runs the same nonce-bound, re-authenticating OIDC login as cosigning, then signs a domain-separated payload (`REMONCE-REVOKE:` prefix) over the approver's signature — so a cosignature can never be replayed as a revocation, or vice versa.
+- The revocation is recorded against the approval's **key binding** (`SHA256` of the approver's public key, as attested in the token's `nonce`), not its signature bytes — so a malleated copy of the signature can't slip past it.
 - The agent first re-verifies the approver bundle itself; only genuine approvals can be pinned to the revocation list (prevents cache poisoning).
 - **Self-revocation** (revoker has the same OIDC `sub` as the approver) is always allowed. **Third-party revocation** requires an OPA decision with `input.action == "revoke"` (see `policy/authz.rego`).
 - The revoker attestation must be fresh within `operator_max_validity`.
@@ -385,9 +416,17 @@ revocation_service_url = "https://revocations.example.com:10023"
 Semantics:
 
 - The service exposes the same `POST /revoke` endpoint as the agent and performs the **same full verification** (approver bundle genuineness, revoker attestation, self-vs-third-party OPA check) — it cannot be poisoned with unverified entries. `remonce revoke --agent https://revocations...` can therefore target it directly.
-- When `revocation_service_url` is set, the agent checks `GET /revoked/{sig}` before every execution and a revocation submitted to any agent is forwarded to the service.
+- When `revocation_service_url` is set, the agent checks `GET /revoked/{key_binding}` (64 lowercase hex characters) before every execution and a revocation submitted to any agent is forwarded to the service.
 - **Fail-closed**: if the service is configured but unreachable, the agent denies execution (`Revocation Check Failed`). A configured revocation service must be available — there is deliberately no fail-open mode.
 - Revocations expire from the store when the underlying approval would have aged out of `approver_max_validity` anyway; expired entries are compacted out of the JSONL file on service restart.
 - The service reads the same `config.toml` sections as the agent (`[oidc]`, `[timestamp_authority]`, `[[commands]]`, `opa_url`), since it performs the same verification. It also accepts revocations for commands missing from its own `[[commands]]` (verified with default windows; third parties judged by the default OPA rule), since it serves agents whose command sets it may not mirror.
-- `retention` must be at least the longest `approver_max_validity` any agent allows; each revocation is kept until the revoked approval's token expiry plus the larger of the two.
+- `retention` must be at least the longest `approver_max_validity` any agent allows; each revocation is kept until the revoked approval's `iat` plus the larger of the two.
 - Writes are fsync'd before the service acknowledges them. A torn final line left by a crash is ignored at startup; corruption anywhere else refuses to start (agents then fail closed).
+
+## Upgrading to per-signature logins
+
+This release changes what agents accept, with no compatibility mode:
+
+1. **Register two OIDC clients.** Create a new signing client (or reuse the old one) and a new viewer client, add both to the provider, and set `client_id` and `viewer_client_id`. See "IdP requirements" above; for Vault, [docs/idp/VAULT.md](docs/idp/VAULT.md).
+2. **Upgrade the signer, CLI, agents and revocation service together.** Bundles signed by older signers lack the re-authentication evidence (and may carry high-S signatures), so agents reject them. Re-sign any outstanding approvals.
+3. **Archive the revocation log.** The revocation service now records key bindings instead of signature hex, and refuses to start on an old `revocations.jsonl`. Move it aside; approvals it listed can't pass the new verification anyway.

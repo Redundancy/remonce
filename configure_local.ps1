@@ -5,16 +5,20 @@ Write-Host "Running Terraform Apply..."
 
 Write-Host "Retrieving Terraform Outputs..."
 $clientId = .\bin\terraform.exe output -raw oidc_client_id
+$viewerClientId = .\bin\terraform.exe output -raw oidc_viewer_client_id
 $issuerUrl = .\bin\terraform.exe output -raw oidc_provider_issuer_url
 
-Write-Host "Found Client ID: $clientId"
+Write-Host "Found signing Client ID: $clientId"
+Write-Host "Found viewer Client ID: $viewerClientId"
 Write-Host "Found Issuer URL: $issuerUrl"
 
 $configPath = "config.toml"
 $configContent = Get-Content $configPath
 
-# Update Client ID
-$configContent = $configContent -replace 'client_id = ".*"', "client_id = ""$clientId"""
+# Update Client IDs. Anchored so the signing pattern can't also match
+# (and clobber) viewer_client_id.
+$configContent = $configContent -replace '^client_id = ".*"', "client_id = ""$clientId"""
+$configContent = $configContent -replace '^viewer_client_id = ".*"', "viewer_client_id = ""$viewerClientId"""
 
 # Update Issuer URL
 $configContent = $configContent -replace 'issuer_url = ".*"', "issuer_url = ""$issuerUrl"""

@@ -2,20 +2,13 @@
 //!
 //! Reads an approver bundle (JSON or the base64 token the UI produces),
 //! authenticates the operator via an OIDC authorization-code flow with a
-//! loopback redirect (PKCE + nonce bound to a fresh ephemeral key), co-signs,
-//! timestamps, and emits a ready-to-submit `ExecutionBundle` — optionally
-//! POSTing it straight to the agent.
+//! loopback redirect (PKCE + nonce bound to a fresh ephemeral key, forced
+//! re-authentication), co-signs, timestamps, and emits a ready-to-submit
+//! `ExecutionBundle` — optionally POSTing it straight to the agent.
 
 use crate::config::Config;
 use crate::security::{ApproverBundle, ExecutionBundle, OperatorCosign};
-use crate::web::OidcMetadata;
 use base64::Engine as _;
-use p256::{
-    ecdsa::{SigningKey, signature::Signer},
-    pkcs8::EncodePublicKey,
-};
-use rand::{RngCore, rngs::OsRng};
-use sha2::{Digest, Sha256};
 
 pub struct CosignArgs {
     /// Path to the approver bundle, or "-" for stdin.
@@ -65,41 +58,30 @@ pub async fn run(args: CosignArgs, insecure: bool) -> Result<(), Error> {
         );
     }
 
-    // 2. Ephemeral key + OIDC login (nonce-bound).
-    let signing_key = SigningKey::random(&mut OsRng);
-    let public_key_pem = signing_key
-        .verifying_key()
-        .to_public_key_pem(spki::der::pem::LineEnding::LF)
-        .map_err(|e| format!("Failed to encode public key: {e}"))?;
-
-    let id_token = oidc_login(&config, &public_key_pem).await?;
+    // 2. Ephemeral key + its own OIDC login (nonce-bound, re-authenticated).
+    let ephemeral = crate::signing::new_ephemeral()?;
+    let id_token = oidc_login(&config, &ephemeral.nonce).await?;
     eprintln!("OIDC login complete.");
 
-    // 3. Cosign: signature over (approver_sig_hex || operator_pubkey_pem).
-    let mut payload = approver.signature.as_bytes().to_vec();
-    payload.extend_from_slice(public_key_pem.as_bytes());
-    let signature: p256::ecdsa::Signature = signing_key.sign(&payload);
-    let signature_bytes = signature.to_bytes();
-
-    // 4. TSA timestamp over (sig_bytes || id_token).
-    let http_client = crate::http_client();
-    let mut data_to_timestamp = signature_bytes.to_vec();
-    data_to_timestamp.extend_from_slice(id_token.as_bytes());
-    let timestamp_token_bytes = crate::tsa::request_timestamp(
-        &http_client,
+    // 3. Cosign over (approver_sig_hex || operator_pubkey_pem), timestamped.
+    let payload = crate::security::operator_payload(&approver.signature, &ephemeral.public_key_pem);
+    let a = crate::signing::attest(
+        &crate::http_client(),
         &config.timestamp_authority.url,
-        &data_to_timestamp,
+        &ephemeral.key,
+        &ephemeral.public_key_pem,
+        id_token,
+        &payload,
     )
-    .await
-    .map_err(|e| format!("TSA error: {e}"))?;
+    .await?;
 
     let bundle = ExecutionBundle {
         operator: Some(OperatorCosign {
             approver_sig: approver.signature.clone(),
-            signature: hex::encode(signature_bytes),
-            id_token,
-            public_key: public_key_pem,
-            timestamp_token: hex::encode(timestamp_token_bytes),
+            signature: a.signature,
+            id_token: a.id_token,
+            public_key: a.public_key,
+            timestamp_token: a.timestamp_token,
         }),
         approver,
     };
@@ -199,37 +181,29 @@ pub async fn run_revoke(args: RevokeArgs, insecure: bool) -> Result<(), Error> {
     let command_str = serde_json::to_string_pretty(&approver.command)?;
     eprintln!("Approver bundle loaded. Command to revoke:\n{command_str}");
 
-    let signing_key = SigningKey::random(&mut OsRng);
-    let public_key_pem = signing_key
-        .verifying_key()
-        .to_public_key_pem(spki::der::pem::LineEnding::LF)
-        .map_err(|e| format!("Failed to encode public key: {e}"))?;
-
-    let id_token = oidc_login(&config, &public_key_pem).await?;
+    let ephemeral = crate::signing::new_ephemeral()?;
+    let id_token = oidc_login(&config, &ephemeral.nonce).await?;
     eprintln!("OIDC login complete.");
 
-    let payload = crate::security::revocation_payload(&approver.signature, &public_key_pem);
-    let signature: p256::ecdsa::Signature = signing_key.sign(&payload);
-    let signature_bytes = signature.to_bytes();
-
-    let http_client = crate::http_client();
-    let mut data_to_timestamp = signature_bytes.to_vec();
-    data_to_timestamp.extend_from_slice(id_token.as_bytes());
-    let timestamp_token_bytes = crate::tsa::request_timestamp(
-        &http_client,
+    let payload =
+        crate::security::revocation_payload(&approver.signature, &ephemeral.public_key_pem);
+    let a = crate::signing::attest(
+        &crate::http_client(),
         &config.timestamp_authority.url,
-        &data_to_timestamp,
+        &ephemeral.key,
+        &ephemeral.public_key_pem,
+        id_token,
+        &payload,
     )
-    .await
-    .map_err(|e| format!("TSA error: {e}"))?;
+    .await?;
 
     let bundle = crate::security::RevocationBundle {
         approver,
         revoker: crate::security::RevokerAttestation {
-            signature: hex::encode(signature_bytes),
-            id_token,
-            public_key: public_key_pem,
-            timestamp_token: hex::encode(timestamp_token_bytes),
+            signature: a.signature,
+            id_token: a.id_token,
+            public_key: a.public_key,
+            timestamp_token: a.timestamp_token,
         },
     };
 
@@ -249,31 +223,19 @@ pub async fn run_revoke(args: RevokeArgs, insecure: bool) -> Result<(), Error> {
     }
 }
 
-/// Authorization-code flow with PKCE and the nonce bound to the ephemeral key.
-/// Binds the configured loopback `redirect_uri` to receive the callback, prints
-/// the authorization URL for the operator to open, and returns the validated
-/// ID token.
-async fn oidc_login(config: &Config, public_key_pem: &str) -> Result<String, Error> {
+/// Authorization-code flow against the signing client, with PKCE, the nonce
+/// bound to the ephemeral key, and forced re-authentication. Binds the
+/// configured loopback `redirect_uri` to receive the callback, prints the
+/// authorization URL for the operator to open, and returns the validated ID
+/// token.
+async fn oidc_login(config: &Config, nonce: &str) -> Result<String, Error> {
     let http_client = crate::http_client();
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        config.oidc.issuer_url
-    );
-    let metadata: OidcMetadata = http_client.get(&discovery_url).send().await?.json().await?;
-    let jwks: jsonwebtoken::jwk::JwkSet = http_client
-        .get(&metadata.jwks_uri)
-        .send()
-        .await?
-        .json()
-        .await?;
+    let (metadata, jwks) = crate::oidc_client::discover(&http_client, &config.oidc.issuer_url)
+        .await
+        .map_err(|e| -> Error { e.into() })?;
 
-    let oidc_nonce = hex::encode(Sha256::digest(public_key_pem.as_bytes()));
-    let oidc_state = {
-        let mut bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut bytes);
-        hex::encode(bytes)
-    };
-    let (pkce_challenge, pkce_verifier) = crate::web::pkce::generate_pkce_challenge();
+    let oidc_state = crate::oidc_client::random_token();
+    let (pkce_challenge, pkce_verifier) = crate::oidc_client::pkce_pair();
 
     let redirect_uri = config.get_redirect_uri();
     let redirect_parsed: url::Url = redirect_uri.parse()?;
@@ -298,17 +260,18 @@ async fn oidc_login(config: &Config, public_key_pem: &str) -> Result<String, Err
         .into());
     }
 
-    let mut auth_url: url::Url = metadata.authorization_endpoint.parse()?;
-    auth_url
-        .query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", &config.oidc.client_id)
-        .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("scope", "openid groups user_profile")
-        .append_pair("state", &oidc_state)
-        .append_pair("nonce", &oidc_nonce)
-        .append_pair("code_challenge", &pkce_challenge)
-        .append_pair("code_challenge_method", "S256");
+    let auth_url = crate::oidc_client::authorize_url(
+        &metadata,
+        &crate::oidc_client::AuthorizeParams {
+            client_id: &config.oidc.client_id,
+            redirect_uri: &redirect_uri,
+            state: &oidc_state,
+            nonce,
+            pkce_challenge: &pkce_challenge,
+            reauth: Some(crate::oidc_client::Reauth::from_config(&config.oidc)),
+        },
+    )
+    .map_err(|e| -> Error { e.into() })?;
 
     // Bind the redirect address. This requires `remonce web` to not be running
     // on the same port — the CLI takes its place for the duration of the login.
@@ -317,51 +280,41 @@ async fn oidc_login(config: &Config, public_key_pem: &str) -> Result<String, Err
         .map_err(|e| {
             format!(
                 "Cannot bind redirect address {host}:{port} ({e}). \
-                 If `remonce web` is running, use its Cosign page instead."
+                 If `remonce web` is running, use its pages instead."
             )
         })?;
 
-    eprintln!("\nOpen this URL in a browser to authenticate:\n\n  {auth_url}\n");
+    let started_at = time::OffsetDateTime::now_utc();
+    eprintln!(
+        "\nEach signature needs its own login: open this URL in a browser and \
+         re-authenticate:\n\n  {auth_url}\n"
+    );
     eprintln!("Waiting for the OIDC callback on {host}:{port} ...");
 
     let code = wait_for_callback(listener, &callback_path, &oidc_state).await?;
 
-    // Exchange the code.
-    #[derive(serde::Deserialize)]
-    struct TokenResponse {
-        id_token: String,
-    }
-    let token_response: TokenResponse = http_client
-        .post(&metadata.token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("redirect_uri", &redirect_uri),
-            ("client_id", &config.oidc.client_id),
-            ("code_verifier", &pkce_verifier),
-        ])
-        .send()
-        .await?
-        .json()
-        .await?;
+    let id_token = crate::oidc_client::exchange_code(
+        &http_client,
+        &metadata,
+        &config.oidc.client_id,
+        &redirect_uri,
+        &code,
+        &pkce_verifier,
+    )
+    .await
+    .map_err(|e| -> Error { e.into() })?;
 
-    // Validate signature, issuer, audience, and the nonce binding.
-    let header = jsonwebtoken::decode_header(&token_response.id_token)?;
-    let kid = header.kid.ok_or("Token missing 'kid' in header")?;
-    let jwk = jwks.find(&kid).ok_or("No matching JWK found for token")?;
-    let mut validation = jsonwebtoken::Validation::new(header.alg);
-    validation.set_audience(&[&config.oidc.client_id]);
-    validation.set_issuer(&[&config.oidc.issuer_url]);
-    let token_data = jsonwebtoken::decode::<crate::security::Claims>(
-        &token_response.id_token,
-        &jsonwebtoken::DecodingKey::from_jwk(jwk)?,
-        &validation,
-    )?;
-    if token_data.claims.nonce != oidc_nonce {
-        return Err("Nonce mismatch: token is not bound to our ephemeral key".into());
-    }
+    crate::oidc_client::validate_id_token(
+        &id_token,
+        &jwks,
+        &config.oidc.issuer_url,
+        &config.oidc.client_id,
+        nonce,
+        Some(started_at),
+    )
+    .map_err(|e| -> Error { e.into() })?;
 
-    Ok(token_response.id_token)
+    Ok(id_token)
 }
 
 /// Minimal one-shot HTTP server: accept connections until one carries the

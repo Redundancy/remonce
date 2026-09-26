@@ -112,8 +112,8 @@ pub struct RevocationServiceConfig {
     #[serde(default = "default_revocation_persist_path")]
     pub persist_path: String,
 
-    /// Minimum time a revocation is kept (counted from the revoked bundle's
-    /// token expiry), whatever this service's own `[[commands]]` say. Must
+    /// Minimum time a revocation is kept (counted from the revoked
+    /// approval's ID-token `iat`), whatever this service's own `[[commands]]` say. Must
     /// be at least the longest `approver_max_validity` any agent allows.
     /// Default: 30 days.
     #[serde(default, with = "humantime_serde")]
@@ -204,13 +204,41 @@ pub struct OidcConfig {
     /// Used for OIDC discovery (.well-known/openid-configuration).
     pub issuer_url: String,
 
-    /// The OIDC Client ID for this application, registered in Vault.
+    /// The *signing* OIDC client. Every approval, cosign and revocation is
+    /// made with a fresh login to this client; agents only accept its tokens
+    /// on the signing path, never as bearer credentials.
     pub client_id: String,
 
-    /// The Redirect URI registered with the OIDC provider.
+    /// The *viewer* OIDC client, used for browsing (files, execution logs).
+    /// Its tokens are bearer credentials accepted only by the agent's
+    /// read-only endpoints. Must differ from `client_id`. Required by
+    /// `remonce web`; agents without it refuse file/log viewing.
+    #[serde(default)]
+    pub viewer_client_id: Option<String>,
+
+    /// `max_age` sent on every signing authorization, forcing the user to
+    /// re-authenticate. Defaults to 1s: effectively "always", and portable —
+    /// some IdPs (e.g. Vault) reject `max_age=0`. Must not exceed
+    /// `security::MAX_AUTH_AGE`, or the resulting signatures can never verify.
+    #[serde(default, with = "humantime_serde")]
+    pub signing_max_age: Option<std::time::Duration>,
+
+    /// Also send `prompt=login` on signing authorizations, for IdPs that
+    /// ignore `max_age`.
+    #[serde(default)]
+    pub signing_prompt_login: bool,
+
+    /// The Redirect URI registered with the OIDC provider (for both clients).
     /// This application will listen for callbacks at this URL.
     /// If not specified, defaults to "http://{listen_address}/oidc/callback".
     pub redirect_uri: Option<String>,
+}
+
+impl OidcConfig {
+    /// `max_age` for signing logins (default 1s: always re-authenticate).
+    pub fn signing_max_age_or_default(&self) -> std::time::Duration {
+        self.signing_max_age.unwrap_or(std::time::Duration::from_secs(1))
+    }
 }
 
 // Default implementation for OidcConfig to make it optional in toml if needed, 
@@ -224,6 +252,9 @@ impl Default for OidcConfig {
         Self {
             issuer_url: "".to_string(),
             client_id: "".to_string(),
+            viewer_client_id: None,
+            signing_max_age: None,
+            signing_prompt_login: false,
             redirect_uri: None,
         }
     }

@@ -92,9 +92,9 @@ EOF
 
 ---
 
-## Step 3: Create the OIDC Client
+## Step 3: Create the OIDC Clients
 
-The client represents Remonce as an application that will receive tokens.
+Remonce needs **two** clients: a *signing* client, used for a fresh re-authenticating login on every approval, cosign and revocation, and a *viewer* client, used for the ordinary browsing login (files and execution logs). Agents accept each only where it belongs, so a signing token carried inside a delegated bundle can never be used to browse.
 
 ```hcl
 resource "vault_identity_oidc_client" "remonce_client" {
@@ -112,11 +112,25 @@ resource "vault_identity_oidc_client" "remonce_client" {
   # Public client for browser-based apps (no client secret)
   client_type = "public"
 
-  # Token lifetimes
+  # Token lifetimes. Signature validity is measured from the login (`iat`),
+  # so this no longer widens how long a signature is usable.
   id_token_ttl     = 3600  # 1 hour
   access_token_ttl = 3600  # 1 hour
 }
+
+# The viewer client. Its tokens are bearer credentials for read-only
+# endpoints, so keep them short-lived.
+resource "vault_identity_oidc_client" "remonce_viewer" {
+  name          = "remonce-viewer"
+  redirect_uris = vault_identity_oidc_client.remonce_client.redirect_uris
+  client_type   = "public"
+
+  id_token_ttl     = 900   # 15 minutes
+  access_token_ttl = 900
+}
 ```
+
+Assign both clients the same assignment (Step 4).
 
 > [!IMPORTANT]
 > **Redirect URI Requirements**:
@@ -154,7 +168,10 @@ Finally, create the provider that serves the OIDC endpoints.
 resource "vault_identity_oidc_provider" "oidc_provider" {
   name = "vaultprovider"
   
-  allowed_client_ids = [vault_identity_oidc_client.remonce_client.client_id]
+  allowed_client_ids = [
+    vault_identity_oidc_client.remonce_client.client_id,
+    vault_identity_oidc_client.remonce_viewer.client_id,
+  ]
   
   scopes_supported = [
     vault_identity_oidc_scope.groups.name,
@@ -175,7 +192,10 @@ resource "vault_identity_oidc_key" "remonce_key" {
   name               = "remonce_key"
   algorithm          = "ES256"
   rotation_period    = 604800  # 1 week
-  allowed_client_ids = [vault_identity_oidc_client.remonce_client.client_id]
+  allowed_client_ids = [
+    vault_identity_oidc_client.remonce_client.client_id,
+    vault_identity_oidc_client.remonce_viewer.client_id,
+  ]
 }
 
 # Binds the signing key to the Remonce client
@@ -186,8 +206,13 @@ resource "vault_identity_oidc_role" "token_role" {
 }
 
 output "oidc_client_id" {
-  description = "Client ID for Remonce OIDC configuration"
+  description = "Signing client ID for Remonce"
   value       = vault_identity_oidc_client.remonce_client.client_id
+}
+
+output "oidc_viewer_client_id" {
+  description = "Viewer client ID for Remonce"
+  value       = vault_identity_oidc_client.remonce_viewer.client_id
 }
 ```
 
@@ -205,15 +230,19 @@ After Vault is configured, update your `config.toml`:
 
 ```toml
 [oidc]
-issuer_url   = "https://vault.example.com/v1/identity/oidc/provider/vaultprovider"
-client_id    = "<client_id from terraform output>"
-redirect_uri = "http://localhost:8080/oidc/callback"
+issuer_url       = "https://vault.example.com/v1/identity/oidc/provider/vaultprovider"
+client_id        = "<oidc_client_id from terraform output>"
+viewer_client_id = "<oidc_viewer_client_id from terraform output>"
+redirect_uri     = "http://localhost:8080/oidc/callback"
 ```
 
-### Getting the Client ID
+Leave `signing_max_age` at its default of `1s`: Vault rejects `max_age=0` ("max_age must be greater than zero").
+
+### Getting the Client IDs
 
 ```bash
 terraform output oidc_client_id
+terraform output oidc_viewer_client_id
 ```
 
 ---
@@ -228,18 +257,22 @@ curl https://vault.example.com/v1/identity/oidc/provider/vaultprovider/.well-kno
 
 ### 2. Verify Token Claims
 
-After logging in through Remonce, the JWT should contain:
+After signing something through Remonce, the signing JWT in the bundle should contain:
 
 ```json
 {
   "iss": "https://vault.example.com/v1/identity/oidc/provider/vaultprovider",
   "sub": "<entity-id>",
-  "aud": "<client-id>",
+  "aud": "<signing-client-id>",
+  "iat": 1790460388,
+  "auth_time": 1790460388,
   "nonce": "<sha256-of-ephemeral-public-key>",
   "groups": ["example-users"],
   "username": "example-user"
 }
 ```
+
+`aud` must be the bare client ID (not a list with other audiences), and `auth_time` must be present and close to `iat`. Vault issues `auth_time` when `max_age` is requested, and with `max_age=1` it sends the user back through the login page even if they have a Vault session.
 
 ---
 
@@ -267,8 +300,8 @@ After logging in through Remonce, the JWT should contain:
 
 ## Security Best Practices
 
-1. **Dedicated Client ID**: Never share the Remonce client ID with other applications
-2. **Short Token TTL**: Use the shortest practical TTL (5-15 minutes for production). The ID token lifetime also bounds how long a signature can be re-timestamped, and therefore how long the replay cache must remember it
+1. **Dedicated Client IDs**: Never share the Remonce signing or viewer client ID with other applications, or with each other
+2. **Short Viewer Token TTL**: Viewer tokens are bearer credentials for files and logs; keep their TTL short (5-15 minutes). The signing client's TTL no longer affects how long a signature is usable
 3. **Claim Minimization**: Only request scopes needed for OPA policies
 4. **HTTPS in Production**: Never use HTTP issuer URLs in production
 5. **Restrict Assignments**: Only assign entities that should access Remonce

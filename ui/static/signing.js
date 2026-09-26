@@ -4,8 +4,13 @@
 //  - Draft token  = base64(JSON { command: {...}, operator_requires: {...}|null })
 //  - Signed token = base64(JSON ExecutionBundle { approver: {...}, operator: null })
 //  - Cosigned     = ExecutionBundle with operator filled in
-// All agent traffic goes through the loopback web tier proxy
+// All agent traffic goes through the local signer's proxy
 // (/api/agent/*, /ws/*) — the browser never talks to the agent directly.
+//
+// Signing (approve, co-sign, revoke) needs a fresh login every time: the
+// page POSTs the action to /api/sign/begin, follows the returned IdP URL to
+// re-authenticate, and comes back to the same page with ?sign_result=<id>,
+// which consumeSignResult() reads once from /api/sign/result/<id>.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -146,6 +151,81 @@ async function submitBundle(bundle) {
     return data.message || (bundle.approver.command && bundle.approver.command.id);
 }
 
+// Start a signing flow: the server parks `action` and returns the IdP URL
+// for a dedicated, re-authenticating login. Navigates away on success.
+async function beginSigning(action) {
+    const res = await fetch('/api/sign/begin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(action)
+    });
+    if (!res.ok) {
+        throw new Error(await res.text());
+    }
+    const data = await res.json();
+    window.location.assign(data.authorize_url);
+}
+
+// Render a signed/co-signed bundle into the page's result area.
+function showSignedBundle(bundle) {
+    window.signedBundle = bundle;
+    document.getElementById('signed-token-output').value = btoa(JSON.stringify(bundle));
+    document.getElementById('signed-result-area').style.display = 'block';
+}
+
+// On return from a signing login, fetch the (read-once) result and restore
+// the page. The id is stripped from the URL either way.
+async function consumeSignResult() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const id = urlParams.get('sign_result');
+    if (!id) return;
+    urlParams.delete('sign_result');
+    const rest = urlParams.toString();
+    history.replaceState(null, '', window.location.pathname + (rest ? `?${rest}` : ''));
+
+    let result;
+    try {
+        const res = await fetch(`/api/sign/result/${encodeURIComponent(id)}`);
+        if (!res.ok) throw new Error(await res.text());
+        result = await res.json();
+    } catch (e) {
+        alert('Could not load the signing result: ' + e.message);
+        return;
+    }
+
+    if (result.outcome === 'error') {
+        alert('Signing failed: ' + result.message);
+        return;
+    }
+
+    if (result.action === 'approve' && result.outcome === 'bundle') {
+        const approver = result.bundle.approver;
+        document.getElementById('draft-token-input').value = btoa(JSON.stringify({
+            command: approver.command,
+            operator_requires: approver.operator_requires
+        }));
+        handleInspectToken();
+        showSignedBundle(result.bundle);
+        const signBtn = document.getElementById('sign-token-btn');
+        signBtn.disabled = true;
+        signBtn.innerText = 'Signed Successfully';
+    } else if (result.action === 'cosign' && result.outcome === 'bundle') {
+        document.getElementById('cosign-token-input').value = btoa(JSON.stringify(result.bundle.approver));
+        handleCosignInspect();
+        showSignedBundle(result.bundle);
+        const btn = document.getElementById('cosign-btn');
+        btn.disabled = true;
+        btn.innerText = 'Co-signed';
+    } else if (result.action === 'revoke' && result.outcome === 'revoked') {
+        if (result.status >= 200 && result.status < 300) {
+            alert('Approval revoked. The agent will refuse this bundle from now on.');
+        } else {
+            const msg = (result.body && result.body.error) || JSON.stringify(result.body);
+            alert(`Revocation Error: agent returned ${result.status}: ${msg}`);
+        }
+    }
+}
+
 function gotoMonitor(executionId) {
     const params = new URLSearchParams();
     params.set('id', executionId);
@@ -235,6 +315,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const cosignBtn = document.getElementById('cosign-btn');
     if (cosignBtn) cosignBtn.addEventListener('click', handleCosign);
+
+    consumeSignResult();
 });
 
 // ---------------------------------------------------------------------------
@@ -521,33 +603,18 @@ async function handleSignToken() {
     if (!window.currentDraft) return;
 
     signBtn.disabled = true;
-    signBtn.innerText = 'Signing...';
+    signBtn.innerText = 'Redirecting to sign in...';
 
     try {
-        const response = await fetch('/api/sign', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                command: window.currentDraft.command,
-                operator_requires: window.currentDraft.operator_requires
-            })
+        await beginSigning({
+            action: 'approve',
+            command: window.currentDraft.command,
+            operator_requires: window.currentDraft.operator_requires
         });
-
-        if (!response.ok) {
-            throw new Error('Signing failed: ' + await response.text());
-        }
-
-        const bundle = await response.json();
-        window.signedBundle = bundle;
-
-        document.getElementById('signed-token-output').value = btoa(JSON.stringify(bundle));
-        document.getElementById('signed-result-area').style.display = 'block';
-
-        signBtn.innerText = 'Signed Successfully';
     } catch (err) {
-        alert('Error: ' + err.message);
+        alert('Signing failed: ' + err.message);
         signBtn.disabled = false;
-        signBtn.innerText = 'Sign Command';
+        signBtn.innerText = 'Sign (re-authenticate)';
     }
 }
 
@@ -615,28 +682,10 @@ async function handleRevokeToken() {
     }
 
     btn.disabled = true;
-    btn.textContent = 'Revoking...';
+    btn.textContent = 'Redirecting to sign in...';
 
     try {
-        const res = await fetch('/api/agent/revoke', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ agent_url: currentAgentUrl(), approver: approver })
-        });
-        const text = await res.text();
-        if (!res.ok) {
-            let msg = `Agent returned ${res.status}`;
-            try {
-                const data = JSON.parse(text);
-                if (data && data.error) msg = data.error;
-                else if (text.trim()) msg += `: ${text}`;
-            } catch (_) {
-                if (text.trim()) msg += `: ${text}`;
-            }
-            throw new Error(msg);
-        }
-        alert('Approval revoked. The agent will refuse this bundle from now on.');
-        btn.textContent = 'Revoked';
+        await beginSigning({ action: 'revoke', agent_url: currentAgentUrl(), approver: approver });
     } catch (e) {
         alert('Revocation Error: ' + e.message);
         btn.disabled = false;
@@ -682,27 +731,14 @@ async function handleCosign() {
     if (!window.cosignApprover) return;
 
     btn.disabled = true;
-    btn.innerText = 'Co-signing...';
+    btn.innerText = 'Redirecting to sign in...';
 
     try {
-        const response = await fetch('/api/cosign', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ approver: window.cosignApprover })
-        });
-        if (!response.ok) {
-            throw new Error('Cosign failed: ' + await response.text());
-        }
-        const bundle = await response.json();
-        window.signedBundle = bundle;
-
-        document.getElementById('signed-token-output').value = btoa(JSON.stringify(bundle));
-        document.getElementById('signed-result-area').style.display = 'block';
-        btn.innerText = 'Co-signed';
+        await beginSigning({ action: 'cosign', approver: window.cosignApprover });
     } catch (e) {
-        alert('Error: ' + e.message);
+        alert('Co-sign failed: ' + e.message);
         btn.disabled = false;
-        btn.innerText = 'Co-sign as Me';
+        btn.innerText = 'Co-sign as Me (re-authenticate)';
     }
 }
 
@@ -843,6 +879,10 @@ async function refreshFiles() {
         const agent = currentAgentUrl();
         if (agent) params.set('agent_url', agent);
         const res = await fetch(`/api/agent/files?${params.toString()}`);
+        if (res.status === 401) {
+            list.innerHTML = '<div class="col-12 text-warning">Session expired — <a href="/auth/login">log in again</a>.</div>';
+            return;
+        }
         if (!res.ok) throw new Error(`Agent returned ${res.status}: ${await res.text()}`);
         const files = await res.json();
 

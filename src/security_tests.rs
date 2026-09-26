@@ -1,16 +1,17 @@
 #[cfg(test)]
 mod tests {
     use crate::security::{
-        ApproverBundle, ClaimPredicate, ExecutionBundle, OperatorConstraint, OperatorCosign,
-        RevocationBundle, RevokerAttestation, ValidationError, VerifierConfig,
-        canonical_approver_payload, revocation_payload, verify_execution, verify_revocation,
+        ApproverBundle, CACHE_SLACK, ClaimPredicate, ExecutionBundle, OperatorConstraint,
+        OperatorCosign, RevocationBundle, RevokerAttestation, ValidationError, VerifierConfig,
+        canonical_approver_payload, key_binding, operator_payload, revocation_payload,
+        sign_low_s, verify_bearer_token, verify_execution, verify_revocation,
     };
     use crate::tsa::{MessageImprint, TSTInfo};
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use chrono;
     use jsonwebtoken::jwk::{Jwk, JwkSet};
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use p256::ecdsa::{Signature, SigningKey, signature::{Signer, Verifier}};
     use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
     use rand::rngs::OsRng;
     use rasn::prelude::*;
@@ -68,13 +69,17 @@ mod tests {
         serde_json::from_value(j).expect("Failed to create JWK")
     }
 
+    /// A token as a fresh per-signature login would produce: issued 30s
+    /// before `signed_at`, authenticated 10s before that, and — to prove the
+    /// lifetime no longer matters — valid for a whole day. `extra_claims`
+    /// overrides any claim; a `null` value removes it.
     fn create_valid_jwt(
         keys: &TestKeys,
         issuer: &str,
         audience: &str,
         subject: &str,
         nonce: &str,
-        expiry: OffsetDateTime,
+        signed_at: OffsetDateTime,
         extra_claims: serde_json::Value,
     ) -> String {
         let header = jsonwebtoken::Header {
@@ -83,17 +88,24 @@ mod tests {
             ..Default::default()
         };
 
+        let iat = signed_at - Duration::seconds(30);
         let mut claims = serde_json::json!({
             "sub": subject,
             "iss": issuer,
             "aud": audience,
-            "exp": expiry.unix_timestamp(),
+            "iat": iat.unix_timestamp(),
+            "auth_time": (iat - Duration::seconds(10)).unix_timestamp(),
+            "exp": (iat + Duration::hours(24)).unix_timestamp(),
             "nonce": nonce,
             "username": subject,
         });
         if let Some(obj) = extra_claims.as_object() {
             for (k, v) in obj {
-                claims[k] = v.clone();
+                if v.is_null() {
+                    claims.as_object_mut().unwrap().remove(k);
+                } else {
+                    claims[k] = v.clone();
+                }
             }
         }
 
@@ -333,8 +345,24 @@ mod tests {
         approver_signed_at: OffsetDateTime,
         approver_groups: Vec<&str>,
     ) -> ApproverBundle {
+        build_approver_bundle_with(
+            env,
+            command,
+            operator_requires,
+            approver_signed_at,
+            json!({ "groups": approver_groups }),
+        )
+    }
+
+    fn build_approver_bundle_with(
+        env: &Env,
+        command: serde_json::Value,
+        operator_requires: Option<OperatorConstraint>,
+        approver_signed_at: OffsetDateTime,
+        claims: serde_json::Value,
+    ) -> ApproverBundle {
         let canonical = canonical_approver_payload(&command, &operator_requires);
-        let sig: p256::ecdsa::Signature = env.approver.signing_key.sign(canonical.as_bytes());
+        let sig = sign_low_s(&env.approver.signing_key, canonical.as_bytes());
         let sig_bytes = sig.to_bytes();
         let sig_hex = hex::encode(sig_bytes);
 
@@ -345,8 +373,8 @@ mod tests {
             "remonce",
             "alice",
             &nonce,
-            approver_signed_at + Duration::minutes(30),
-            serde_json::json!({ "groups": approver_groups }),
+            approver_signed_at,
+            claims,
         );
 
         let mut data = sig_bytes.to_vec();
@@ -392,9 +420,26 @@ mod tests {
         operator_signed_at: OffsetDateTime,
         operator_groups: Vec<&str>,
     ) -> OperatorCosign {
-        let mut payload = approver_sig_hex.as_bytes().to_vec();
-        payload.extend_from_slice(keys.public_key_pem.as_bytes());
-        let sig: p256::ecdsa::Signature = keys.signing_key.sign(&payload);
+        build_operator_cosign_with(
+            env,
+            keys,
+            subject,
+            approver_sig_hex,
+            operator_signed_at,
+            json!({ "groups": operator_groups }),
+        )
+    }
+
+    fn build_operator_cosign_with(
+        env: &Env,
+        keys: &TestKeys,
+        subject: &str,
+        approver_sig_hex: &str,
+        operator_signed_at: OffsetDateTime,
+        claims: serde_json::Value,
+    ) -> OperatorCosign {
+        let payload = operator_payload(approver_sig_hex, &keys.public_key_pem);
+        let sig = sign_low_s(&keys.signing_key, &payload);
         let sig_bytes = sig.to_bytes();
 
         let nonce = hex::encode(Sha256::digest(keys.public_key_pem.as_bytes()));
@@ -404,8 +449,8 @@ mod tests {
             "remonce",
             subject,
             &nonce,
-            operator_signed_at + Duration::minutes(30),
-            serde_json::json!({ "groups": operator_groups }),
+            operator_signed_at,
+            claims,
         );
 
         let mut tsa_data = sig_bytes.to_vec();
@@ -429,7 +474,7 @@ mod tests {
         revoker_signed_at: OffsetDateTime,
     ) -> RevokerAttestation {
         let payload = revocation_payload(approver_sig_hex, &revoker_keys.public_key_pem);
-        let sig: p256::ecdsa::Signature = revoker_keys.signing_key.sign(&payload);
+        let sig = sign_low_s(&revoker_keys.signing_key, &payload);
         let sig_bytes = sig.to_bytes();
 
         let nonce = hex::encode(Sha256::digest(revoker_keys.public_key_pem.as_bytes()));
@@ -439,7 +484,7 @@ mod tests {
             "remonce",
             subject,
             &nonce,
-            revoker_signed_at + Duration::minutes(30),
+            revoker_signed_at,
             serde_json::json!({}),
         );
 
@@ -711,7 +756,8 @@ mod tests {
         assert!(r.self_revoked);
         assert_eq!(r.approver.username, "alice");
         assert_eq!(r.revoker.username, "alice");
-        assert_eq!(r.approver_signature_hex, sig_hex);
+        assert_eq!(r.approver_key_binding, key_binding(&env.approver.public_key_pem));
+        let _ = sig_hex;
     }
 
     #[test]
@@ -1050,10 +1096,9 @@ mod tests {
     }
 
     #[test]
-    fn usable_until_covers_retimestamping_to_token_expiry() {
-        // The test JWTs expire 30 minutes after signing. A holder can
-        // re-timestamp until then, so the executor signature stays usable
-        // until token_exp + window — well past signed_at + window.
+    fn long_lived_token_does_not_extend_usable_until() {
+        // The test tokens live 24h. Re-timestamping can no longer stretch a
+        // signature to token_exp: usability is bounded from `iat`.
         let env = new_env();
         let now = OffsetDateTime::now_utc();
         let approver = build_approver_bundle(
@@ -1068,9 +1113,449 @@ mod tests {
             operator: None,
         };
         let a = verify_execution(&bundle, &verifier_config(&env)).expect("should verify");
+        assert_eq!(a.operator.token_exp - a.operator.issued_at, Duration::hours(24));
         let window = StdDuration::from_secs(10 * 60);
-        let until = a.operator.usable_until(window);
-        assert!(until >= a.operator.signed_at + Duration::minutes(39));
-        assert_eq!(until, a.operator.token_exp + window);
+        assert_eq!(
+            a.operator.usable_until(window),
+            a.operator.issued_at + window + CACHE_SLACK
+        );
+    }
+
+    // --- Signature malleability (s -> n - s) ---
+
+    /// The high-S twin of a valid low-S signature: equally valid under plain
+    /// ECDSA, different bytes.
+    fn maul(sig_hex: &str) -> (String, Vec<u8>) {
+        use p256::elliptic_curve::ff::PrimeField;
+        let sig = Signature::from_slice(&hex::decode(sig_hex).unwrap()).unwrap();
+        let (r, s) = sig.split_scalars();
+        let neg_s = -(*s.as_ref());
+        let mauled = Signature::from_scalars(r.as_ref().to_repr(), neg_s.to_repr()).unwrap();
+        let bytes = mauled.to_bytes().to_vec();
+        (hex::encode(&bytes), bytes)
+    }
+
+    /// A fresh TSA timestamp over (sig_bytes || id_token), as any holder of
+    /// a bundle can obtain.
+    fn retimestamp(env: &Env, sig_bytes: &[u8], id_token: &str, at: OffsetDateTime) -> String {
+        let mut data = sig_bytes.to_vec();
+        data.extend_from_slice(id_token.as_bytes());
+        create_mock_timestamp(&data, at, &env.tsa_keys)
+    }
+
+    fn assert_high_s_rejected(result: Result<impl std::fmt::Debug, ValidationError>) {
+        match result {
+            Err(ValidationError::InvalidSignatureFormat(msg)) => {
+                assert!(msg.contains("high-S"), "unexpected message: {msg}")
+            }
+            other => panic!("expected high-S rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn high_s_approver_signature_rejected() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let mut approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now,
+            vec!["approvers"],
+        );
+        let payload = canonical_approver_payload(&approver.command, &approver.operator_requires);
+        let (hex_sig, bytes) = maul(&approver.signature);
+        // The malleability is real: plain ECDSA accepts the twin.
+        let high = Signature::from_slice(&bytes).unwrap();
+        assert!(
+            env.approver
+                .signing_key
+                .verifying_key()
+                .verify(payload.as_bytes(), &high)
+                .is_ok()
+        );
+        approver.signature = hex_sig;
+        approver.timestamp_token = retimestamp(&env, &bytes, &approver.id_token, now);
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
+        };
+        assert_high_s_rejected(verify_execution(&bundle, &verifier_config(&env)));
+    }
+
+    #[test]
+    fn high_s_operator_signature_rejected() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            any_operator(),
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        let mut op = build_operator_cosign(&env, &approver.signature, now, vec!["noc-l2"]);
+        let (hex_sig, bytes) = maul(&op.signature);
+        op.signature = hex_sig;
+        op.timestamp_token = retimestamp(&env, &bytes, &op.id_token, now);
+        let bundle = ExecutionBundle {
+            approver,
+            operator: Some(op),
+        };
+        assert_high_s_rejected(verify_execution(&bundle, &verifier_config(&env)));
+    }
+
+    #[test]
+    fn high_s_revoker_signature_rejected() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::days(1),
+            vec!["approvers"],
+        );
+        let mut revoker =
+            build_revoker_attestation(&env, &env.operator, "bob", &approver.signature, now);
+        let (hex_sig, bytes) = maul(&revoker.signature);
+        revoker.signature = hex_sig;
+        revoker.timestamp_token = retimestamp(&env, &bytes, &revoker.id_token, now);
+        let req = RevocationBundle { approver, revoker };
+        assert_high_s_rejected(verify_revocation(&req, &verifier_config(&env)));
+    }
+
+    #[test]
+    fn sign_low_s_always_low() {
+        let key = SigningKey::random(&mut OsRng);
+        for i in 0u32..256 {
+            let sig = sign_low_s(&key, &i.to_be_bytes());
+            assert!(sig.normalize_s().is_none(), "high-S signature produced");
+        }
+    }
+
+    // --- Re-timestamping and IdP-attested times ---
+
+    #[test]
+    fn retimestamp_after_sign_delay_rejected() {
+        // A holder re-timestamps an 8-minute-old self-execute signature: the
+        // TSA time looks fresh, but it is too far from the token's `iat`.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let iat = now - Duration::minutes(8);
+        let approver = build_approver_bundle_with(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now,
+            json!({
+                "iat": iat.unix_timestamp(),
+                "auth_time": (iat - Duration::seconds(10)).unix_timestamp(),
+            }),
+        );
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::SignedTooLongAfterIssue { .. })),
+            "expected SignedTooLongAfterIssue, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn delegated_approval_retimestamped_later_rejected() {
+        // A 2-day-old approval re-timestamped today must not look fresh.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let iat = now - Duration::days(2);
+        let approver = build_approver_bundle_with(
+            &env,
+            json!({ "command": "ping-test" }),
+            any_operator(),
+            now - Duration::minutes(1),
+            json!({
+                "iat": iat.unix_timestamp(),
+                "auth_time": (iat - Duration::seconds(10)).unix_timestamp(),
+            }),
+        );
+        let op = build_operator_cosign(&env, &approver.signature, now, vec!["noc-l2"]);
+        let bundle = ExecutionBundle {
+            approver,
+            operator: Some(op),
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::SignedTooLongAfterIssue { .. })),
+            "expected SignedTooLongAfterIssue, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn timestamp_before_iat_rejected() {
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle_with(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::minutes(10),
+            json!({
+                "iat": now.unix_timestamp(),
+                "auth_time": (now - Duration::seconds(10)).unix_timestamp(),
+            }),
+        );
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::TimestampBeforeIssue)),
+            "expected TimestampBeforeIssue, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn stale_by_iat_despite_fresh_timestamp() {
+        // TSA time 9m ago is inside the 10m window, but the login (`iat`)
+        // was 11m ago — freshness is measured from the login.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let iat = now - Duration::minutes(11);
+        let approver = build_approver_bundle_with(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now - Duration::minutes(9),
+            json!({
+                "iat": iat.unix_timestamp(),
+                "auth_time": (iat - Duration::seconds(10)).unix_timestamp(),
+            }),
+        );
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
+        };
+        let result = verify_execution(&bundle, &verifier_config(&env));
+        assert!(
+            matches!(result, Err(ValidationError::ExecutorStale { .. })),
+            "expected ExecutorStale, got {:?}",
+            result
+        );
+    }
+
+    fn self_exec_with_claims(env: &Env, claims: serde_json::Value) -> Result<(), ValidationError> {
+        let approver = build_approver_bundle_with(
+            env,
+            json!({ "command": "ping-test" }),
+            None,
+            OffsetDateTime::now_utc(),
+            claims,
+        );
+        let bundle = ExecutionBundle {
+            approver,
+            operator: None,
+        };
+        verify_execution(&bundle, &verifier_config(env)).map(|_| ())
+    }
+
+    #[test]
+    fn missing_iat_rejected() {
+        let env = new_env();
+        let result = self_exec_with_claims(&env, json!({ "iat": null }));
+        assert!(
+            matches!(result, Err(ValidationError::MissingClaim("iat"))),
+            "expected MissingClaim(iat), got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn missing_auth_time_rejected() {
+        let env = new_env();
+        let result = self_exec_with_claims(&env, json!({ "auth_time": null }));
+        assert!(
+            matches!(result, Err(ValidationError::MissingClaim("auth_time"))),
+            "expected MissingClaim(auth_time), got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn stale_auth_time_rejected() {
+        // A silent SSO refresh of a 10-minute-old session is not a
+        // re-authentication.
+        let env = new_env();
+        let iat = OffsetDateTime::now_utc() - Duration::seconds(30);
+        let result = self_exec_with_claims(
+            &env,
+            json!({ "auth_time": (iat - Duration::minutes(10)).unix_timestamp() }),
+        );
+        assert!(
+            matches!(result, Err(ValidationError::AuthenticationTooOld { .. })),
+            "expected AuthenticationTooOld, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn auth_time_after_iat_rejected() {
+        let env = new_env();
+        let iat = OffsetDateTime::now_utc() - Duration::seconds(30);
+        let result = self_exec_with_claims(
+            &env,
+            json!({ "auth_time": (iat + Duration::minutes(5)).unix_timestamp() }),
+        );
+        assert!(
+            matches!(result, Err(ValidationError::AuthTimeAfterIssue)),
+            "expected AuthTimeAfterIssue, got {:?}",
+            result
+        );
+    }
+
+    // --- Audience separation (signing vs viewer client) ---
+
+    #[test]
+    fn viewer_aud_rejected_for_signing() {
+        let env = new_env();
+        let result = self_exec_with_claims(&env, json!({ "aud": "remonce-viewer" }));
+        assert!(
+            matches!(
+                result,
+                Err(ValidationError::JwtValidationFailed(_) | ValidationError::AudienceMismatch(_))
+            ),
+            "expected audience rejection, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn multi_aud_array_rejected() {
+        // jsonwebtoken alone accepts any overlap; the strict rule must not.
+        let env = new_env();
+        let result = self_exec_with_claims(&env, json!({ "aud": ["remonce", "remonce-viewer"] }));
+        assert!(
+            matches!(result, Err(ValidationError::AudienceMismatch(_))),
+            "expected AudienceMismatch, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn azp_mismatch_rejected() {
+        let env = new_env();
+        let result = self_exec_with_claims(&env, json!({ "azp": "remonce-viewer" }));
+        assert!(
+            matches!(result, Err(ValidationError::AudienceMismatch(_))),
+            "expected AudienceMismatch, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn single_element_aud_array_accepted() {
+        let env = new_env();
+        let result = self_exec_with_claims(&env, json!({ "aud": ["remonce"], "azp": "remonce" }));
+        assert!(result.is_ok(), "expected ok, got {:?}", result);
+    }
+
+    fn bearer(env: &Env, aud: serde_json::Value) -> String {
+        create_valid_jwt(
+            &env.operator,
+            "https://issuer.example",
+            "unused",
+            "bob",
+            "random-nonce",
+            OffsetDateTime::now_utc(),
+            json!({ "aud": aud }),
+        )
+    }
+
+    #[test]
+    fn verify_bearer_token_accepts_viewer() {
+        let env = new_env();
+        let token = bearer(&env, json!("remonce-viewer"));
+        let claims =
+            verify_bearer_token(&token, &env.jwks, "https://issuer.example", "remonce-viewer")
+                .expect("viewer token should verify");
+        assert_eq!(claims["sub"], "bob");
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_signing_aud() {
+        // An approver's token carried in a delegated bundle must not work
+        // as a file/log viewing credential.
+        let env = new_env();
+        let token = bearer(&env, json!("remonce"));
+        assert!(
+            verify_bearer_token(&token, &env.jwks, "https://issuer.example", "remonce-viewer")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_multi_aud() {
+        let env = new_env();
+        let token = bearer(&env, json!(["remonce-viewer", "remonce"]));
+        assert!(
+            verify_bearer_token(&token, &env.jwks, "https://issuer.example", "remonce-viewer")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_expired() {
+        let env = new_env();
+        let expired = OffsetDateTime::now_utc() - Duration::hours(1);
+        let token = create_valid_jwt(
+            &env.operator,
+            "https://issuer.example",
+            "remonce-viewer",
+            "bob",
+            "random-nonce",
+            OffsetDateTime::now_utc(),
+            json!({ "exp": expired.unix_timestamp() }),
+        );
+        assert!(
+            verify_bearer_token(&token, &env.jwks, "https://issuer.example", "remonce-viewer")
+                .is_err()
+        );
+    }
+
+    // --- Cache keys ---
+
+    #[test]
+    fn key_binding_consistent_across_execute_and_revoke() {
+        // Execution checks revocation by the approver's key binding; a
+        // revocation must record exactly that key.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc();
+        let approver = build_approver_bundle(
+            &env,
+            json!({ "command": "ping-test" }),
+            None,
+            now,
+            vec!["approvers"],
+        );
+        let bundle = ExecutionBundle {
+            approver: approver.clone(),
+            operator: None,
+        };
+        let a = verify_execution(&bundle, &verifier_config(&env)).expect("should verify");
+        let revoker =
+            build_revoker_attestation(&env, &env.operator, "bob", &approver.signature, now);
+        let r = verify_revocation(&RevocationBundle { approver, revoker }, &verifier_config(&env))
+            .expect("should verify");
+
+        let expected = key_binding(&env.approver.public_key_pem);
+        assert_eq!(a.approver.key_binding, expected);
+        assert_eq!(a.executor_key_binding, expected);
+        assert_eq!(r.approver_key_binding, expected);
+        assert_eq!(a.approver.claims["nonce"], expected);
     }
 }

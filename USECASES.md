@@ -132,8 +132,8 @@ allow if {
 
 1. Before bed, you sign the runbook command via the signer UI. You set `operator_requires` to require `groups contains "noc-l2"`. `approver_max_validity` defaults to 3 days.
 2. You hand the bundle off — an attachment in the runbook ticket, a paste into a ChatOps thread, anything. There's no secret in the bundle that's worth more than a single execution.
-3. At 3am the NOC engineer pages in. They open the ticket, copy the bundle, log into `remonce web` running on their laptop, paste the bundle into a "co-sign and execute" page, hit go.
-4. Their workstation calls `/api/cosign`, then forwards the resulting `ExecutionBundle` to the agent. The agent verifies you authorized it, verifies them as a fresh cosigner with the right group, runs the action.
+3. At 3am the NOC engineer pages in. They open the ticket, copy the bundle, log into `remonce web` running on their laptop, paste the bundle into the Co-sign page, and re-authenticate when asked (every signature gets its own login).
+4. Their workstation co-signs with a one-time key, then forwards the resulting `ExecutionBundle` to the agent. The agent verifies you authorized it, verifies them as a fresh cosigner with the right group, runs the action.
 5. Audit log records both identities — you authorized, they executed.
 
 **Agent config.** Same shape as use case 2, but `operator_requires` constrains to `noc-l2` and policy doesn't care about workflow claims.

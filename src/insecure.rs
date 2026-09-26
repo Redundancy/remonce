@@ -34,11 +34,52 @@ impl InsecureMode {
 pub enum InsecureError {
     #[error("configuration requires --insecure to run:\n{}", .0.join("\n"))]
     Refused(Vec<String>),
+    /// Configuration that is wrong rather than merely risky. `--insecure`
+    /// does not bypass these.
+    #[error("invalid configuration:\n{}", .0.join("\n"))]
+    Invalid(Vec<String>),
+}
+
+/// Configuration errors that no flag can excuse: they either break the
+/// security model outright or guarantee every signature fails.
+fn invalid_config(config: &Config) -> Vec<String> {
+    let mut errors = Vec::new();
+    let oidc = &config.oidc;
+
+    if oidc.client_id.is_empty() {
+        errors.push("oidc.client_id (the signing client) must be set".into());
+    }
+    match oidc.viewer_client_id.as_deref() {
+        Some("") => errors.push("oidc.viewer_client_id is empty; remove it or set it".into()),
+        // Sharing a client would make every signing token a valid bearer
+        // token for file/log viewing, and vice versa.
+        Some(v) if v == oidc.client_id => errors.push(
+            "oidc.viewer_client_id must differ from oidc.client_id; viewer tokens are bearer \
+             credentials and must never share an audience with signing tokens"
+                .into(),
+        ),
+        _ => {}
+    }
+    let max_age = oidc.signing_max_age_or_default();
+    if max_age > crate::security::MAX_AUTH_AGE {
+        errors.push(format!(
+            "oidc.signing_max_age {:?} exceeds the {:?} agents accept between authentication \
+             and token issue; signatures made with it would never verify",
+            max_age,
+            crate::security::MAX_AUTH_AGE
+        ));
+    }
+    errors
 }
 
 /// Scan the config, emit warnings for active insecure options, and either
 /// return an `InsecureMode` (enabled or not) or refuse to start.
 pub fn validate(config: &Config, insecure_flag: bool) -> Result<InsecureMode, InsecureError> {
+    let errors = invalid_config(config);
+    if !errors.is_empty() {
+        return Err(InsecureError::Invalid(errors));
+    }
+
     let mut violations = Vec::new();
 
     // Gate 1: OIDC issuer_url is HTTP and non-loopback.
@@ -143,6 +184,9 @@ mod tests {
             oidc: OidcConfig {
                 issuer_url: "https://issuer.example/".into(),
                 client_id: "x".into(),
+                viewer_client_id: Some("x-viewer".into()),
+                signing_max_age: None,
+                signing_prompt_login: false,
                 redirect_uri: None,
             },
             listen_address: "127.0.0.1:8080".into(),
@@ -234,6 +278,35 @@ mod tests {
             validate(&cfg, false),
             Err(InsecureError::Refused(_))
         ));
+    }
+
+    #[test]
+    fn viewer_equal_to_signing_refused_even_with_insecure() {
+        let mut cfg = base_config();
+        cfg.oidc.viewer_client_id = Some("x".into());
+        assert!(matches!(validate(&cfg, true), Err(InsecureError::Invalid(_))));
+    }
+
+    #[test]
+    fn empty_client_id_refused() {
+        let mut cfg = base_config();
+        cfg.oidc.client_id = String::new();
+        assert!(matches!(validate(&cfg, true), Err(InsecureError::Invalid(_))));
+    }
+
+    #[test]
+    fn signing_max_age_over_limit_refused() {
+        let mut cfg = base_config();
+        cfg.oidc.signing_max_age = Some(Duration::from_secs(60 * 60));
+        assert!(matches!(validate(&cfg, true), Err(InsecureError::Invalid(_))));
+    }
+
+    #[test]
+    fn missing_viewer_client_is_allowed() {
+        // Agents may run without viewing; `remonce web` checks separately.
+        let mut cfg = base_config();
+        cfg.oidc.viewer_client_id = None;
+        assert!(validate(&cfg, false).is_ok());
     }
 
     #[test]

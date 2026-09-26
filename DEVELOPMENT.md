@@ -112,7 +112,8 @@ Authorization logic is handled by **OPA** using Rego.
 2.  You will be redirected to Vault for login.
     -   **Username**: `webapp`
     -   **Password**: *See `vault_setup.tf` or Terraform output (commonly `password` or similar in dev setups)*.
-3.  Upon success, you are redirected back to the `remonce` Commands page.
+3.  Upon success, you are redirected back to the `remonce` Commands page. This login uses the *viewer* client and only lets you browse.
+4.  Every signature (Sign, Co-sign, Revoke) sends you back to Vault to log in again: each gets its own login to the *signing* client and a one-time key. Both client IDs are written to `config.toml` by `configure_local.ps1`.
 
 ## Troubleshooting
 

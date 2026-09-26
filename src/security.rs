@@ -13,13 +13,22 @@
 //! `None` = self-execute only (a cosign is rejected); `Some(_)` = delegated
 //! (self-execute is rejected), with an empty `any_of` meaning "any operator".
 //!
-//! Signature hex must be canonical lowercase: caches key on the hex string,
-//! and `hex::decode` would otherwise accept case variants of the same bytes.
+//! Every signature comes from its own OIDC login: a fresh ephemeral key whose
+//! hash is the token's `nonce`, and a forced re-authentication. Freshness is
+//! therefore measured from the IdP-attested `iat` (and `auth_time`), which a
+//! re-timestamp cannot move — not from the token's `exp`, whose lifetime the
+//! operator of Remonce usually doesn't control.
+//!
+//! Replay and revocation caches key on the **key binding** — the verified
+//! `nonce`, i.e. `hex(SHA256(public_key_pem))` — which sits inside the
+//! IdP-signed payload and so cannot be mauled the way ECDSA signature bytes
+//! can. Signatures must still be low-S and canonical lowercase hex: the
+//! operator payload signs the approver's hex string, so it must be unique.
 
 use crate::tsa;
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
-use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature, VerifyingKey};
+use p256::ecdsa::signature::{Signer, Verifier};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -41,12 +50,24 @@ pub enum ValidationError {
     InvalidJwtHeader(String),
     #[error("JWT validation failed: {0}")]
     JwtValidationFailed(String),
+    #[error("JWT audience rejected: {0}")]
+    AudienceMismatch(String),
+    #[error("JWT is missing the `{0}` claim")]
+    MissingClaim(&'static str),
     #[error("JWT nonce not bound to signer's public key")]
     JwtNonceMismatch,
     #[error("Timestamp verification failed: {0}")]
     TimestampVerificationFailed(String),
     #[error("JWT expired relative to timestamp")]
     JwtExpired,
+    #[error("Signature was timestamped before its ID token was issued")]
+    TimestampBeforeIssue,
+    #[error("Signature was timestamped {delay_secs}s after its ID token was issued (max {max_secs}s)")]
+    SignedTooLongAfterIssue { delay_secs: u64, max_secs: u64 },
+    #[error("ID token's auth_time is after its iat")]
+    AuthTimeAfterIssue,
+    #[error("Signer authenticated {age_secs}s before the ID token was issued (max {max_secs}s)")]
+    AuthenticationTooOld { age_secs: u64, max_secs: u64 },
     #[error("Approver signature is stale ({age_secs}s > {max_secs}s)")]
     ApproverStale { age_secs: u64, max_secs: u64 },
     #[error("Executor signature is stale ({age_secs}s > {max_secs}s)")]
@@ -65,8 +86,22 @@ pub enum ValidationError {
     CosignNotAllowed,
 }
 
-/// Tolerated clock skew between the TSA and this host.
-const MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
+/// Tolerated clock skew between the TSA / IdP and this host, and between
+/// the TSA and the IdP.
+pub const MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
+/// Longest allowed gap between an ID token's issue (`iat`) and the TSA
+/// timestamp over the signature made with it. Signing happens right after
+/// the login, so this is short; it is what stops a holder re-timestamping an
+/// old signature to make it look fresh.
+pub const MAX_SIGN_DELAY: Duration = Duration::from_secs(5 * 60);
+/// Longest allowed gap between the signer's actual authentication
+/// (`auth_time`) and the token's issue — proves the login was a real
+/// re-authentication, not a silent SSO refresh of an old session.
+pub const MAX_AUTH_AGE: Duration = Duration::from_secs(5 * 60);
+/// `auth_time` and `iat` come from the same IdP clock; allow a little slop.
+const AUTH_TIME_SLACK: Duration = Duration::from_secs(60);
+/// Pad on cache retention to cover whole-second rounding in the checks.
+pub const CACHE_SLACK: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Claims {
@@ -74,6 +109,10 @@ pub struct Claims {
     pub username: Option<String>,
     pub nonce: String,
     pub exp: u64,
+    #[serde(default)]
+    pub iat: Option<f64>,
+    #[serde(default)]
+    pub auth_time: Option<f64>,
 }
 
 /// A predicate over OIDC claims. Minimal by design: if you need more
@@ -150,6 +189,7 @@ pub struct RevokerAttestation {
 }
 
 pub struct VerifierConfig {
+    /// The *signing* OIDC client. Viewer-client tokens are rejected here.
     pub client_id: String,
     pub issuer_url: String,
     pub jwks: jsonwebtoken::jwk::JwkSet,
@@ -162,18 +202,28 @@ pub struct VerifierConfig {
 pub struct SignerIdentity {
     pub username: String,
     pub claims: serde_json::Value,
+    /// TSA time over the signature.
     pub signed_at: time::OffsetDateTime,
-    /// The ID token's `exp`. Anyone holding a bundle can obtain a fresh TSA
-    /// timestamp over the same signature + token until this instant, so it
-    /// bounds how late `signed_at` can be pushed. Size cache TTLs from it.
+    /// The ID token's `iat`: IdP-attested, and within `MAX_SIGN_DELAY` of
+    /// `signed_at`. Freshness windows are measured from here.
+    pub issued_at: time::OffsetDateTime,
+    /// The ID token's `auth_time`: when the signer actually authenticated.
+    pub auth_time: time::OffsetDateTime,
+    /// The ID token's `exp`. Kept for audit only — its lifetime is the IdP's
+    /// choice and no longer extends a signature's validity.
     pub token_exp: time::OffsetDateTime,
+    /// `hex(SHA256(public_key_pem))`, as attested in the token's `nonce`.
+    /// Unique per signature and immune to signature malleability; the replay
+    /// and revocation cache key.
+    pub key_binding: String,
 }
 
 impl SignerIdentity {
     /// Latest instant a signature by this signer can still pass a freshness
-    /// check of `window`, allowing for re-timestamping up to `token_exp`.
+    /// check of `window`. Re-timestamping can't extend this: the TSA time
+    /// must stay within `MAX_SIGN_DELAY` of `iat`, and age is checked from both.
     pub fn usable_until(&self, window: Duration) -> time::OffsetDateTime {
-        self.token_exp.max(self.signed_at) + window
+        self.issued_at + window + CACHE_SLACK
     }
 }
 
@@ -183,9 +233,9 @@ pub struct AuthorizedExecution {
     /// Equals `approver` when self-executing.
     pub operator: SignerIdentity,
     pub self_executed: bool,
-    /// The signature whose freshness bounds execution (operator sig if
-    /// delegated, else approver sig). Used as the replay cache key.
-    pub executor_signature_hex: String,
+    /// Key binding of the signer whose freshness bounds execution (operator
+    /// if delegated, else approver). Used as the replay cache key.
+    pub executor_key_binding: String,
 }
 
 /// Build the canonical bytes an approver signs over.
@@ -207,7 +257,7 @@ pub fn canonical_approver_payload(
 
 /// Build the bytes an operator signs over: approver signature hex followed
 /// by the operator's public-key PEM. Binds the cosign to *this* approver's sig.
-fn operator_payload(approver_sig_hex: &str, operator_public_key_pem: &str) -> Vec<u8> {
+pub fn operator_payload(approver_sig_hex: &str, operator_public_key_pem: &str) -> Vec<u8> {
     let mut bytes = approver_sig_hex.as_bytes().to_vec();
     bytes.extend_from_slice(operator_public_key_pem.as_bytes());
     bytes
@@ -223,6 +273,19 @@ pub fn revocation_payload(approver_sig_hex: &str, revoker_public_key_pem: &str) 
     bytes
 }
 
+/// The OIDC `nonce` a signer's token must carry: `hex(SHA256(pem))`.
+pub fn key_binding(public_key_pem: &str) -> String {
+    hex::encode(Sha256::digest(public_key_pem.as_bytes()))
+}
+
+/// Sign `msg`, normalized to low-S. The verifier rejects high-S signatures
+/// (the `s → n−s` twin of every valid signature), and `p256` does not
+/// normalize on its own, so every signer must go through this.
+pub fn sign_low_s(key: &SigningKey, msg: &[u8]) -> Signature {
+    let sig: Signature = key.sign(msg);
+    sig.normalize_s().unwrap_or(sig)
+}
+
 /// Decode a signature hex string, rejecting anything but canonical lowercase.
 fn decode_canonical_hex(s: &str, what: &str) -> Result<Vec<u8>, ValidationError> {
     let bytes = hex::decode(s)
@@ -233,6 +296,18 @@ fn decode_canonical_hex(s: &str, what: &str) -> Result<Vec<u8>, ValidationError>
         )));
     }
     Ok(bytes)
+}
+
+/// Parse a raw `r || s` signature, rejecting the high-S form.
+fn parse_low_s(bytes: &[u8], what: &str) -> Result<Signature, ValidationError> {
+    let sig = Signature::from_slice(bytes)
+        .map_err(|e| ValidationError::InvalidSignatureFormat(format!("{what}: {e}")))?;
+    if sig.normalize_s().is_some() {
+        return Err(ValidationError::InvalidSignatureFormat(format!(
+            "{what}: high-S signature"
+        )));
+    }
+    Ok(sig)
 }
 
 fn same_subject(a: &serde_json::Value, b: &serde_json::Value) -> bool {
@@ -254,53 +329,93 @@ fn username_from_claims(claims: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// Verify the approver leg of a bundle: signature over the canonical payload,
-/// TSA timestamp, and nonce-bound JWT. Returns the approver's identity.
+/// Which leg of a bundle is being verified; selects error variants.
+#[derive(Clone, Copy)]
+enum Leg {
+    Approver,
+    Operator,
+    Revoker,
+}
+
+impl Leg {
+    fn name(self) -> &'static str {
+        match self {
+            Leg::Approver => "approver",
+            Leg::Operator => "operator",
+            Leg::Revoker => "revoker",
+        }
+    }
+
+    fn signature_failed(self) -> ValidationError {
+        match self {
+            Leg::Approver => ValidationError::ApproverSignatureFailed,
+            Leg::Operator => ValidationError::OperatorSignatureFailed,
+            Leg::Revoker => ValidationError::RevokerSignatureFailed,
+        }
+    }
+}
+
+/// Verify one signing leg: low-S signature over `payload`, TSA timestamp
+/// over `(sig_bytes || id_token)`, and the nonce-bound, freshly-issued JWT.
+/// Role-specific freshness is left to the caller.
+fn verify_leg(
+    leg: Leg,
+    signature_hex: &str,
+    payload: &[u8],
+    public_key_pem: &str,
+    id_token: &str,
+    timestamp_token_hex: &str,
+    config: &VerifierConfig,
+) -> Result<SignerIdentity, ValidationError> {
+    let what = leg.name();
+
+    // ---- 1. Signature over the payload ----
+    let pubkey = VerifyingKey::from_public_key_pem(public_key_pem)
+        .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
+    let sig_bytes = decode_canonical_hex(signature_hex, what)?;
+    let sig = parse_low_s(&sig_bytes, what)?;
+    pubkey
+        .verify(payload, &sig)
+        .map_err(|_| leg.signature_failed())?;
+
+    // ---- 2. TSA over (sig_bytes || id_token) ----
+    let tsa_bytes = hex::decode(timestamp_token_hex).map_err(|_| {
+        ValidationError::TimestampVerificationFailed(format!("{what} TSA: invalid hex"))
+    })?;
+    let mut tsa_data = sig_bytes;
+    tsa_data.extend_from_slice(id_token.as_bytes());
+    let signed_at = tsa::verify_timestamp(&tsa_bytes, &tsa_data, &config.trusted_roots)
+        .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
+
+    // ---- 3. JWT: issuer, strict audience, nonce, iat/auth_time vs signed_at ----
+    let token = verify_oidc_jwt(id_token, public_key_pem, signed_at, config)?;
+
+    Ok(SignerIdentity {
+        username: username_from_claims(&token.claims),
+        claims: token.claims,
+        signed_at,
+        issued_at: token.iat,
+        auth_time: token.auth_time,
+        token_exp: token.exp,
+        key_binding: token.key_binding,
+    })
+}
+
+/// Verify the approver leg of a bundle.
 fn verify_approver(
     approver: &ApproverBundle,
     config: &VerifierConfig,
 ) -> Result<SignerIdentity, ValidationError> {
-    // ---- 1. Verify approver signature over canonical(command + operator_requires) ----
-    let approver_payload =
-        canonical_approver_payload(&approver.command, &approver.operator_requires);
-
-    let approver_pubkey = VerifyingKey::from_public_key_pem(&approver.public_key)
-        .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
-
-    let approver_sig_bytes = decode_canonical_hex(&approver.signature, "approver")?;
-
-    let approver_sig = Signature::from_slice(&approver_sig_bytes)
-        .map_err(|e| ValidationError::InvalidSignatureFormat(e.to_string()))?;
-
-    use p256::ecdsa::signature::Verifier;
-    approver_pubkey
-        .verify(approver_payload.as_bytes(), &approver_sig)
-        .map_err(|_| ValidationError::ApproverSignatureFailed)?;
-
-    // ---- 2. Verify approver TSA over (sig_bytes || id_token) ----
-    let approver_tsa_bytes = hex::decode(&approver.timestamp_token).map_err(|_| {
-        ValidationError::TimestampVerificationFailed("approver TSA: invalid hex".into())
-    })?;
-    let mut approver_tsa_data = approver_sig_bytes.clone();
-    approver_tsa_data.extend_from_slice(approver.id_token.as_bytes());
-    let approver_signed_at =
-        tsa::verify_timestamp(&approver_tsa_bytes, &approver_tsa_data, &config.trusted_roots)
-            .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
-
-    // ---- 3. Verify approver JWT ----
-    let (approver_claims_obj, token_exp) = verify_oidc_jwt(
-        &approver.id_token,
+    let payload = canonical_approver_payload(&approver.command, &approver.operator_requires);
+    verify_leg(
+        Leg::Approver,
+        &approver.signature,
+        payload.as_bytes(),
         &approver.public_key,
-        approver_signed_at,
+        &approver.id_token,
+        &approver.timestamp_token,
         config,
-    )?;
-
-    Ok(SignerIdentity {
-        username: username_from_claims(&approver_claims_obj),
-        claims: approver_claims_obj,
-        signed_at: approver_signed_at,
-        token_exp,
-    })
+    )
 }
 
 pub fn verify_execution(
@@ -308,9 +423,8 @@ pub fn verify_execution(
     config: &VerifierConfig,
 ) -> Result<AuthorizedExecution, ValidationError> {
     let approver = verify_approver(&bundle.approver, config)?;
-    let approver_signed_at = approver.signed_at;
 
-    // ---- 4. Delegated vs self-execute branch ----
+    // ---- Delegated vs self-execute branch ----
     let now = time::OffsetDateTime::now_utc();
 
     match &bundle.operator {
@@ -321,78 +435,54 @@ pub fn verify_execution(
             Err(ValidationError::CosignRequired)
         }
         Some(op) => {
-            // 4a. Re-check the stated approver_sig matches the bundle.
+            // Re-check the stated approver_sig matches the bundle.
             if op.approver_sig != bundle.approver.signature {
                 return Err(ValidationError::OperatorStapling);
             }
 
-            // 4b. Verify operator signature over (approver_sig_hex || operator_pubkey_pem).
-            let operator_pubkey = VerifyingKey::from_public_key_pem(&op.public_key)
-                .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
-
-            let op_sig_bytes = decode_canonical_hex(&op.signature, "operator")?;
-            let op_sig = Signature::from_slice(&op_sig_bytes)
-                .map_err(|e| ValidationError::InvalidSignatureFormat(e.to_string()))?;
-
+            // Operator signs (approver_sig_hex || operator_pubkey_pem).
             let op_payload = operator_payload(&bundle.approver.signature, &op.public_key);
-            operator_pubkey
-                .verify(&op_payload, &op_sig)
-                .map_err(|_| ValidationError::OperatorSignatureFailed)?;
-
-            // 4c. Operator TSA.
-            let op_tsa_bytes = hex::decode(&op.timestamp_token).map_err(|_| {
-                ValidationError::TimestampVerificationFailed("operator TSA: invalid hex".into())
-            })?;
-            let mut op_tsa_data = op_sig_bytes.clone();
-            op_tsa_data.extend_from_slice(op.id_token.as_bytes());
-            let operator_signed_at =
-                tsa::verify_timestamp(&op_tsa_bytes, &op_tsa_data, &config.trusted_roots)
-                    .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
-
-            // 4d. Operator JWT + nonce bound to operator pubkey.
-            let (operator_claims_obj, operator_token_exp) = verify_oidc_jwt(
-                &op.id_token,
+            let operator = verify_leg(
+                Leg::Operator,
+                &op.signature,
+                &op_payload,
                 &op.public_key,
-                operator_signed_at,
+                &op.id_token,
+                &op.timestamp_token,
                 config,
             )?;
-            let operator_username = username_from_claims(&operator_claims_obj);
 
-            // 4e. Freshness — operator (short) + approver (long).
-            check_age(now, operator_signed_at, config.operator_max_validity, true)?;
-            check_age(now, approver_signed_at, config.approver_max_validity, false)?;
+            // Freshness — operator (short) + approver (long).
+            check_fresh(now, &operator, config.operator_max_validity, true)?;
+            check_fresh(now, &approver, config.approver_max_validity, false)?;
 
-            // 4f. Evaluate operator_requires against operator claims.
-            if let Some(req) = &bundle.approver.operator_requires {
-                if !req.any_of.is_empty() && !any_of_matches(&req.any_of, &operator_claims_obj) {
-                    return Err(ValidationError::OperatorConstraintUnsatisfied);
-                }
+            // Evaluate operator_requires against operator claims.
+            if let Some(req) = &bundle.approver.operator_requires
+                && !req.any_of.is_empty()
+                && !any_of_matches(&req.any_of, &operator.claims)
+            {
+                return Err(ValidationError::OperatorConstraintUnsatisfied);
             }
 
             // An approver cosigning their own delegated bundle is still one
             // person — report it as self-executed so four-eyes policies hold.
-            let self_executed = same_subject(&approver.claims, &operator_claims_obj);
+            let self_executed = same_subject(&approver.claims, &operator.claims);
 
             Ok(AuthorizedExecution {
                 approver,
-                operator: SignerIdentity {
-                    username: operator_username,
-                    claims: operator_claims_obj,
-                    signed_at: operator_signed_at,
-                    token_exp: operator_token_exp,
-                },
+                executor_key_binding: operator.key_binding.clone(),
+                operator,
                 self_executed,
-                executor_signature_hex: op.signature.clone(),
             })
         }
         None => {
             // Self-execute: approver's own sig must be within the short window.
-            check_age(now, approver_signed_at, config.operator_max_validity, true)?;
+            check_fresh(now, &approver, config.operator_max_validity, true)?;
 
             Ok(AuthorizedExecution {
                 operator: approver.clone(),
                 self_executed: true,
-                executor_signature_hex: bundle.approver.signature.clone(),
+                executor_key_binding: approver.key_binding.clone(),
                 approver,
             })
         }
@@ -406,9 +496,8 @@ pub struct AuthorizedRevocation {
     /// Whether the revoker is the approver themselves (same `sub`). If false,
     /// the caller must consult policy (OPA) before honoring the revocation.
     pub self_revoked: bool,
-    /// Hex signature of the approver bundle being revoked — the revocation
-    /// cache key.
-    pub approver_signature_hex: String,
+    /// Key binding of the approval being revoked — the revocation cache key.
+    pub approver_key_binding: String,
 }
 
 /// Verify a revocation request: the approver bundle must be genuine and the
@@ -424,130 +513,233 @@ pub fn verify_revocation(
     //    could poison the revocation cache with signatures they invented.
     let approver = verify_approver(&req.approver, config)?;
 
-    // 2. Verify revoker signature over the domain-separated payload.
-    let revoker_pubkey = VerifyingKey::from_public_key_pem(&req.revoker.public_key)
-        .map_err(|e| ValidationError::InvalidPublicKey(e.to_string()))?;
-
-    let revoker_sig_bytes = decode_canonical_hex(&req.revoker.signature, "revoker")?;
-    let revoker_sig = Signature::from_slice(&revoker_sig_bytes)
-        .map_err(|e| ValidationError::InvalidSignatureFormat(e.to_string()))?;
-
+    // 2. Revoker attestation over the domain-separated payload.
     let payload = revocation_payload(&req.approver.signature, &req.revoker.public_key);
-    use p256::ecdsa::signature::Verifier;
-    revoker_pubkey
-        .verify(&payload, &revoker_sig)
-        .map_err(|_| ValidationError::RevokerSignatureFailed)?;
-
-    // 3. Revoker TSA + JWT (nonce bound to revoker's ephemeral key).
-    let revoker_tsa_bytes = hex::decode(&req.revoker.timestamp_token).map_err(|_| {
-        ValidationError::TimestampVerificationFailed("revoker TSA: invalid hex".into())
-    })?;
-    let mut revoker_tsa_data = revoker_sig_bytes.clone();
-    revoker_tsa_data.extend_from_slice(req.revoker.id_token.as_bytes());
-    let revoker_signed_at =
-        tsa::verify_timestamp(&revoker_tsa_bytes, &revoker_tsa_data, &config.trusted_roots)
-            .map_err(|e| ValidationError::TimestampVerificationFailed(e.to_string()))?;
-
-    let (revoker_claims, revoker_token_exp) = verify_oidc_jwt(
-        &req.revoker.id_token,
+    let revoker = verify_leg(
+        Leg::Revoker,
+        &req.revoker.signature,
+        &payload,
         &req.revoker.public_key,
-        revoker_signed_at,
+        &req.revoker.id_token,
+        &req.revoker.timestamp_token,
         config,
     )?;
 
-    // 4. Revocation is an "act now" signature — hold it to the short window.
-    check_age(
+    // 3. Revocation is an "act now" signature — hold it to the short window.
+    check_fresh(
         time::OffsetDateTime::now_utc(),
-        revoker_signed_at,
+        &revoker,
         config.operator_max_validity,
         true,
     )?;
 
-    let same_sub = same_subject(&approver.claims, &revoker_claims);
+    let self_revoked = same_subject(&approver.claims, &revoker.claims);
 
     Ok(AuthorizedRevocation {
-        revoker: SignerIdentity {
-            username: username_from_claims(&revoker_claims),
-            claims: revoker_claims,
-            signed_at: revoker_signed_at,
-            token_exp: revoker_token_exp,
-        },
-        self_revoked: same_sub,
-        approver_signature_hex: req.approver.signature.clone(),
+        revoker,
+        self_revoked,
+        approver_key_binding: approver.key_binding.clone(),
         approver,
     })
 }
 
-/// Shared JWT verification: signature against JWKS, issuer, audience, and
-/// nonce bound to the caller's ephemeral public key. Also checks the JWT's
-/// own `exp` against the TSA timestamp (not wall clock). Returns the claims
-/// and the token's expiry.
-fn verify_oidc_jwt(
-    id_token: &str,
-    signer_public_key_pem: &str,
-    signed_at: time::OffsetDateTime,
-    config: &VerifierConfig,
-) -> Result<(serde_json::Value, time::OffsetDateTime), ValidationError> {
+/// Claims and times from a verified, nonce-bound ID token.
+struct VerifiedToken {
+    claims: serde_json::Value,
+    iat: time::OffsetDateTime,
+    auth_time: time::OffsetDateTime,
+    exp: time::OffsetDateTime,
+    key_binding: String,
+}
+
+/// Strict audience rule shared by every token check: `aud` must be exactly
+/// `expected` (a string, or a one-element array), and `azp`, if present,
+/// must equal it too. `jsonwebtoken` alone accepts any overlapping array,
+/// which would let one token pass as both a signing and a viewer token.
+pub fn check_audience(claims: &serde_json::Value, expected: &str) -> Result<(), ValidationError> {
+    let ok = match claims.get("aud") {
+        Some(serde_json::Value::String(a)) => a == expected,
+        Some(serde_json::Value::Array(arr)) => {
+            arr.len() == 1 && arr[0].as_str() == Some(expected)
+        }
+        _ => false,
+    };
+    if !ok {
+        return Err(ValidationError::AudienceMismatch(format!(
+            "aud must be exactly \"{expected}\""
+        )));
+    }
+    if let Some(azp) = claims.get("azp")
+        && azp.as_str() != Some(expected)
+    {
+        return Err(ValidationError::AudienceMismatch(format!(
+            "azp must be \"{expected}\""
+        )));
+    }
+    Ok(())
+}
+
+/// Read a NumericDate claim (integer or fractional seconds).
+fn numeric_date(
+    claims: &serde_json::Value,
+    name: &'static str,
+) -> Result<time::OffsetDateTime, ValidationError> {
+    let v = claims.get(name).ok_or(ValidationError::MissingClaim(name))?;
+    let secs = v
+        .as_i64()
+        .or_else(|| v.as_f64().map(|f| f.floor() as i64))
+        .ok_or_else(|| ValidationError::JwtValidationFailed(format!("{name} is not a number")))?;
+    time::OffsetDateTime::from_unix_timestamp(secs)
+        .map_err(|_| ValidationError::JwtValidationFailed(format!("{name} out of range")))
+}
+
+fn whole_secs(d: time::Duration) -> u64 {
+    d.whole_seconds().max(0) as u64
+}
+
+/// Decode and verify a JWT's signature and issuer against the pinned JWKS,
+/// plus the strict audience rule. `validate_exp` controls whether `exp` is
+/// checked against the wall clock.
+fn decode_verified(
+    token: &str,
+    jwks: &jsonwebtoken::jwk::JwkSet,
+    issuer: &str,
+    audience: &str,
+    validate_exp: bool,
+) -> Result<serde_json::Value, ValidationError> {
     let header =
-        decode_header(id_token).map_err(|e| ValidationError::InvalidJwtHeader(e.to_string()))?;
+        decode_header(token).map_err(|e| ValidationError::InvalidJwtHeader(e.to_string()))?;
     let kid = header
         .kid
         .ok_or_else(|| ValidationError::InvalidJwtHeader("Missing kid".into()))?;
-    let jwk = config
-        .jwks
+    let jwk = jwks
         .find(&kid)
         .ok_or_else(|| ValidationError::JwtValidationFailed("Unknown signing key".into()))?;
     let decoding_key = DecodingKey::from_jwk(jwk)
         .map_err(|e| ValidationError::JwtValidationFailed(e.to_string()))?;
 
     let mut validation = Validation::new(header.alg);
-    validation.set_audience(&[&config.client_id]);
-    validation.set_issuer(&[&config.issuer_url]);
-    validation.validate_exp = false;
+    validation.set_audience(&[audience]);
+    validation.set_issuer(&[issuer]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+    validation.validate_exp = validate_exp;
 
-    let token_data = decode::<serde_json::Value>(id_token, &decoding_key, &validation)
-        .map_err(|e| ValidationError::JwtValidationFailed(e.to_string()))?;
-    let claims = token_data.claims;
+    let claims = decode::<serde_json::Value>(token, &decoding_key, &validation)
+        .map_err(|e| ValidationError::JwtValidationFailed(e.to_string()))?
+        .claims;
+    check_audience(&claims, audience)?;
+    Ok(claims)
+}
 
-    let expected_nonce = hex::encode(Sha256::digest(signer_public_key_pem.as_bytes()));
+/// Verify a signing token: JWKS signature, issuer, strict audience (the
+/// signing client), nonce bound to the signer's ephemeral key, and the
+/// issue/auth times relative to the TSA time `signed_at`:
+///
+/// - `signed_at <= exp` (the only remaining use of `exp`);
+/// - `iat - skew <= signed_at <= iat + MAX_SIGN_DELAY` — a signature can't be
+///   re-timestamped long after the login that produced it;
+/// - `auth_time <= iat + slack` and `iat - auth_time <= MAX_AUTH_AGE` — the
+///   login was a real re-authentication.
+fn verify_oidc_jwt(
+    id_token: &str,
+    signer_public_key_pem: &str,
+    signed_at: time::OffsetDateTime,
+    config: &VerifierConfig,
+) -> Result<VerifiedToken, ValidationError> {
+    let claims = decode_verified(
+        id_token,
+        &config.jwks,
+        &config.issuer_url,
+        &config.client_id,
+        false,
+    )?;
+
+    let expected_nonce = key_binding(signer_public_key_pem);
     let nonce = claims
         .get("nonce")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| ValidationError::JwtValidationFailed("Missing nonce".into()))?;
+        .ok_or(ValidationError::MissingClaim("nonce"))?;
     if nonce != expected_nonce {
         return Err(ValidationError::JwtNonceMismatch);
     }
 
-    let exp = claims
-        .get("exp")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| ValidationError::JwtValidationFailed("Missing exp".into()))?;
-    let exp_time = time::OffsetDateTime::from_unix_timestamp(exp)
-        .map_err(|_| ValidationError::JwtValidationFailed("Invalid exp claim".into()))?;
-    if signed_at > exp_time {
+    let exp = numeric_date(&claims, "exp")?;
+    let iat = numeric_date(&claims, "iat")?;
+    let auth_time = numeric_date(&claims, "auth_time")?;
+
+    if signed_at > exp {
         return Err(ValidationError::JwtExpired);
     }
+    if signed_at < iat - MAX_FUTURE_SKEW {
+        return Err(ValidationError::TimestampBeforeIssue);
+    }
+    if signed_at - iat > MAX_SIGN_DELAY {
+        return Err(ValidationError::SignedTooLongAfterIssue {
+            delay_secs: whole_secs(signed_at - iat),
+            max_secs: MAX_SIGN_DELAY.as_secs(),
+        });
+    }
+    if auth_time > iat + AUTH_TIME_SLACK {
+        return Err(ValidationError::AuthTimeAfterIssue);
+    }
+    if iat - auth_time > MAX_AUTH_AGE {
+        return Err(ValidationError::AuthenticationTooOld {
+            age_secs: whole_secs(iat - auth_time),
+            max_secs: MAX_AUTH_AGE.as_secs(),
+        });
+    }
 
-    Ok((claims, exp_time))
+    Ok(VerifiedToken {
+        claims,
+        iat,
+        auth_time,
+        exp,
+        key_binding: expected_nonce,
+    })
+}
+
+/// Verify a bearer token for the read-only viewer endpoints: JWKS
+/// signature, issuer, `exp` against the wall clock, and the strict audience
+/// rule for the *viewer* client. No nonce binding — this is plain bearer
+/// auth, which is why it must never share an audience with signing tokens.
+pub fn verify_bearer_token(
+    token: &str,
+    jwks: &jsonwebtoken::jwk::JwkSet,
+    issuer: &str,
+    viewer_audience: &str,
+) -> Result<serde_json::Value, ValidationError> {
+    decode_verified(token, jwks, issuer, viewer_audience, true)
+}
+
+/// Check a signer is fresh against both its IdP issue time and its TSA
+/// time. `iat` is the binding bound (a re-timestamp can't move it); the TSA
+/// time is kept as a backstop.
+fn check_fresh(
+    now: time::OffsetDateTime,
+    who: &SignerIdentity,
+    max: Duration,
+    is_executor: bool,
+) -> Result<(), ValidationError> {
+    check_age(now, who.issued_at, max, is_executor)?;
+    check_age(now, who.signed_at, max, is_executor)
 }
 
 fn check_age(
     now: time::OffsetDateTime,
-    signed_at: time::OffsetDateTime,
+    at: time::OffsetDateTime,
     max: Duration,
     is_executor: bool,
 ) -> Result<(), ValidationError> {
-    if signed_at > now {
+    if at > now {
         // Small clock skew is treated as zero age; anything larger would let
-        // a skewed TSA extend a signature's life past the replay-cache TTL.
-        let ahead_secs = (signed_at - now).whole_seconds().max(0) as u64;
+        // a skewed TSA or IdP extend a signature's life past the cache TTL.
+        let ahead_secs = whole_secs(at - now);
         if ahead_secs > MAX_FUTURE_SKEW.as_secs() {
             return Err(ValidationError::TimestampInFuture { ahead_secs });
         }
         return Ok(());
     }
-    let age = now - signed_at;
-    let age_secs = age.whole_seconds().max(0) as u64;
+    let age_secs = whole_secs(now - at);
     let max_secs = max.as_secs();
     if age_secs > max_secs {
         return Err(if is_executor {

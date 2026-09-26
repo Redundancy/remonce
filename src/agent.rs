@@ -38,38 +38,27 @@ pub struct AgentState {
 
 // ExecutionRequest is imported from security module
 
-/// Verify an OIDC JWT against the agent's pinned JWKS. Used by the
-/// `/api/files` and `/api/files/stream` endpoints, where the bearer token
-/// is the only auth (we don't have a session). Returns the JWT claims.
+/// Verify a viewer bearer token against the agent's pinned JWKS. Used by
+/// `/api/files`, `/api/files/stream` and `/stream/{id}`, where the bearer
+/// token is the only auth. Returns the JWT claims.
 ///
-/// Note: this is bearer-token auth and intentionally does NOT enforce the
-/// nonce-binding to an ephemeral key (that's the approver/operator path
-/// in `security::verify_execution`). A leaked ID token grants file-read
-/// until it expires; mitigate via short JWT lifetimes and dedicated
-/// clientID.
+/// Only tokens for the *viewer* client are accepted (strict audience), so a
+/// signing token — including an approver's token carried inside a delegated
+/// bundle — can never be used to browse. Without `viewer_client_id` the
+/// endpoints are disabled.
 fn verify_query_token(
     token: &str,
-    jwks: &jsonwebtoken::jwk::JwkSet,
-    issuer: &str,
-    audience: &str,
+    state: &AgentState,
 ) -> Result<serde_json::Value, (axum::http::StatusCode, &'static str)> {
     use axum::http::StatusCode;
-    let header = jsonwebtoken::decode_header(token)
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid Token Header"))?;
-    let kid = header
-        .kid
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing KID"))?;
-    let jwk = jwks
-        .find(&kid)
-        .ok_or((StatusCode::UNAUTHORIZED, "Unknown Key"))?;
-    let decoding_key = jsonwebtoken::DecodingKey::from_jwk(jwk)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Key Error"))?;
-    let mut validation = jsonwebtoken::Validation::new(header.alg);
-    validation.set_audience(&[audience]);
-    validation.set_issuer(&[issuer]);
-    let token_data = jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation)
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid Token"))?;
-    Ok(token_data.claims)
+    let Some(viewer) = state.config.oidc.viewer_client_id.as_deref() else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "File viewing disabled (no viewer_client_id configured)",
+        ));
+    };
+    crate::security::verify_bearer_token(token, &state.jwks, &state.config.oidc.issuer_url, viewer)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid Token"))
 }
 
 /// How long to keep draining a command's output after it exits or is killed.
@@ -142,6 +131,12 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         config.timestamp_authority.trust_system_store,
     );
     tracing::info!("Loaded {} trusted TSA roots", trusted_roots.len());
+
+    if config.oidc.viewer_client_id.is_none() {
+        tracing::warn!(
+            "oidc.viewer_client_id is not set: file and execution-log viewing is disabled on this agent"
+        );
+    }
 
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
@@ -292,14 +287,8 @@ async fn execute_handler(
         issuer_url: state.config.oidc.issuer_url.clone(),
         jwks: state.jwks.clone(),
         trusted_roots: state.trusted_roots.clone(),
-        approver_max_validity: operator_max, // unused for self-exec; kept for symmetry
-        operator_max_validity: operator_max,
-    };
-    // We verify with operator_max_validity reflecting the short window; approver_max_validity
-    // needs to come from cmd_config:
-    let verifier_config = crate::security::VerifierConfig {
         approver_max_validity: approver_max,
-        ..verifier_config
+        operator_max_validity: operator_max,
     };
 
     let authz = match crate::security::verify_execution(&bundle, &verifier_config) {
@@ -341,10 +330,11 @@ async fn execute_handler(
         ..Default::default()
     };
 
-    // 3. Revocation check — the approver's signature may have been revoked
-    //    after the bundle was issued. Local cache first, then the central
+    // 3. Revocation check — the approval may have been revoked after it was
+    //    issued. Keyed on the approver's key binding (not signature bytes,
+    //    which are malleable). Local cache first, then the central
     //    revocation service (fail-closed) if one is configured.
-    if state.revocations.is_revoked(&bundle.approver.signature) {
+    if state.revocations.is_revoked(&authz.approver.key_binding) {
         crate::audit::log_audit(
             "deny",
             "Approval has been revoked".into(),
@@ -359,7 +349,7 @@ async fn execute_handler(
     }
 
     if let Some((client, base)) = &state.revocation_service {
-        match check_revocation_service(client, base, &bundle.approver.signature).await {
+        match check_revocation_service(client, base, &authz.approver.key_binding).await {
             Ok(false) => {}
             Ok(true) => {
                 crate::audit::log_audit(
@@ -581,9 +571,9 @@ async fn execute_handler(
         });
     }
 
-    // 6. Replay check — executor signature (operator if delegated, else
+    // 6. Replay check — executor key binding (operator if delegated, else
     //    approver). The entry must outlive every way the signature could
-    //    still pass freshness, including re-timestamping up to token expiry.
+    //    still pass freshness, which is bounded from the token's `iat`.
     let replay_ttl: std::time::Duration = (authz.operator.usable_until(operator_max)
         - time::OffsetDateTime::now_utc())
     .try_into()
@@ -591,7 +581,7 @@ async fn execute_handler(
     .max(operator_max);
     if state
         .replay_cache
-        .check_and_insert(&authz.executor_signature_hex, replay_ttl)
+        .check_and_insert(&authz.executor_key_binding, replay_ttl)
         .is_err()
     {
         crate::audit::log_audit(
@@ -607,7 +597,7 @@ async fn execute_handler(
         });
     }
     // Released again if we fail before the process actually starts.
-    let release_replay = || state.replay_cache.release(&authz.executor_signature_hex);
+    let release_replay = || state.replay_cache.release(&authz.executor_key_binding);
 
     // Preserve legacy locals used below.
     let authenticated_user = approver_user.clone();
@@ -876,16 +866,16 @@ struct RevokedStatusResponse {
     revoked: bool,
 }
 
-/// Query the central revocation service for `sig_hex`. Any transport or
-/// protocol error is surfaced to the caller, which treats it as fatal
-/// (fail-closed).
+/// Query the central revocation service for an approval's key binding.
+/// Any transport or protocol error is surfaced to the caller, which treats
+/// it as fatal (fail-closed).
 async fn check_revocation_service(
     client: &Client,
     base: &url::Url,
-    sig_hex: &str,
+    key_binding: &str,
 ) -> Result<bool, String> {
     let url = base
-        .join(&format!("revoked/{}", sig_hex))
+        .join(&format!("revoked/{}", key_binding))
         .map_err(|e| e.to_string())?;
     let resp = client
         .get(url)
@@ -941,8 +931,8 @@ async fn revoke_handler(
         ..Default::default()
     };
 
-    // Pin the revocation until the approval would have expired anyway —
-    // allowing for the approval being re-timestamped up to its token expiry.
+    // Pin the revocation until the approval would have expired anyway
+    // (measured from its token's `iat`).
     let now = time::OffsetDateTime::now_utc();
     let expiry = revocation
         .approver
@@ -952,7 +942,7 @@ async fn revoke_handler(
             (expiry - now).try_into().unwrap_or_default();
         state
             .revocations
-            .revoke(&revocation.approver_signature_hex, remaining);
+            .revoke(&revocation.approver_key_binding, remaining);
     }
 
     // Forward to the central revocation service so a single submission
@@ -1029,12 +1019,7 @@ async fn stream_logs_handler(
         Some(t) => t,
         None => return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response(),
     };
-    let claims = match verify_query_token(
-        &token,
-        &state.jwks,
-        &state.config.oidc.issuer_url,
-        &state.config.oidc.client_id,
-    ) {
+    let claims = match verify_query_token(&token, &state) {
         Ok(c) => c,
         Err((status, msg)) => return (status, msg).into_response(),
     };
@@ -1123,12 +1108,7 @@ async fn list_files_handler(
     let Some(token) = bearer_token(&headers) else {
         return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
     };
-    match verify_query_token(
-        &token,
-        &state.jwks,
-        &state.config.oidc.issuer_url,
-        &state.config.oidc.client_id,
-    ) {
+    match verify_query_token(&token, &state) {
         Ok(_claims) => Json(files::list_available_files(&state.config.files)).into_response(),
         Err((status, msg)) => (status, msg).into_response(),
     }
@@ -1175,12 +1155,7 @@ async fn stream_file_handler(
         log_audit("deny", "Missing bearer token".into(), "unknown".into(), None);
         return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
     };
-    let claims = match verify_query_token(
-        &token,
-        &state.jwks,
-        &state.config.oidc.issuer_url,
-        &state.config.oidc.client_id,
-    ) {
+    let claims = match verify_query_token(&token, &state) {
         Ok(c) => c,
         Err((status, msg)) => {
             log_audit("deny", msg.into(), "unknown".into(), None);

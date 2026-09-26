@@ -126,7 +126,10 @@ resource "vault_identity_oidc_provider" "localhost_provider" {
   # The issuer URL must be accessible from the browser of the user authenticating.
   # For local testing, this is typically the Vault address.
   # issuer = "http://127.0.0.1:8200"
-  allowed_client_ids = [vault_identity_oidc_client.webapp_client.client_id]
+  allowed_client_ids = [
+    vault_identity_oidc_client.webapp_client.client_id,
+    vault_identity_oidc_client.viewer_client.client_id,
+  ]
   scopes_supported = [
     vault_identity_oidc_scope.groups.name,
     vault_identity_oidc_scope.user_profile.name
@@ -174,11 +177,34 @@ resource "vault_identity_oidc_client" "webapp_client" {
   # Type of client. 'public' clients cannot securely store a secret (e.g., SPAs).
   client_type = "public"
 
-  # TTL for tokens
+  # TTL for tokens. Signing freshness is measured from the token's `iat`,
+  # so this lifetime no longer extends how long a signature stays valid.
   id_token_ttl     = 3600 # 1 hour
   access_token_ttl = 3600 # 1 hour
 
 
+}
+
+# The viewer client: logs users in for browsing files and execution logs.
+# Its tokens are bearer credentials, accepted by agents only on read-only
+# endpoints, so keep them short-lived. Must be a different client from the
+# signing client above.
+resource "vault_identity_oidc_client" "viewer_client" {
+  name = "webapp-viewer"
+
+  redirect_uris = [
+    "http://localhost:8080/oidc/callback",
+    "http://127.0.0.1:8080/oidc/callback"
+  ]
+
+  assignments = [
+    vault_identity_oidc_assignment.app_assignment.name
+  ]
+
+  client_type = "public"
+
+  id_token_ttl     = 900 # 15 minutes
+  access_token_ttl = 900
 }
 
 
@@ -195,7 +221,12 @@ output "oidc_provider_issuer_url" {
   description = "The issuer URL for Vault's OIDC provider. Use this for the '.well-known/oidc-configuration' endpoint."
 }
 
+output "oidc_viewer_client_id" {
+  value       = vault_identity_oidc_client.viewer_client.client_id
+  description = "The Client ID for the viewer (browsing) OIDC client."
+}
+
 output "oidc_client_id" {
   value       = vault_identity_oidc_client.webapp_client.client_id
-  description = "The Client ID for the OIDC webapp client."
+  description = "The Client ID for the OIDC signing client."
 }

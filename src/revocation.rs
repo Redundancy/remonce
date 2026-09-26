@@ -111,6 +111,8 @@ pub async fn verify_and_authorize(
         };
     let approver_max = approver_max.max(ctx.min_approver_validity.unwrap_or_default());
 
+    // Approver bundles and revoker attestations are both signing-client
+    // tokens; viewer tokens have no place here.
     let verifier_config = crate::security::VerifierConfig {
         client_id: ctx.config.oidc.client_id.clone(),
         issuer_url: ctx.config.oidc.issuer_url.clone(),
@@ -217,14 +219,16 @@ pub async fn verify_and_authorize(
 // --- Persistent store -----------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredRevocation {
-    sig: String,
+    /// The revoked approval's key binding (`hex(SHA256(approver pubkey))`).
+    key: String,
     expires_at_unix: i64,
 }
 
-/// Revoked approver-signature hashes backed by a JSONL append log, so the
-/// set survives service restarts. Expired entries are dropped (and the file
-/// compacted) on load.
+/// Revoked approvals (by approver key binding) backed by a JSONL append log,
+/// so the set survives service restarts. Expired entries are dropped (and
+/// the file compacted) on load.
 #[derive(Clone)]
 pub struct PersistentRevocationStore {
     inner: Arc<Mutex<StoreInner>>,
@@ -249,6 +253,21 @@ impl PersistentRevocationStore {
                 .filter(|l| !l.is_empty())
                 .collect();
             for (idx, line) in lines.iter().enumerate() {
+                // Logs from before key-binding revocation keyed on signature
+                // hex, which no longer matches anything. Refuse rather than
+                // silently dropping them — even as the last line, where the
+                // torn-write tolerance below would otherwise swallow it.
+                if let Ok(serde_json::Value::Object(obj)) =
+                    serde_json::from_str::<serde_json::Value>(line)
+                    && obj.contains_key("sig")
+                {
+                    return Err(format!(
+                        "'{}' is a pre-key-binding revocation log (line {}); archive it \
+                         and start a fresh one (see the upgrade notes in CONFIGURATION.md)",
+                        path.display(),
+                        idx + 1
+                    ));
+                }
                 let entry: StoredRevocation = match serde_json::from_str(line) {
                     Ok(e) => e,
                     // A crash mid-append leaves a torn final line. Refusing
@@ -272,7 +291,7 @@ impl PersistentRevocationStore {
                 if entry.expires_at_unix <= now {
                     continue;
                 }
-                let slot = map.entry(entry.sig).or_insert(entry.expires_at_unix);
+                let slot = map.entry(entry.key).or_insert(entry.expires_at_unix);
                 if *slot < entry.expires_at_unix {
                     *slot = entry.expires_at_unix;
                 }
@@ -290,9 +309,9 @@ impl PersistentRevocationStore {
     fn compact(&self) -> Result<(), String> {
         let inner = self.inner.lock().expect("revocation store lock poisoned");
         let mut out = String::new();
-        for (sig, expires_at_unix) in &inner.map {
+        for (key, expires_at_unix) in &inner.map {
             let line = serde_json::to_string(&StoredRevocation {
-                sig: sig.clone(),
+                key: key.clone(),
                 expires_at_unix: *expires_at_unix,
             })
             .map_err(|e| format!("Serialize error: {e}"))?;
@@ -306,11 +325,11 @@ impl PersistentRevocationStore {
         Ok(())
     }
 
-    /// Record `sig_hex` as revoked until `expires_at_unix`, appending to the
+    /// Record `key` as revoked until `expires_at_unix`, appending to the
     /// log. Idempotent; keeps the later expiry if revoked twice.
-    pub fn revoke(&self, sig_hex: &str, expires_at_unix: i64) -> Result<(), String> {
+    pub fn revoke(&self, key: &str, expires_at_unix: i64) -> Result<(), String> {
         let mut inner = self.inner.lock().expect("revocation store lock poisoned");
-        match inner.map.get(sig_hex) {
+        match inner.map.get(key) {
             Some(existing) if *existing >= expires_at_unix => return Ok(()),
             _ => {}
         }
@@ -319,7 +338,7 @@ impl PersistentRevocationStore {
         // must not claim the revocation exists (a retry would short-circuit
         // above and the revocation would vanish on restart).
         let line = serde_json::to_string(&StoredRevocation {
-            sig: sig_hex.to_string(),
+            key: key.to_string(),
             expires_at_unix,
         })
         .map_err(|e| format!("Serialize error: {e}"))?;
@@ -331,16 +350,16 @@ impl PersistentRevocationStore {
         writeln!(file, "{line}").map_err(|e| format!("Failed to append revocation: {e}"))?;
         file.sync_data()
             .map_err(|e| format!("Failed to sync revocation log: {e}"))?;
-        inner.map.insert(sig_hex.to_string(), expires_at_unix);
+        inner.map.insert(key.to_string(), expires_at_unix);
         Ok(())
     }
 
-    pub fn is_revoked(&self, sig_hex: &str) -> bool {
+    pub fn is_revoked(&self, key: &str) -> bool {
         let inner = self.inner.lock().expect("revocation store lock poisoned");
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         inner
             .map
-            .get(sig_hex)
+            .get(key)
             .map(|expires_at| *expires_at > now)
             .unwrap_or(false)
     }
@@ -433,7 +452,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/revoke", post(revoke_handler))
-        .route("/revoked/{sig}", get(revoked_handler))
+        .route("/revoked/{key}", get(revoked_handler))
         .with_state(state);
 
     let addr: SocketAddr = svc_config
@@ -478,7 +497,7 @@ async fn revoke_handler(
     if expiry > time::OffsetDateTime::now_utc() {
         state
             .store
-            .revoke(&revocation.approver_signature_hex, expiry.unix_timestamp())
+            .revoke(&revocation.approver_key_binding, expiry.unix_timestamp())
             .map_err(|e| {
                 crate::audit::log_audit(
                     "error",
@@ -525,11 +544,16 @@ async fn revoke_handler(
 
 async fn revoked_handler(
     State(state): State<ServiceState>,
-    Path(sig): Path<String>,
-) -> Json<RevokedStatus> {
-    Json(RevokedStatus {
-        revoked: state.store.is_revoked(&sig),
-    })
+    Path(key): Path<String>,
+) -> Result<Json<RevokedStatus>, (axum::http::StatusCode, &'static str)> {
+    // A key binding is a lowercase hex SHA-256. Rejecting anything else
+    // keeps a malformed query from ever reading as "not revoked".
+    if key.len() != 64 || !key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "Invalid key binding"));
+    }
+    Ok(Json(RevokedStatus {
+        revoked: state.store.is_revoked(&key),
+    }))
 }
 
 #[cfg(test)]
@@ -602,7 +626,7 @@ mod tests {
     fn corrupt_middle_entry_is_rejected() {
         let path = temp_path("corrupt");
         let live = format!(
-            "{{\"sig\":\"abc\",\"expires_at_unix\":{}}}",
+            "{{\"key\":\"abc\",\"expires_at_unix\":{}}}",
             far_future()
         );
         std::fs::write(&path, format!("not json\n{live}\n")).unwrap();
@@ -615,12 +639,34 @@ mod tests {
         // A crash mid-append must not stop the service from starting.
         let path = temp_path("torn");
         let live = format!(
-            "{{\"sig\":\"abc\",\"expires_at_unix\":{}}}",
+            "{{\"key\":\"abc\",\"expires_at_unix\":{}}}",
             far_future()
         );
-        std::fs::write(&path, format!("{live}\n{{\"sig\":\"de")).unwrap();
+        std::fs::write(&path, format!("{live}\n{{\"key\":\"de")).unwrap();
         let store = PersistentRevocationStore::load(path.clone()).unwrap();
         assert!(store.is_revoked("abc"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_format_log_refused() {
+        let path = temp_path("oldformat");
+        let old = format!("{{\"sig\":\"abc\",\"expires_at_unix\":{}}}", far_future());
+        let new = format!("{{\"key\":\"def\",\"expires_at_unix\":{}}}", far_future());
+        std::fs::write(&path, format!("{old}\n{new}\n")).unwrap();
+        let err = PersistentRevocationStore::load(path.clone()).err().unwrap();
+        assert!(err.contains("pre-key-binding"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_format_single_line_not_treated_as_torn() {
+        // A one-line old log is also the "last line"; it must not be
+        // silently dropped by the torn-write tolerance.
+        let path = temp_path("oldsingle");
+        let old = format!("{{\"sig\":\"abc\",\"expires_at_unix\":{}}}", far_future());
+        std::fs::write(&path, format!("{old}\n")).unwrap();
+        assert!(PersistentRevocationStore::load(path.clone()).is_err());
         let _ = std::fs::remove_file(path);
     }
 

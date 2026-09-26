@@ -5,9 +5,22 @@
 # This should match the 'issuer' URL from the Terraform outputs.
 issuer_url = "http://127.0.0.1:8200/v1/identity/oidc/provider/vaultprovider"
 
-# The OIDC client ID for this application.
+# The *signing* OIDC client. Every approval, cosign and revocation is a
+# fresh login to this client with forced re-authentication.
 # This should match the 'oidc_client_id' from the Terraform outputs.
-client_id = "xAoXyxo5QuLi3zxz17OR82L2vW258SEP"
+client_id = "k6zGO8u0k6MMwkqTNbLCkGeFx2QWT8iW"
+
+# The *viewer* OIDC client, used to log in for browsing files and logs. Its
+# tokens are bearer credentials the agent accepts only on read-only
+# endpoints. Must differ from client_id. Required by `remonce web`.
+# This should match the 'oidc_viewer_client_id' from the Terraform outputs.
+viewer_client_id = "xtoIjxJ0LDciBOD3TKqd175ZVKTne6er"
+
+# Re-authentication on signing logins. max_age defaults to 1s, i.e. always
+# re-authenticate (Vault rejects 0). Add prompt=login for IdPs that ignore
+# max_age.
+#signing_max_age = "1s"
+#signing_prompt_login = false
 
 # Explicit redirect URI to avoid cookie domain mismatch (localhost vs 127.0.0.1)
 redirect_uri = "http://localhost:8080/oidc/callback"
