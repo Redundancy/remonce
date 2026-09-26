@@ -70,8 +70,7 @@ impl SignAction {
     /// the request — so the callback is not an open redirect.
     fn return_page(&self) -> &'static str {
         match self {
-            SignAction::Approve { .. } => "/ui/inspect",
-            SignAction::Cosign { .. } => "/ui/cosign",
+            SignAction::Approve { .. } | SignAction::Cosign { .. } => "/ui/review",
             SignAction::Revoke { .. } => "/ui/execute",
         }
     }
@@ -91,7 +90,13 @@ struct PendingSign {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SignOutcome {
-    Bundle { bundle: Box<ExecutionBundle> },
+    Bundle {
+        bundle: Box<ExecutionBundle>,
+        /// Who signed, from the verified ID token.
+        signer: String,
+        /// RFC 3339 time from the verified TSA timestamp.
+        signed_at: String,
+    },
     Revoked { status: u16, body: serde_json::Value },
     Error { message: String },
 }
@@ -277,7 +282,7 @@ async fn sign(
     .await?;
     let started_at = time::OffsetDateTime::from_unix_timestamp(entry.started_at_unix)
         .map_err(|_| "Invalid start time".to_string())?;
-    crate::oidc_client::validate_id_token(
+    let claims = crate::oidc_client::validate_id_token(
         &id_token,
         &state.jwks,
         &state.config.oidc.issuer_url,
@@ -285,6 +290,12 @@ async fn sign(
         &crate::security::key_binding(&entry.public_key_pem),
         Some(started_at),
     )?;
+    let signer = claims
+        .get("username")
+        .or_else(|| claims.get("sub"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
 
     let key = crate::signing::key_from_hex(&entry.signing_key_hex)?;
     let tsa_url = &state.config.timestamp_authority.url;
@@ -305,7 +316,10 @@ async fn sign(
                 payload.as_bytes(),
             )
             .await?;
+            let signed_at = timestamp_time(state, &a)?;
             Ok(SignOutcome::Bundle {
+                signer,
+                signed_at,
                 bundle: Box::new(ExecutionBundle {
                     approver: ApproverBundle {
                         command,
@@ -323,7 +337,10 @@ async fn sign(
             let payload = crate::security::operator_payload(&approver.signature, pem);
             let a = crate::signing::attest(&state.http_client, tsa_url, &key, pem, id_token, &payload)
                 .await?;
+            let signed_at = timestamp_time(state, &a)?;
             Ok(SignOutcome::Bundle {
+                signer,
+                signed_at,
                 bundle: Box::new(ExecutionBundle {
                     operator: Some(OperatorCosign {
                         approver_sig: approver.signature.clone(),
@@ -371,6 +388,22 @@ async fn sign(
             Ok(SignOutcome::Revoked { status, body })
         }
     }
+}
+
+/// Verify the attestation's TSA token the way an agent will, and return its
+/// time. Catches a misconfigured or untrusted TSA here, before the bundle is
+/// handed out, rather than at execution.
+fn timestamp_time(
+    state: &AppState,
+    a: &crate::signing::Attestation,
+) -> Result<String, String> {
+    let token = hex::decode(&a.timestamp_token).map_err(|_| "Invalid TSA token".to_string())?;
+    let mut data = hex::decode(&a.signature).map_err(|_| "Invalid signature".to_string())?;
+    data.extend_from_slice(a.id_token.as_bytes());
+    let at = crate::tsa::verify_timestamp(&token, &data, &state.trusted_roots)
+        .map_err(|e| format!("The timestamp from the TSA does not verify: {e}"))?;
+    at.format(&time::format_description::well_known::Rfc3339)
+        .map_err(|e| e.to_string())
 }
 
 /// GET /api/sign/result/{id} — read (and forget) a signing result.

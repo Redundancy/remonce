@@ -1,32 +1,20 @@
-<h2 class="mb-4">Execute Command</h2>
-
-<!-- Input Section -->
-<div id="execution-input-area" class="row justify-content-center mb-4">
-    <div class="col-md-8 col-lg-6">
-        <div class="card shadow-sm border-danger">
-            <div class="card-body">
-                <p class="text-muted small">Paste a signed token from yourself or another user to execute it.
-                </p>
-                <div class="mb-3">
-                    <label for="signed-token-input" class="form-label">Signed Token</label>
-                    <textarea id="signed-token-input" class="form-control" rows="3"
-                        placeholder="Paste Base64 signed token here..."></textarea>
-                </div>
-                <button id="execute-token-btn" class="btn btn-danger w-100">
-                    Execute
-                </button>
-                <button id="revoke-token-btn" class="btn btn-outline-warning w-100 mt-2"
-                    title="Revoke this approval on the agent. The approver themselves may always revoke; anyone else needs policy approval.">
-                    Revoke Approval
-                </button>
-                <div id="agent-url-area" class="mt-3"></div>
-            </div>
-        </div>
-    </div>
+<div class="page-head">
+  <div>
+    <h1>Execute</h1>
+    <div class="sub">Run a signed approval on the agent, or revoke it so no agent will accept it.</div>
+  </div>
 </div>
 
-<script>
-    document.addEventListener('DOMContentLoaded', () => {
-        // Auto-execute if signed_token is present is handled in signing.js
-    });
-</script>
+<div id="exec-result"></div>
+
+<section class="panel">
+  <div class="field">
+    <label for="exec-token">Signed approval</label>
+    <textarea id="exec-token" class="input" spellcheck="false" placeholder="Paste the signed token (base64) or JSON bundle"></textarea>
+  </div>
+  <div class="actions">
+    <button id="exec-btn" class="btn">Review</button>
+  </div>
+</section>
+
+<div id="exec-detail" hidden></div>

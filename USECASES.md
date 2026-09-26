@@ -57,7 +57,7 @@ allow if {
 }
 ```
 
-**UI status.** ✅ Fully supported. Generate → Inspect & Sign → Execute is exactly this path. The Files page covers the read-only file flow.
+**UI status.** ✅ Fully supported. Commands → Prepare → Sign → Execute now is exactly this path, and the Runs page streams the output. The Files page covers the read-only file flow.
 
 ---
 
@@ -113,7 +113,7 @@ allow if {
 ```
 
 **UI status.** ✅ Supported, with one identity-provider caveat.
-- ✅ The Generate page has an `operator_requires` builder; Inspect & Sign exports the approver bundle as copyable base64 or downloadable JSON.
+- ✅ Preparing a command has a **Delegate** option with an `operator_requires` builder; the signed approval is exported as copyable base64 or downloadable JSON.
 - ✅ `remonce cosign` covers the executor side: reads the bundle from a file or stdin, does the cosign locally, and `--submit`s to the agent.
 - ⚠️ Caveat: the cosigner's OIDC token must carry a `nonce` bound to its ephemeral key. Machine-minted tokens generally can't: GitHub Actions OIDC has fixed claims, and Vault's machine flows ([identity tokens](https://developer.hashicorp.com/vault/docs/secrets/identity/identity-token)) take no caller-selected nonce either. Until the planned machine-operator path lands (see PRODUCTION_READINESS.md), a human runs the cosign step.
 
@@ -132,7 +132,7 @@ allow if {
 
 1. Before bed, you sign the runbook command via the signer UI. You set `operator_requires` to require `groups contains "noc-l2"`. `approver_max_validity` defaults to 3 days.
 2. You hand the bundle off — an attachment in the runbook ticket, a paste into a ChatOps thread, anything. There's no secret in the bundle that's worth more than a single execution.
-3. At 3am the NOC engineer pages in. They open the ticket, copy the bundle, log into `remonce web` running on their laptop, paste the bundle into the Co-sign page, and re-authenticate when asked (every signature gets its own login).
+3. At 3am the NOC engineer pages in. They open the ticket, copy the bundle, log into `remonce web` running on their laptop, paste the bundle into "Sign a request", and re-authenticate when asked (every signature gets its own login).
 4. Their workstation co-signs with a one-time key, then forwards the resulting `ExecutionBundle` to the agent. The agent verifies you authorized it, verifies them as a fresh cosigner with the right group, runs the action.
 5. Audit log records both identities — you authorized, they executed.
 
@@ -152,8 +152,8 @@ allow if {
 The `not input.self_executed` is a four-eyes constraint — even if you happen to also be in `noc-l2`, you can't both authorize and execute the same bundle. Drop the line if you don't need separation of duties.
 
 **UI status.** ✅ Fully supported.
-- ✅ The approver builds the delegation on the Generate page (operator-requirements builder), signs on Inspect & Sign, and exports via copy or Download JSON.
-- ✅ The NOC side uses the **Cosign** page: paste the bundle, inspect the command + who approved it, co-sign, Execute Now — or `remonce cosign` from a terminal.
+- ✅ The approver prepares the command with **Delegate** (operator-requirements builder), signs it, and exports via copy or Download JSON.
+- ✅ The NOC side uses **Sign a request**: paste the bundle, check the command and who approved it, co-sign, Execute now — or `remonce cosign` from a terminal.
 
 ---
 
@@ -224,6 +224,6 @@ A few cross-cutting notes that fall out of these four:
 
 The delegation use cases (2 and 3) are covered by:
 
-1. **"Create a delegation"** — on the Generate page tick **Delegate** and optionally add `operator_requires` rows (claim/op/value); Inspect & Sign exports the signed approver bundle via copy-to-clipboard or Download JSON.
-2. **Cosign page** (`/ui/cosign`) — paste an approver bundle, inspect the command + claimed approver identity (best-effort; the agent is the final authority), co-sign with your session identity, and submit.
+1. **"Create a delegation"** — when preparing a command choose **Delegate** and optionally add `operator_requires` rows (claim/op/value); the signed approval is exported via copy-to-clipboard or Download JSON.
+2. **Sign a request** (`/ui/review`) — paste an approver bundle, check the command + claimed approver identity (best-effort; the agent is the final authority), co-sign with a fresh login, and submit.
 3. **`remonce cosign` CLI** — reads an approver bundle from a file or stdin, runs its own browser-based OIDC login (PKCE + nonce-bound ephemeral key), cosigns locally, and writes the ExecutionBundle to stdout/a file or `--submit`s it to the agent. See CONFIGURATION.md.

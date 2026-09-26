@@ -81,13 +81,13 @@ In a **new terminal** window:
 
 ### Frontend Development (`ui/`)
 
-The UI is built with **HTML** and **Bootstrap 5.3**. Assets are served locally from the `ui/` directory.
+The UI is plain HTML, CSS and JavaScript with no framework, build step or third-party assets. Everything is served from the `ui/` directory, under a strict Content Security Policy (no inline script or styles, no external origins).
 
--   **Modify HTML**: Edit `ui/*.html` files.
+-   **Pages**: `ui/layout.html` is the shell (sidebar, top bar); each page is a fragment (`ui/commands.html`, `review.html`, `execute.html`, `monitor.html`, `files.html`) rendered into it.
     -   *Note*: The Rust server loads these templates **at runtime** on each request, so you **do not** need to restart `cargo run` to see HTML changes. Just refresh your browser.
--   **Modify CSS**: Edit `ui/style.css`.
+-   **Modify CSS**: Edit `ui/static/remonce.css`.
     -   You may need to hard-refresh (Ctrl+F5) to clear browser cache.
--   **Modify JS**: Edit `ui/signing.js`.
+-   **Modify JS**: Edit `ui/static/app.js`. It builds the DOM without `innerHTML`, and must not add inline handlers (the CSP blocks them).
     -   Refresh browser to see changes.
 
 ### Backend Development (`src/`)

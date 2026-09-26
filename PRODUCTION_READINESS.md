@@ -53,8 +53,7 @@ This document tracks known security gaps, "TODO" items, and requirements for mov
 - **Improvement**: optionally pin the TSA policy OID / signer certificate, and verify signingCertificate(v2).
 
 ### Content Security Policy for the Signer UI
-- **Current**: the web tier sends `nosniff`, `X-Frame-Options: DENY` and `no-referrer`, and agent responses are always relayed as JSON. Data-driven inline handlers were removed, but a few static inline `onclick`/`<script>` blocks remain.
-- **Improvement**: move the remaining inline script into `signing.js` and add a strict `script-src 'self'` CSP.
+- **Status**: **Fixed**. The signer UI has no inline script or styles and no third-party assets, and every response carries `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'` (plus `frame-ancestors 'none'`, `base-uri 'none'`, `form-action 'self'`), alongside `nosniff`, `X-Frame-Options: DENY` and `no-referrer`. Page templates HTML-escape every substituted value, and `/api/commands` no longer exposes executables, arguments or environment.
 
 ### Library-Based TSA Handling
 - **Current**: custom RFC 3161 implementation in `src/tsa.rs`, written to control the verification chain precisely without heavy dependencies.

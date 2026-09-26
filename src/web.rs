@@ -70,6 +70,16 @@ async fn security_headers(
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    // The UI is fully self-hosted: no inline scripts, no third-party origins.
+    // Signed bundles (with ID tokens) live in these pages, so injected script
+    // must have nowhere to load from or send to.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+             connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
     resp
 }
 
@@ -96,6 +106,8 @@ pub struct AppState {
     pub agent_http: Client,
     /// rustls config for WebSocket connections to the agent.
     pub agent_tls: std::sync::Arc<rustls::ClientConfig>,
+    /// TSA trust anchors, to check each timestamp before handing out a bundle.
+    pub trusted_roots: Vec<Vec<u8>>,
 }
 
 /// Data stored in the session during a viewer login.
@@ -104,6 +116,23 @@ struct LoginFlow {
     state: String,
     pkce_verifier: String,
     nonce: String,
+    /// Local UI path to return to after login (validated by `local_ui_path`).
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LoginQuery {
+    next: Option<String>,
+}
+
+/// Accept only same-origin UI paths as a post-login destination, so the
+/// login endpoint can't be used as an open redirect.
+fn local_ui_path(next: &str) -> Option<String> {
+    let ok = (next == "/ui" || next.starts_with("/ui/") || next.starts_with("/ui?"))
+        && !next.contains("//")
+        && !next.contains('\\')
+        && !next.chars().any(|c| c.is_control());
+    ok.then(|| next.to_string())
 }
 
 /// Data stored in the session after a user has logged in. Holds only the
@@ -190,6 +219,11 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
     let agent_tls = crate::agent_proxy::build_agent_tls(config.agent_ca_path.as_deref())
         .map_err(AppError::Config)?;
 
+    let trusted_roots = crate::tsa::load_trust_anchors(
+        config.timestamp_authority.ca_path.as_deref(),
+        config.timestamp_authority.trust_system_store,
+    );
+
     let app_state = AppState {
         http_client: http_client.clone(),
         config: config.clone(),
@@ -198,6 +232,7 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         hostname,
         agent_http,
         agent_tls,
+        trusted_roots,
     };
 
     // Session layer for storing OIDC state and user profile.
@@ -215,7 +250,7 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
     let session_layer = session_layer.with_secure(secure_cookies);
 
     let app = Router::new()
-        .route("/", get(|| async { Redirect::to("/auth/login") }))
+        .route("/", get(|| async { Redirect::to("/ui") }))
         .route("/auth/login", get(login_handler))
         .route("/oidc/callback", get(callback_handler))
         .route("/api/sign/begin", post(crate::web_sign::begin_handler))
@@ -257,69 +292,105 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Index page handler (root /ui)
+/// The UI pages: `/ui/{name}` renders `ui/{name}.html` inside the layout.
+const UI_PAGES: &[(&str, &str)] = &[
+    ("commands", "Commands"),
+    ("review", "Sign a request"),
+    ("execute", "Execute"),
+    ("monitor", "Runs"),
+    ("files", "Files"),
+];
+
+/// `/ui` — the command registry.
 async fn index_page_handler(
     State(state): State<AppState>,
     session: Session,
-) -> Result<Html<String>, AppError> {
-    render_template(session, "index", &state).await
+    uri: axum::http::Uri,
+) -> Result<axum::response::Response, AppError> {
+    render_template(session, "commands", &state, &uri).await
 }
 
-/// Generic UI handler for /ui/:page
+/// `/ui/{page}` for the pages in `UI_PAGES`.
 async fn ui_handler(
     State(state): State<AppState>,
     session: Session,
     axum::extract::Path(page): axum::extract::Path<String>,
-) -> Result<Html<String>, AppError> {
-    // Basic validation to prevent traversal
-    if !page.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-         return Err(AppError::Internal("Invalid page name".into()));
-    }
-    render_template(session, &page, &state).await
+    uri: axum::http::Uri,
+) -> Result<axum::response::Response, AppError> {
+    render_template(session, &page, &state, &uri).await
 }
 
-/// Helper to render pages using Header/Footer partials
+#[cfg(test)]
+mod tests {
+    use super::local_ui_path;
+
+    #[test]
+    fn login_return_path_is_local_ui_only() {
+        assert_eq!(local_ui_path("/ui").as_deref(), Some("/ui"));
+        assert_eq!(local_ui_path("/ui/monitor?id=1").as_deref(), Some("/ui/monitor?id=1"));
+        for bad in ["https://evil.example/ui", "//evil.example/ui", "/ui//evil", "/uix", "/auth/login", "/ui\\x"] {
+            assert_eq!(local_ui_path(bad), None, "{bad}");
+        }
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Render a page into `ui/layout.html`. Every substituted value is
+/// HTML-escaped; page fragments contain no script.
 async fn render_template(
     session: Session,
-    template_name: &str,
+    page: &str,
     state: &AppState,
-) -> Result<Html<String>, AppError> {
-    let hostname = &state.hostname;
+    uri: &axum::http::Uri,
+) -> Result<axum::response::Response, AppError> {
+    let Some(&(page, title)) = UI_PAGES.iter().find(|(name, _)| *name == page) else {
+        return Ok((axum::http::StatusCode::NOT_FOUND, "Page not found").into_response());
+    };
     let profile: UserProfile = session.get(PROFILE_KEY).await?.unwrap_or_default();
-
     if profile.subject.is_empty() {
-        // Redirect to home if not logged in, or show friendly message?
-        // Using simple message for now as per previous logic
-        return Ok(Html(
-            "<h1>Not Logged In</h1><p><a href='/'>Home</a></p>".to_string(),
-        ));
+        let here = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/ui");
+        let next: String = url::form_urlencoded::byte_serialize(here.as_bytes()).collect();
+        return Ok(Redirect::to(&format!("/auth/login?next={next}")).into_response());
     }
 
-    // Load Partials
-    let header = std::fs::read_to_string("ui/header.html").map_err(|e| {
-        AppError::Internal(format!("Failed to load header: {e}"))
-    })?;
-    
-    let footer = std::fs::read_to_string("ui/footer.html").map_err(|e| {
-        AppError::Internal(format!("Failed to load footer: {e}"))
-    })?;
+    let read = |path: &str| {
+        std::fs::read_to_string(path)
+            .map_err(|e| AppError::Internal(format!("Failed to load {path}: {e}")))
+    };
+    let layout = read("ui/layout.html")?;
+    let content = read(&format!("ui/{page}.html"))?;
 
-    // Load Content
-    let content_path = format!("ui/{}.html", template_name);
-    let content = std::fs::read_to_string(&content_path).map_err(|e| {
-         AppError::Internal(format!("Page not found ({}): {}", template_name, e))
-    })?;
+    let initials: String = profile
+        .username
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .take(2)
+        .filter_map(|w| w.chars().next())
+        .collect::<String>()
+        .to_uppercase();
+    let agent_options: String = std::iter::once(&state.config.agent_url)
+        .chain(state.config.allowed_agent_urls.iter())
+        .map(|u| format!("<option value=\"{}\"></option>", html_escape(u)))
+        .collect();
 
-    // Combine
-    let full_body = format!("{}{}{}", header, content, footer);
+    let body = layout
+        .replace("{{content}}", &content)
+        .replace("{{page}}", page)
+        .replace("{{title}}", title)
+        .replace("{{username}}", &html_escape(&profile.username))
+        .replace("{{initials}}", &html_escape(&initials))
+        .replace("{{hostname}}", &html_escape(&state.hostname))
+        .replace("{{agent_url}}", &html_escape(&state.config.agent_url))
+        .replace("{{agent_options}}", &agent_options);
 
-    // Replace Variables
-    let body = full_body
-        .replace("{{subject}}", &profile.subject)
-        .replace("{{hostname}}", hostname)
-        .replace("{{agent_url}}", &state.config.agent_url);
-
-    Ok(Html(body))
+    Ok(Html(body).into_response())
 }
 
 /// Initiates a viewer login (the browsing session). Signing never uses
@@ -327,6 +398,7 @@ async fn render_template(
 async fn login_handler(
     State(state): State<AppState>,
     session: Session,
+    Query(query): Query<LoginQuery>,
 ) -> Result<Redirect, AppError> {
     let viewer_client_id = viewer_client_id(&state)?;
     let oidc_state = crate::oidc_client::random_token();
@@ -342,6 +414,7 @@ async fn login_handler(
                 state: oidc_state.clone(),
                 pkce_verifier,
                 nonce: nonce.clone(),
+                next: query.next.as_deref().and_then(local_ui_path),
             },
         )
         .await?;
@@ -461,7 +534,7 @@ async fn callback_handler(
         )
         .await?;
 
-    Ok(Redirect::to("/ui"))
+    Ok(Redirect::to(flow.next.as_deref().unwrap_or("/ui")))
 }
 
 // Custom (de)serialization for session data
@@ -480,10 +553,34 @@ impl From<tower_sessions::session::Error> for AppError {
 }
 
 /// Helper handler to fetch available commands if authorized.
+/// What the UI needs to know about a command. Deliberately excludes the
+/// executable, arguments, working directory and environment.
+#[derive(Serialize)]
+struct CommandView {
+    name: String,
+    description: Option<String>,
+    /// Seconds a delegated approval stays usable after signing.
+    approver_max_validity_secs: u64,
+    /// Seconds the executing signature stays usable after signing.
+    operator_max_validity_secs: u64,
+    params: Vec<ParamView>,
+}
+
+#[derive(Serialize)]
+struct ParamView {
+    name: String,
+    description: Option<String>,
+    required: bool,
+    default: Option<String>,
+    allowed: Option<Vec<String>>,
+    min: Option<i64>,
+    max: Option<i64>,
+}
+
 async fn get_commands_handler(
     State(state): State<AppState>,
     session: Session,
-) -> Result<axum::Json<Vec<crate::config::CommandConfig>>, AppError> {
+) -> Result<axum::Json<Vec<CommandView>>, AppError> {
     let profile = require_profile(&session).await?;
 
     // Query OPA for "view_docs" permission
@@ -511,8 +608,32 @@ async fn get_commands_handler(
         .unwrap_or(false);
 
     if !allowed {
-        return Err(AppError::Auth("Unauthorized to view commands".into()));
+        return Err(AppError::Forbidden("Policy does not allow you to view commands".into()));
     }
 
-    Ok(axum::Json(state.config.commands.clone()))
+    let commands = state
+        .config
+        .commands
+        .iter()
+        .map(|c| CommandView {
+            name: c.name.clone(),
+            description: c.description.clone(),
+            approver_max_validity_secs: c.approver_max_validity_or_default().as_secs(),
+            operator_max_validity_secs: c.operator_max_validity_or_default().as_secs(),
+            params: c
+                .params
+                .iter()
+                .map(|p| ParamView {
+                    name: p.name.clone(),
+                    description: p.description.clone(),
+                    required: p.required,
+                    default: p.default.clone(),
+                    allowed: p.allowed.clone(),
+                    min: p.min,
+                    max: p.max,
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(axum::Json(commands))
 }

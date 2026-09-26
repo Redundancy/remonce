@@ -101,7 +101,8 @@ There is also **`remonce cosign`** — a headless CLI for operators who receive 
     mkdir certs
     openssl req -x509 -newkey rsa:2048 -nodes -days 365 `
       -keyout certs/agent-key.pem -out certs/agent-fullchain.pem `
-      -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+      -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" `
+      -addext "basicConstraints=critical,CA:FALSE"
     ```
     Then uncomment the `[agent]` / `[agent.tls]` block in [config.toml](config.toml).
 3.  **Start Services**:

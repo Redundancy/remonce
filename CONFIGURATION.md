@@ -118,8 +118,11 @@ Generate a self-signed cert for local testing with e.g. `rcgen`, `mkcert`, or `o
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout certs/agent-key.pem -out certs/agent-fullchain.pem \
-  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+  -addext "basicConstraints=critical,CA:FALSE"
 ```
+
+`CA:FALSE` matters: `openssl req -x509` otherwise marks the certificate as a CA, and the signer's WebSocket client (used for log and file streaming) rejects a CA certificate presented as a server certificate.
 
 Certificates are hot-reloaded on change.
 
@@ -329,7 +332,7 @@ Both windows are measured from the signing login — the ID token's IdP-signed `
 | `{ "any_of": [] }` | **Delegated to any operator** (subject to OPA). Self-execution is rejected. |
 | `{ "any_of": [ ... ] }` | **Delegated with constraints.** The operator must match at least one predicate. |
 
-In the web UI, tick **Delegate** on the Generate page (optionally adding requirements); `remonce cosign` refuses self-execute-only approvals up front.
+In the web UI, choose **Delegate** when preparing a command (optionally adding requirements); `remonce cosign` refuses self-execute-only approvals up front.
 
 The predicates are enforced by the agent *before* OPA:
 
@@ -361,7 +364,7 @@ remonce cosign -b approval.json -o execution-bundle.json
 The command reads `[oidc]` and `agent_url` / `agent_ca_path` from `config.toml`. It generates a fresh ephemeral keypair, runs a browser-based OIDC authorization-code flow against the signing client (PKCE, the nonce bound to the ephemeral key, and forced re-authentication — same pattern as the web UI), obtains an RFC 3161 timestamp on the cosignature, and produces an ExecutionBundle.
 
 - `--agent <url>` overrides `agent_url` for `--submit`. Must be `https://`.
-- The OIDC redirect listener binds the host/port from `oidc.redirect_uri`. If `remonce web` is already running on that port, use its Cosign page instead.
+- The OIDC redirect listener binds the host/port from `oidc.redirect_uri`. If `remonce web` is already running on that port, co-sign from its "Sign a request" page instead.
 - Note for CI: tokens minted by platform OIDC issuers (e.g. GitHub Actions) cannot carry a custom nonce, so they cannot bind an ephemeral key. CLI cosigning is for humans; machine flows need an issuer that honors the `nonce` parameter.
 
 ## Revoking an approval (`remonce revoke`)
