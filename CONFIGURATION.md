@@ -6,6 +6,8 @@ This document identifies the configuration options available for Remonce, includ
 
 Both `remonce web` (the signer) and `remonce agent` (the executor) read the same `config.toml` from the current working directory. Each binary only uses the sections relevant to it.
 
+Unknown keys are rejected at startup: a misspelled setting (say `max_validity` instead of `approver_max_validity`) fails loudly instead of silently falling back to a default.
+
 ### Deployment model
 
 Remonce is designed around a split:
@@ -30,6 +32,7 @@ Currently gated settings:
 | `oidc.issuer_url` is `http://` and non-loopback | JWKS fetch at startup is MITM-able; compromises the entire identity trust chain |
 | `timestamp_authority.trust_system_store = true` | Trusts every CA in the OS store as a TSA signer (hundreds of CAs) |
 | `commands[].operator_max_validity > 1h` | Effectively turns off the at-execution-time freshness bound |
+| `opa_url` is `http://` and non-loopback | OPA's answer *is* the authorization decision; a MITM could return `allow` |
 | `agent.cors_allowed_origins` contains `"*"` | Allows any browser origin to call the agent |
 
 Loopback HTTP for OIDC (e.g., local Vault in dev) is **not** gated — it stays fine without the flag.
@@ -50,9 +53,14 @@ logs_dir = "logs"
 
 # Agent the web UI talks to. The browser never contacts the agent directly:
 # the signer proxies /api/agent/* and the /ws/* log streams to this URL over
-# TLS. Must be https://. The UI lets the user override it per-session.
+# TLS. Must be https://.
 # Default: "https://localhost:10022"
 agent_url = "https://agent.example.com:10022"
+
+# Other agents the UI may be pointed at. The agent box in the UI can only
+# select agent_url or one of these; any other URL is refused, because the
+# signer sends the user's ID token and signatures to whichever agent is used.
+allowed_agent_urls = ["https://db01.example.com:10022", "https://web01.example.com:10022"]
 
 # Optional: PEM file with extra CA roots trusted when the signer connects to
 # the agent (e.g. a self-signed agent cert or private CA). System roots are
@@ -148,6 +156,17 @@ These settings determine how the agent checks permissions.
 # If omitted, defaults to "http://localhost:8181".
 opa_url = "http://127.0.0.1:8181"
 ```
+
+Policy decisions requested by the agent (`input.action`):
+
+| Action | When | Input |
+|--------|------|-------|
+| `execute` | Running a signed command | approver/operator identities, `command`, `self_executed`, `host` |
+| `revoke` | Someone other than the approver revokes an approval | approver identity, revoker as `operator` |
+| `read_file` | Streaming an allowed file | `jwt`, `file` |
+| `view_execution` | Streaming an execution's output log | `jwt`, `execution_id` |
+
+The agent's file and log-stream endpoints take the caller's ID token as an `Authorization: Bearer` header (never a query parameter). The web tier attaches it when proxying.
 
 ### Security & TSA (RFC 3161)
 
@@ -264,13 +283,25 @@ Remonce separates **authorization freshness** (approver) from **execution freshn
 | Setting | Default | Controls |
 |---------|---------|----------|
 | `approver_max_validity` | 3 days | How long a signed approval stays usable. A pre-authorized command can sit until the NOC picks it up, up to this limit. |
-| `operator_max_validity` | 10 minutes | How recent the executor's signature must be. In a delegated flow this is the operator's cosign TSA timestamp; in self-execute it's the approver's own. Also bounds the replay-cache TTL. |
+| `operator_max_validity` | 10 minutes | How recent the executor's signature must be. In a delegated flow this is the operator's cosign TSA timestamp; in self-execute it's the approver's own. |
+
+Because anyone holding a signature and its ID token can re-timestamp it until the token expires, a signature effectively stays fresh until `token_exp + max_validity`. The replay cache and revocation list size their retention to match, and short ID token lifetimes (5–15 minutes) keep the window tight.
 
 **Self-execute vs delegated**: when the approver submits their own bundle immediately (no operator cosign), they must be within `operator_max_validity`. If you want longer self-execute windows, raise `operator_max_validity` — but remember this also lengthens the replay-cache window and the operator-side freshness bound.
 
 ### Operator constraints (`operator_requires`)
 
-The approver can embed OIDC claim predicates that the executing operator must satisfy. These are enforced by the agent *before* OPA:
+`operator_requires` is covered by the approver's signature and also decides the **delegation mode**:
+
+| `operator_requires` | Meaning |
+|---|---|
+| absent / `null` | **Self-execute only.** The approver runs it within `operator_max_validity`; a co-sign is rejected. |
+| `{ "any_of": [] }` | **Delegated to any operator** (subject to OPA). Self-execution is rejected. |
+| `{ "any_of": [ ... ] }` | **Delegated with constraints.** The operator must match at least one predicate. |
+
+In the web UI, tick **Delegate** on the Generate page (optionally adding requirements); `remonce cosign` refuses self-execute-only approvals up front.
+
+The predicates are enforced by the agent *before* OPA:
 
 ```json
 {
@@ -283,7 +314,7 @@ The approver can embed OIDC claim predicates that the executing operator must sa
 }
 ```
 
-Semantics: if `any_of` is non-empty, at least one predicate must match the operator's OIDC token claims. Empty/absent = no constraint (any authenticated operator in OPA's allow-set may execute). Claims are evaluated at **execution time** against the operator's fresh token, so group changes propagate immediately.
+Semantics: if `any_of` is non-empty, at least one predicate must match the operator's OIDC token claims; an empty list means any authenticated operator in OPA's allow-set. Claims are evaluated at **execution time** against the operator's fresh token, so group changes propagate immediately. An approver co-signing their own delegation is reported to OPA as `self_executed: true`, so four-eyes rules still hold.
 
 ## CLI cosigning (`remonce cosign`)
 
@@ -335,6 +366,7 @@ For multi-agent estates, run a single revocation service so one submission revok
 [revocation_service]
 listen_address = "0.0.0.0:10023"
 persist_path = "revocations.jsonl"   # survives restarts; compacted on load
+retention = "30d"                    # keep revocations at least this long (default 30d)
 
 [revocation_service.tls]
 mode = "files"                        # or "acme", same options as [agent.tls]
@@ -356,4 +388,6 @@ Semantics:
 - When `revocation_service_url` is set, the agent checks `GET /revoked/{sig}` before every execution and a revocation submitted to any agent is forwarded to the service.
 - **Fail-closed**: if the service is configured but unreachable, the agent denies execution (`Revocation Check Failed`). A configured revocation service must be available — there is deliberately no fail-open mode.
 - Revocations expire from the store when the underlying approval would have aged out of `approver_max_validity` anyway; expired entries are compacted out of the JSONL file on service restart.
-- The service reads the same `config.toml` sections as the agent (`[oidc]`, `[timestamp_authority]`, `[[commands]]`, `opa_url`), since it performs the same verification.
+- The service reads the same `config.toml` sections as the agent (`[oidc]`, `[timestamp_authority]`, `[[commands]]`, `opa_url`), since it performs the same verification. It also accepts revocations for commands missing from its own `[[commands]]` (verified with default windows; third parties judged by the default OPA rule), since it serves agents whose command sets it may not mirror.
+- `retention` must be at least the longest `approver_max_validity` any agent allows; each revocation is kept until the revoked approval's token expiry plus the larger of the two.
+- Writes are fsync'd before the service acknowledges them. A torn final line left by a crash is ignored at startup; corruption anywhere else refuses to start (agents then fail closed).

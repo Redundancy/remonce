@@ -25,6 +25,40 @@ Ensure you have the following installed and available in `bin/` or your PATH:
 
     Keep this terminal window open.
 
+## Vault Development Configuration
+
+`start_services.bat` configures Vault for local development, which differs from production in two ways.
+
+### 1. Userpass Authentication
+
+Production Vault deployments typically use enterprise auth methods (LDAP, OIDC, SAML) where entities and aliases are created automatically. For local development, `vault_setup.tf` creates a simple userpass backend:
+
+```hcl
+resource "vault_auth_backend" "userpass" {
+  type = "userpass"
+  path = "userpass"
+}
+```
+
+### 2. Manual Entity and Alias Creation
+
+With userpass, entities and aliases must be created manually (enterprise auth methods create them on first login):
+
+```hcl
+resource "vault_identity_entity" "example_user" {
+  name = "example-user"
+}
+
+resource "vault_identity_entity_alias" "example_user_alias" {
+  name           = "example"                              # Username
+  mount_accessor = vault_auth_backend.userpass.accessor   # Auth method
+  canonical_id   = vault_identity_entity.example_user.id
+}
+```
+
+> [!TIP]
+> For production Vault OIDC configuration, see [docs/idp/VAULT.md](docs/idp/VAULT.md).
+
 ## Running the Application
 
 In a **new terminal** window:

@@ -4,7 +4,7 @@ Concrete scenarios that map a real operational need onto Remonce's primitives. E
 
 The four primitives in play across all of these:
 
-- **Approver bundle** — the cryptographic authorization. Long validity (default 3 days). Carries a command + optional `operator_requires` claim predicates on whoever is allowed to execute.
+- **Approver bundle** — the cryptographic authorization. Long validity (default 3 days). Carries a command + optional `operator_requires`. Its presence (signed) marks the bundle as delegated — it must then be co-signed, and its claim predicates restrict who may do so; without it the bundle is self-execute only.
 - **Operator cosign** — the at-execution-time freshness + attribution layer. Short validity (default 10 minutes).
 - **OPA policy** — business-logic allow/deny. Sees both identities and `self_executed`.
 - **Loopback signer + remote agent** — the signer (`remonce web`) runs on the operator's workstation; the agent (`remonce agent`) runs on the target.
@@ -115,7 +115,7 @@ allow if {
 **UI status.** ✅ Supported, with one identity-provider caveat.
 - ✅ The Generate page has an `operator_requires` builder; Inspect & Sign exports the approver bundle as copyable base64 or downloadable JSON.
 - ✅ `remonce cosign` covers the executor side: reads the bundle from a file or stdin, does the cosign locally, and `--submit`s to the agent.
-- ⚠️ Caveat: the cosigner's OIDC token must carry a `nonce` bound to its ephemeral key. Platform-minted tokens (GitHub Actions OIDC, etc.) don't honor a custom `nonce`, so the CI workload needs an issuer that does (e.g. Vault's OIDC provider with the CI runner authenticating via JWT auth) — or a human runs the cosign step.
+- ⚠️ Caveat: the cosigner's OIDC token must carry a `nonce` bound to its ephemeral key. Machine-minted tokens generally can't: GitHub Actions OIDC has fixed claims, and Vault's machine flows ([identity tokens](https://developer.hashicorp.com/vault/docs/secrets/identity/identity-token)) take no caller-selected nonce either. Until the planned machine-operator path lands (see PRODUCTION_READINESS.md), a human runs the cosign step.
 
 ---
 
@@ -224,6 +224,6 @@ A few cross-cutting notes that fall out of these four:
 
 The delegation use cases (2 and 3) are covered by:
 
-1. **"Create a delegation"** — the Generate page includes an `operator_requires` builder (claim/op/value rows); Inspect & Sign exports the signed approver bundle via copy-to-clipboard or Download JSON.
+1. **"Create a delegation"** — on the Generate page tick **Delegate** and optionally add `operator_requires` rows (claim/op/value); Inspect & Sign exports the signed approver bundle via copy-to-clipboard or Download JSON.
 2. **Cosign page** (`/ui/cosign`) — paste an approver bundle, inspect the command + claimed approver identity (best-effort; the agent is the final authority), co-sign with your session identity, and submit.
 3. **`remonce cosign` CLI** — reads an approver bundle from a file or stdin, runs its own browser-based OIDC login (PKCE + nonce-bound ephemeral key), cosigns locally, and writes the ExecutionBundle to stdout/a file or `--submit`s it to the agent. See CONFIGURATION.md.

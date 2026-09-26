@@ -62,6 +62,7 @@ JWTs are short-lived, but we may want to execute commands slightly later. Howeve
 -   We send the signature to an RFC 3161 TSA.
 -   The TSA returns a signed timestamp proving the signature existed at time $T$.
 -   **Validation**: The Agent checks that $T$ is within the validity period of the User's ID Token.
+-   **Caveat — re-timestamping**: a TSA will timestamp any bytes, so whoever holds a signature and its ID token can obtain a *fresh* timestamp over them until the token's `exp`. Freshness windows therefore effectively run until `token_exp + window`, not `first_timestamp + window`. The replay cache and revocation list size their retention accordingly; keep ID token lifetimes short.
 
 ## Delegated Signing (Approver + Operator)
 
@@ -73,13 +74,25 @@ Real-world operations rarely have the person authorizing an action also executin
 -   **Operator**: executes the action. Adds a co-signature with a **short** validity (default: 10 minutes). Provides at-execution-time freshness and attribution.
 -   **Approver self-execute**: when the approver's own TSA timestamp is within the short (operator) window, no co-signature is required — they are acting as both roles. This is the common path for synchronous operations.
 
+### Delegation mode is signed
+
+Whether a bundle is meant for self-execution or for delegation is part of what the approver signs: the `operator_requires` field doubles as the mode.
+
+| `operator_requires` | Mode | Self-execute | Co-sign |
+|---|---|---|---|
+| absent / `null` | Self-execute only | allowed (within the short window) | **rejected** |
+| `{ "any_of": [] }` | Delegated to any operator | **rejected** | allowed (OPA still applies) |
+| `{ "any_of": [ ... ] }` | Delegated with constraints | **rejected** | allowed if a predicate matches |
+
+Without this, the unsigned `operator` field alone would decide the path: anyone holding a bundle meant for a `noc-l2` operator could drop the field and run it as the approver, and any self-execute bundle could be co-signed by anyone for days.
+
 ### Bundle shape
 
 ```
 ExecutionBundle
 ├── approver: ApproverBundle
 │     command                    // the JSON the approver authorized
-│     operator_requires?         // OIDC claim predicates the operator must satisfy
+│     operator_requires?         // null = self-execute only; present = delegated (+ predicates)
 │     signature                  // over canonical(command + operator_requires)
 │     id_token, public_key, timestamp_token
 └── operator: OperatorCosign?    // absent when the approver self-executes
@@ -90,6 +103,7 @@ ExecutionBundle
 
 ### Verification (agent)
 
+0.  Enforce the signed delegation mode: reject a co-sign on a self-execute-only bundle, and a missing co-sign on a delegated one. All signature hex must be canonical lowercase (the replay and revocation caches key on it).
 1.  Verify the approver signature over `canonical(command + operator_requires)`.
 2.  Verify the approver's TSA token covers `(approver_signature || approver_id_token)`.
 3.  Verify the approver's OIDC JWT: signature, issuer, audience, `nonce == SHA256(approver.public_key_pem)`, and `exp > approver_tsa_timestamp`.
@@ -98,7 +112,8 @@ ExecutionBundle
     -   Verify the operator's TSA token and JWT the same way as the approver's.
     -   **Freshness**: operator TSA timestamp must be within `operator_max_validity`; approver TSA must be within `approver_max_validity`.
     -   **Claim predicates**: if `operator_requires.any_of` is non-empty, at least one predicate must match the operator's JWT claims.
-5.  **Else (self-execute)**: the approver's own TSA timestamp must be within the short (`operator_max_validity`) window. `operator_requires` is ignored — it describes who the approver delegates to, not themselves.
+5.  **Else (self-execute)**: the approver's own TSA timestamp must be within the short (`operator_max_validity`) window.
+6.  `self_executed` is true whenever approver and operator share the same OIDC `sub` — including an approver co-signing their own delegated bundle — so four-eyes policies (`not input.self_executed`) can't be satisfied by one person.
 
 Only after these checks does the agent hand control to OPA, which sees both identities as `input.approver` and `input.operator` plus an `input.self_executed` flag. Most policy rules will be approver-centric; operator attestation is a fixed agent-level control.
 
@@ -115,7 +130,7 @@ The predicate language is deliberately small — if you need more expressive log
 
 ### Replay protection
 
-The agent keeps an in-memory cache keyed on the *executor* signature (operator cosign if delegated, approver signature if self-executing). The first submission succeeds; subsequent submissions within `operator_max_validity` are rejected. TTL equals the operator window, so once a signature is too old to pass freshness it naturally ages out of the cache.
+The agent keeps an in-memory cache keyed on the *executor* signature (operator cosign if delegated, approver signature if self-executing). The first submission succeeds; later submissions are rejected for as long as the signature could still pass freshness — until the executor's token expiry plus `operator_max_validity`, since the signature can be re-timestamped up to token expiry. The entry is recorded as the last check before the process spawns (and released if spawning fails), so a bundle rejected for an unrelated reason can be retried.
 
 This complements — doesn't replace — the freshness windows: freshness bounds exposure, replay cache prevents double-execution within that window.
 
@@ -133,11 +148,24 @@ A deny-by-default posture is the default. Example rules in [policy/authz.rego](p
 
 ## Future Considerations
 
-### Revocation server
-Approver/operator freshness windows + the replay cache cover most of the threat surface, but an approver may want to cancel a pre-authorized delegation before the operator acts. A standalone revocation service, consulted by the agent as part of verification, would close that gap. Tradeoff: adds an availability dependency on the critical path (choose fail-open and defeat the purpose, or fail-closed and block the 3am maintenance case). Deferred as an additive hardening.
+### Revocation
+Implemented: approvers (or, with OPA's consent, others) can revoke an approval before it expires, per agent or estate-wide through a central revocation service that agents consult fail-closed. See [CONFIGURATION.md](CONFIGURATION.md#revoking-an-approval-remonce-revoke).
 
 ### Multi-party approval chains
 The current design accepts exactly one approver + one optional operator. For workflows that need $N$ approvers, the approver bundle would generalize to a list, with the verification extending naturally. Not currently implemented.
 
-### Zero Knowledge Proofs
-We explored using zkSNARKs (e.g., [Spartan](https://github.com/Microsoft/Spartan)) for privacy-preserving signatures. While powerful, standard OIDC provides sufficient security for the current enterprise context without the computational overhead of ZKP.
+### Zero Knowledge Proofs (ZK-JWT) with SP1 — proposal, not implemented
+Delegation currently exposes the approver's full ID token to whoever executes the bundle. The token is useless for signing new commands (it is nonce-bound to the approver's ephemeral key), but it is still a valid bearer token for any service that accepts it without checking the binding — which is why Remonce needs a dedicated OIDC client ID.
+
+A general-purpose zkVM such as [SP1](https://github.com/succinctlabs/sp1) could remove that exposure. The goal is not to hide *who* approved, but to keep the raw JWT (and its signature) away from the executor:
+
+*   **Mechanism**: the approver runs a Rust program inside the zkVM with the JWT and ephemeral public key as private inputs.
+*   **Circuit logic**: verify the ID token's signature against the IdP key (public input), and extract `sub`, `iss`, `aud`, `exp`, `nonce` and `groups`/`roles`.
+*   **Public outputs**: the identity claims, the ephemeral public key the nonce binds, and the `kid` that verified the token.
+*   **Agent flow**: verify the command signature against the public key, verify the proof, check the `kid` against the IdP's JWKS, and check the proof binds that same public key.
+*   **Trade-offs**: logic is plain Rust rather than a circuit DSL, but proving takes seconds to minutes versus microseconds for native checks.
+
+Earlier we also looked at zkSNARKs such as [Spartan](https://github.com/Microsoft/Spartan) for privacy-preserving signatures; standard OIDC was judged sufficient without the proving overhead.
+
+#### Why keep ephemeral keys?
+Binding the command hash directly into the nonce would skip the ephemeral key, but the nonce is fixed once the token is issued: one login could authorize exactly one command. Binding a key instead (`nonce == hash(key)`) lets one login sign many commands for the token's lifetime — the session UX the CLI and web UI rely on.

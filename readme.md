@@ -79,6 +79,8 @@ Read-only access to files can be configured via `[[files]]` entries.
 *   [**Security Model**](SECURITY.md): How we secure the chain of trust.
 *   [**Production Readiness**](PRODUCTION_READINESS.md): Roadmap to going live.
 *   [**Alternatives**](alternatives.md): Why not JEA, SSH, or SSM?
+*   **IdP Configuration Guides**:
+    *   [HashiCorp Vault](docs/idp/VAULT.md): Configure Vault as your OIDC provider.
 
 ---
 

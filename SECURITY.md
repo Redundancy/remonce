@@ -14,6 +14,7 @@ The core security model relies on:
 
 When the Agent receives an `ExecutionBundle`, it performs this strict sequence (see [src/security.rs](src/security.rs)):
 
+0.  **Delegation mode**: `operator_requires` is signed and doubles as the mode — absent means self-execute only (a co-sign is rejected), present means delegated (self-execution is rejected). Signature hex must be canonical lowercase: `hex::decode` accepts case variants of the same bytes, and the replay and revocation caches key on the string.
 1.  **Approver signature**: Verify the approver's ECDSA-P-256 signature over `canonical(command + operator_requires)`.
 2.  **Approver TSA**: Validate the RFC 3161 timestamp token covering `(approver_signature || approver_id_token)`. Chain validation is delegated to `rustls-webpki` (see "TSA trust model" below) and enforces:
     -   signature verification up to a trusted root
@@ -27,12 +28,16 @@ When the Agent receives an `ExecutionBundle`, it performs this strict sequence (
         -   Verify operator TSA and JWT the same way as the approver (nonce binds operator's ephemeral key to their identity).
         -   **Freshness**: operator TSA must be within `operator_max_validity` (default 10 min); approver TSA must be within `approver_max_validity` (default 3 days).
         -   **Claim predicates**: if `operator_requires.any_of` is non-empty, at least one predicate must match the operator's JWT claims.
-    *   **Else (self-execute)**: the approver's own TSA timestamp must be within the short (`operator_max_validity`) window — when acting as their own executor, freshness still applies. `operator_requires` is ignored in this branch.
-5.  **Replay cache**: Check the executor signature (operator cosign if delegated, approver signature otherwise) against an in-memory TTL-bounded cache. First-seen wins; replays inside the freshness window are rejected.
+    *   **Else (self-execute)**: the approver's own TSA timestamp must be within the short (`operator_max_validity`) window — when acting as their own executor, freshness still applies.
+    *   `self_executed` is true whenever approver and operator share an OIDC `sub`, so an approver co-signing their own delegation cannot satisfy a four-eyes rule.
+    *   TSA timestamps more than 5 minutes in the future are rejected.
+5.  **Revocation**: the approver signature must not be on the agent's revocation list, nor (when configured) on the central revocation service's — an unreachable service denies execution.
 6.  **Command-level constraints**:
     -   **Target machine**: approver's `target_machines` must include this agent's hostname.
-    -   **Time window**: `not_before` / `not_after` enforced if present.
+    -   **Time window**: `not_before` / `not_after` enforced if present; a present but malformed bound denies.
+    -   **Parameters**: signed `params` validated against `[[commands.params]]`, fail-closed.
 7.  **OPA authorization**: Input includes `input.approver` (username, full claims, signed_at), `input.operator` (same shape), `input.self_executed`, `input.command`, and `input.host`. Policy evaluates with a deny-by-default posture.
+8.  **Replay cache**: last, just before spawning. The executor signature (operator cosign if delegated, approver signature otherwise) is recorded until it could no longer pass freshness — the executor's token expiry plus `operator_max_validity`, because a holder can re-timestamp the signature until the token expires. First-seen wins; if spawning fails the entry is released so the bundle can be retried.
 
 ## Threat Model
 
@@ -182,6 +187,21 @@ Remonce uses the same core mechanism as [OpenPubkey](https://github.com/openpubk
 | **RFC 3161 TSA** | Cryptographic non-repudiation and time-bounding |
 | **OPA Integration** | Fine-grained, policy-as-code authorization |
 | **Command Allowlisting** | Restricts execution to pre-defined aliases |
+
+### Sigstore & Transparency Logs
+
+Remonce shares the "keyless" signing philosophy of [Sigstore](https://www.sigstore.dev/) but differs in implementation to suit private enterprise constraints:
+
+1.  **Identity binding (nonce vs Fulcio)**:
+    *   **Sigstore** uses a dedicated CA (Fulcio) to issue short-lived X.509 certificates based on OIDC identity.
+    *   **Remonce** (like OpenPubkey) binds the ephemeral key directly into the OIDC ID token via the `nonce` claim — the standard OIDC field for binding client state — avoiding separate CA infrastructure. This is not the criticized practice of overloading `aud`.
+    *   **Audience validation**: Remonce strictly checks that the token's `aud` is the configured client ID, so a token issued for another application is never accepted (no confused-deputy).
+2.  **IdP as single point of trust**:
+    *   **Risk**: without a public transparency log (Sigstore's Rekor), a compromised IdP could mint tokens binding its own keys and impersonate users.
+    *   **Mitigation**: authorization is decoupled from identity. A forged identity is still confined by the agent's command allow-list and OPA policy, and every execution lands in the audit log.
+3.  **Timestamping vs transparency**:
+    *   An RFC 3161 TSA provides non-repudiation and time-bounding, similar to Rekor's role.
+    *   **Privacy**: Remonce deliberately avoids a public transparency log so enterprise execution data (command names, user identities) isn't published.
 
 ### OpenPubkey's MFA Cosigner
 
