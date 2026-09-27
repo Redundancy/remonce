@@ -444,7 +444,7 @@ async fn execute_handler(
     // 4. Every approval: genuine, fresh, from different people.
     let validity = cmd_config.approval_validity_or_default();
     let verifier_config = crate::security::VerifierConfig {
-        client_id: state.config.oidc.client_id.clone(),
+        client_id: state.config.oidc.signing_client_id.clone(),
         issuer_url: state.config.oidc.issuer_url.clone(),
         jwks: state.jwks.clone(),
         trusted_roots: state.trusted_roots.clone(),

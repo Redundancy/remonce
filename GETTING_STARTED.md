@@ -65,7 +65,7 @@ From the project folder:
 
 This starts Vault in development mode and configures it with Terraform (`vault_setup.tf`):
 
-- two OIDC clients: a *viewer* client for ordinary logins, and a *signing* client used for a fresh login on every approval;
+- two OIDC clients: the *viewer* client (`remonce-viewer` in Vault, `viewer_client_id` in `config.toml`) for ordinary logins, and the *signing* client (`remonce-signing`, `signing_client_id`) used for a fresh login on every approval;
 - two users, `webapp` and `webapp2`, both in the group `webapp-users`. Their password is the `APP_USER_PASSWORD` default in the start scripts; set that environment variable first to choose your own.
 
 It writes the client IDs into `config.toml`. Leave Vault running: on Linux and macOS in that terminal (Ctrl+C stops it), on Windows in the window it opens. Development mode keeps nothing on disk, so each restart starts fresh and rewrites the IDs.

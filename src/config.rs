@@ -212,12 +212,14 @@ pub struct OidcConfig {
 
     /// The *signing* OIDC client. Every approval and revocation is
     /// made with a fresh login to this client; agents only accept its tokens
-    /// on the signing path, never as bearer credentials.
-    pub client_id: String,
+    /// on the signing path, never as bearer credentials. (`client_id` is
+    /// accepted as an older name.)
+    #[serde(alias = "client_id")]
+    pub signing_client_id: String,
 
     /// The *viewer* OIDC client, used for browsing (files, execution logs).
     /// Its tokens are bearer credentials accepted only by the agent's
-    /// read-only endpoints. Must differ from `client_id`. Required by
+    /// read-only endpoints. Must differ from `signing_client_id`. Required by
     /// `remonce web`; agents without it refuse file/log viewing.
     #[serde(default)]
     pub viewer_client_id: Option<String>,
@@ -257,7 +259,7 @@ impl Default for OidcConfig {
     fn default() -> Self {
         Self {
             issuer_url: "".to_string(),
-            client_id: "".to_string(),
+            signing_client_id: "".to_string(),
             viewer_client_id: None,
             signing_max_age: None,
             signing_prompt_login: false,
@@ -462,6 +464,17 @@ mod tests {
         );
         let other = cfg.commands.iter().find(|c| c.name == "fail").unwrap();
         assert_eq!(other.approval_validity_or_default(), DEFAULT_APPROVAL_VALIDITY);
+    }
+
+    #[test]
+    fn signing_client_id_accepts_its_older_name() {
+        for key in ["signing_client_id", "client_id"] {
+            let cfg = parse(&format!("[oidc]
+issuer_url = \"https://idp.example\"
+{key} = \"abc\"
+")).unwrap();
+            assert_eq!(cfg.oidc.signing_client_id, "abc", "{key}");
+        }
     }
 
     #[test]

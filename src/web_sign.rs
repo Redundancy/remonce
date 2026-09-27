@@ -205,7 +205,7 @@ pub async fn begin_handler(
     let url = crate::oidc_client::authorize_url(
         &state.oidc_metadata,
         &crate::oidc_client::AuthorizeParams {
-            client_id: &state.config.oidc.client_id,
+            client_id: &state.config.oidc.signing_client_id,
             redirect_uri: &state.config.get_redirect_uri(),
             state: &oidc_state,
             nonce: &ephemeral.nonce,
@@ -278,7 +278,7 @@ async fn sign(
     }
     let code = query.code.as_deref().ok_or("Missing authorization code")?;
 
-    let client_id = &state.config.oidc.client_id;
+    let client_id = &state.config.oidc.signing_client_id;
     let id_token = crate::oidc_client::exchange_code(
         &state.http_client,
         &state.oidc_metadata,

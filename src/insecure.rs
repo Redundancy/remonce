@@ -46,15 +46,15 @@ fn invalid_config(config: &Config) -> Vec<String> {
     let mut errors = Vec::new();
     let oidc = &config.oidc;
 
-    if oidc.client_id.is_empty() {
-        errors.push("oidc.client_id (the signing client) must be set".into());
+    if oidc.signing_client_id.is_empty() {
+        errors.push("oidc.signing_client_id must be set".into());
     }
     match oidc.viewer_client_id.as_deref() {
         Some("") => errors.push("oidc.viewer_client_id is empty; remove it or set it".into()),
         // Sharing a client would make every signing token a valid bearer
         // token for file/log viewing, and vice versa.
-        Some(v) if v == oidc.client_id => errors.push(
-            "oidc.viewer_client_id must differ from oidc.client_id; viewer tokens are bearer \
+        Some(v) if v == oidc.signing_client_id => errors.push(
+            "oidc.viewer_client_id must differ from oidc.signing_client_id; viewer tokens are bearer \
              credentials and must never share an audience with signing tokens"
                 .into(),
         ),
@@ -194,7 +194,7 @@ mod tests {
         Config {
             oidc: OidcConfig {
                 issuer_url: "https://issuer.example/".into(),
-                client_id: "x".into(),
+                signing_client_id: "x".into(),
                 viewer_client_id: Some("x-viewer".into()),
                 signing_max_age: None,
                 signing_prompt_login: false,
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn empty_client_id_refused() {
         let mut cfg = base_config();
-        cfg.oidc.client_id = String::new();
+        cfg.oidc.signing_client_id = String::new();
         assert!(matches!(validate(&cfg, true), Err(InsecureError::Invalid(_))));
     }
 

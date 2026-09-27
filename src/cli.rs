@@ -112,7 +112,7 @@ pub async fn run_approve(args: ApproveArgs, insecure: bool) -> Result<(), Error>
     describe(&bundle)?;
 
     let ephemeral = crate::signing::new_ephemeral()?;
-    let (id_token, claims) = oidc_login(&config, &config.oidc.client_id, &ephemeral.nonce, true).await?;
+    let (id_token, claims) = oidc_login(&config, &config.oidc.signing_client_id, &ephemeral.nonce, true).await?;
     eprintln!("OIDC login complete.");
 
     // Two approvals must be two people; the agent enforces it too.
@@ -199,7 +199,7 @@ pub async fn run_revoke(args: RevokeArgs, insecure: bool) -> Result<(), Error> {
     describe(&request)?;
 
     let ephemeral = crate::signing::new_ephemeral()?;
-    let (id_token, _) = oidc_login(&config, &config.oidc.client_id, &ephemeral.nonce, true).await?;
+    let (id_token, _) = oidc_login(&config, &config.oidc.signing_client_id, &ephemeral.nonce, true).await?;
     eprintln!("OIDC login complete.");
 
     let request_id = crate::security::request_id(&request.command);

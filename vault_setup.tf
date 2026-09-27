@@ -107,9 +107,9 @@ resource "vault_identity_entity" "webapp_user" {
 
 # Alias the userpass login to this entity
 resource "vault_identity_entity_alias" "webapp_user_alias" {
-  name            = "webapp"
-  mount_accessor  = vault_auth_backend.userpass.accessor
-  canonical_id    = vault_identity_entity.webapp_user.id
+  name           = "webapp"
+  mount_accessor = vault_auth_backend.userpass.accessor
+  canonical_id   = vault_identity_entity.webapp_user.id
 }
 
 # Create a group for the webapp users
@@ -126,7 +126,7 @@ resource "vault_identity_group" "webapp_users" {
 resource "vault_identity_oidc_assignment" "app_assignment" {
   name       = "app-assignment"
   group_ids  = [vault_identity_group.webapp_users.id]
-  entity_ids = [vault_identity_entity.webapp_user.id] 
+  entity_ids = [vault_identity_entity.webapp_user.id]
 }
 
 # ------------------------------------------------------------------------------
@@ -134,29 +134,34 @@ resource "vault_identity_oidc_assignment" "app_assignment" {
 # ------------------------------------------------------------------------------
 # This section configures Vault to act as an OIDC Identity Provider.
 
-# Create a signing key for the OIDC tokens.
-resource "vault_identity_oidc_key" "provider_key" {
-  name      = "provider_key"
+# The key Vault signs ID tokens with. Its public half is served at the
+# provider's .well-known/keys, which is where remonce fetches it. (Not to be
+# confused with the *signing client* below: that's the OIDC client used for
+# approvals.)
+resource "vault_identity_oidc_key" "remonce" {
+  name      = "remonce"
   algorithm = "RS256"
 }
 
-# Create a role that assigns the key to a client.
-resource "vault_identity_oidc_role" "token_role" {
-  name = "generated-token"
-  key  = vault_identity_oidc_key.provider_key.name
-  client_id = vault_identity_oidc_client.webapp_client.client_id
+# Let both clients use that key. Separate resources, because each client also
+# names the key: listing the clients on the key itself would be a cycle.
+resource "vault_identity_oidc_key_allowed_client_id" "remonce_signing" {
+  key_name          = vault_identity_oidc_key.remonce.name
+  allowed_client_id = vault_identity_oidc_client.remonce_signing.client_id
 }
 
-# Configure the OIDC provider itself.
-# The issuer is set to localhost without HTTPS as requested.
+resource "vault_identity_oidc_key_allowed_client_id" "remonce_viewer" {
+  key_name          = vault_identity_oidc_key.remonce.name
+  allowed_client_id = vault_identity_oidc_client.remonce_viewer.client_id
+}
+
+# The OIDC provider: serves discovery, JWKS, authorize and token endpoints.
+# For local testing the issuer is Vault's own address over plain HTTP.
 resource "vault_identity_oidc_provider" "localhost_provider" {
   name = "vaultprovider"
-  # The issuer URL must be accessible from the browser of the user authenticating.
-  # For local testing, this is typically the Vault address.
-  # issuer = "http://127.0.0.1:8200"
   allowed_client_ids = [
-    vault_identity_oidc_client.webapp_client.client_id,
-    vault_identity_oidc_client.viewer_client.client_id,
+    vault_identity_oidc_client.remonce_signing.client_id,
+    vault_identity_oidc_client.remonce_viewer.client_id,
   ]
   scopes_supported = [
     vault_identity_oidc_scope.groups.name,
@@ -167,7 +172,7 @@ resource "vault_identity_oidc_provider" "localhost_provider" {
 resource "vault_identity_oidc_scope" "groups" {
   name        = "groups"
   description = "Vault Groups Scope"
-  template    = base64encode(<<EOF
+  template = base64encode(<<EOF
 {
   "groups": {{identity.entity.groups.names}}
 }
@@ -178,7 +183,7 @@ EOF
 resource "vault_identity_oidc_scope" "user_profile" {
   name        = "user_profile"
   description = "Vault User Profile Scope"
-  template    = base64encode(<<EOF
+  template = base64encode(<<EOF
 {
   "username": {{identity.entity.name}}
 }
@@ -186,39 +191,37 @@ EOF
   )
 }
 
-# Create an OIDC client application.
-# This represents an application that will use Vault to authenticate users.
-resource "vault_identity_oidc_client" "webapp_client" {
-  name = "webapp-client"
+# remonce uses two OIDC clients, both public (no client secret; PKCE instead):
 
-  # URIs where the OIDC provider can redirect the user after authentication.
+# The signing client: every approval and revocation is a fresh login to it,
+# with a one-time key bound through the nonce. remonce's `signing_client_id`.
+resource "vault_identity_oidc_client" "remonce_signing" {
+  name = "remonce-signing"
+  key  = vault_identity_oidc_key.remonce.name
+
   redirect_uris = [
     "http://localhost:8080/oidc/callback",
     "http://127.0.0.1:8080/oidc/callback"
   ]
 
-  # Assign the assignment resource
   assignments = [
     vault_identity_oidc_assignment.app_assignment.name
   ]
 
-  # Type of client. 'public' clients cannot securely store a secret (e.g., SPAs).
   client_type = "public"
 
-  # TTL for tokens. Signing freshness is measured from the token's `iat`,
-  # so this lifetime no longer extends how long a signature stays valid.
+  # Approvals are valid from the login (`iat`), not until `exp`, so this
+  # lifetime doesn't extend how long an approval stays usable.
   id_token_ttl     = 3600 # 1 hour
   access_token_ttl = 3600 # 1 hour
-
-
 }
 
-# The viewer client: logs users in for browsing files and execution logs.
-# Its tokens are bearer credentials, accepted by agents only on read-only
-# endpoints, so keep them short-lived. Must be a different client from the
-# signing client above.
-resource "vault_identity_oidc_client" "viewer_client" {
-  name = "webapp-viewer"
+# The viewer client: the ordinary login, for browsing and for identifying
+# whoever executes a request. Its tokens are bearer credentials, so keep them
+# short-lived. remonce's `viewer_client_id`; must differ from the signing client.
+resource "vault_identity_oidc_client" "remonce_viewer" {
+  name = "remonce-viewer"
+  key  = vault_identity_oidc_key.remonce.name
 
   redirect_uris = [
     "http://localhost:8080/oidc/callback",
@@ -246,15 +249,15 @@ output "userpass_auth_path" {
 
 output "oidc_provider_issuer_url" {
   value       = vault_identity_oidc_provider.localhost_provider.issuer
-  description = "The issuer URL for Vault's OIDC provider. Use this for the '.well-known/oidc-configuration' endpoint."
+  description = "The issuer URL for Vault's OIDC provider: remonce's issuer_url."
+}
+
+output "oidc_signing_client_id" {
+  value       = vault_identity_oidc_client.remonce_signing.client_id
+  description = "The signing client's ID: remonce's signing_client_id."
 }
 
 output "oidc_viewer_client_id" {
-  value       = vault_identity_oidc_client.viewer_client.client_id
-  description = "The Client ID for the viewer (browsing) OIDC client."
-}
-
-output "oidc_client_id" {
-  value       = vault_identity_oidc_client.webapp_client.client_id
-  description = "The Client ID for the OIDC signing client."
+  value       = vault_identity_oidc_client.remonce_viewer.client_id
+  description = "The viewer client's ID: remonce's viewer_client_id."
 }

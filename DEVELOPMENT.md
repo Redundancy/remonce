@@ -28,11 +28,11 @@ Ensure you have the following installed and available in `bin/` or your PATH:
 
 ## Vault Development Configuration
 
-The start script configures Vault for local development, which differs from production in two ways.
+The start script configures a dev-mode Vault as the OIDC provider. Two choices make it convenient locally; a production Vault can make different ones.
 
 ### 1. Userpass Authentication
 
-Production Vault deployments typically use enterprise auth methods (LDAP, OIDC, SAML) where entities and aliases are created automatically. For local development, `vault_setup.tf` creates a simple userpass backend:
+Users log in with Vault's built-in username and password method. A production Vault might instead use LDAP, an upstream OIDC provider, or anything else Vault supports; remonce only sees the ID tokens. `vault_setup.tf` creates the userpass backend:
 
 ```hcl
 resource "vault_auth_backend" "userpass" {
@@ -41,9 +41,9 @@ resource "vault_auth_backend" "userpass" {
 }
 ```
 
-### 2. Manual Entity and Alias Creation
+### 2. Entities Created Up Front
 
-With userpass, entities and aliases must be created manually (enterprise auth methods create them on first login):
+Vault creates an identity entity and alias for each user on first login, with any auth method. `vault_setup.tf` creates them in advance instead, so it can put both users in the `webapp-users` group before anyone logs in:
 
 ```hcl
 resource "vault_identity_entity" "example_user" {

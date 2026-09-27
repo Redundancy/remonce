@@ -41,8 +41,8 @@ A few settings are refused outright, even with `--insecure`, because they are wr
 
 | Setting | Why it's refused |
 |---------|------------------|
-| `oidc.client_id` empty | There is no signing client |
-| `oidc.viewer_client_id` equal to `oidc.client_id` (or empty) | Every signing token would also be a viewing and executing bearer token |
+| `oidc.signing_client_id` empty | There is no signing client |
+| `oidc.viewer_client_id` equal to `oidc.signing_client_id` (or empty) | Every signing token would also be a viewing and executing bearer token |
 | `oidc.signing_max_age` above 5 minutes | Agents reject logins older than that, so no signature could verify |
 | `commands[].approval_validity = "0s"` | No approval could ever be used |
 
@@ -201,7 +201,7 @@ Requirements for either:
 
 These settings connect the signer, agent and revocation service to your OIDC provider (Vault, Keycloak, etc.). Remonce uses **two clients**:
 
-- the **signing** client (`client_id`): every approval and revocation is a fresh login to it, with a new ephemeral key bound through the `nonce` and forced re-authentication. Agents accept its tokens only inside approvals and revocations.
+- the **signing** client (`signing_client_id`): every approval and revocation is a fresh login to it, with a new ephemeral key bound through the `nonce` and forced re-authentication. Agents accept its tokens only inside approvals and revocations.
 - the **viewer** client (`viewer_client_id`): the ordinary login. Its tokens are bearer credentials that agents accept on the read-only endpoints (catalog, files, logs) and as the **executor's identity** when a request is submitted.
 
 ```toml
@@ -210,10 +210,10 @@ These settings connect the signer, agent and revocation service to your OIDC pro
 # Must match the 'iss' claim in your JWTs.
 issuer_url = "http://127.0.0.1:8200/v1/identity/oidc/provider/vaultprovider"
 
-# The signing client.
-client_id = "your_signing_client_id"
+# The signing client. (Older configs call it client_id; that name still works.)
+signing_client_id = "your_signing_client_id"
 
-# The viewer client. Must differ from client_id. Required by `remonce web`
+# The viewer client. Must differ from signing_client_id. Required by `remonce web`
 # and `remonce agent` (it identifies whoever submits a request).
 viewer_client_id = "your_viewer_client_id"
 
@@ -515,7 +515,7 @@ Semantics:
 
 This release changes what agents accept, with no compatibility mode:
 
-1. **Register two OIDC clients.** Create a new signing client (or reuse the old one) and a new viewer client, add both to the provider, and set `client_id` and `viewer_client_id`. See "IdP requirements" above; for Vault, [docs/idp/VAULT.md](docs/idp/VAULT.md).
+1. **Register two OIDC clients.** Create a new signing client (or reuse the old one) and a new viewer client, add both to the provider, and set `signing_client_id` and `viewer_client_id`. See "IdP requirements" above; for Vault, [docs/idp/VAULT.md](docs/idp/VAULT.md).
 2. **Upgrade the signer, CLI, agents and revocation service together.** Bundles signed by older signers lack the re-authentication evidence (and may carry high-S signatures), so agents reject them. Re-sign any outstanding approvals.
 3. **Archive the revocation log.** The revocation service now records key bindings instead of signature hex, and refuses to start on an old `revocations.jsonl`. Move it aside; approvals it listed can't pass the new verification anyway.
 

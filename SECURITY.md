@@ -145,7 +145,7 @@ With the flag set:
 
 Currently gated: HTTP non-loopback OIDC issuer, `trust_system_store` for TSA, `approval_validity` above 7 days, wildcard CORS. See [CONFIGURATION.md](CONFIGURATION.md) for the full table.
 
-Some settings are wrong rather than risky, and `--insecure` does **not** bypass them: an empty `oidc.client_id`, a `viewer_client_id` equal to `client_id` (it would make every signing token a viewing and executing bearer credential), a `signing_max_age` above 5 minutes (signatures made with it could never verify), and an `approval_validity` of 0.
+Some settings are wrong rather than risky, and `--insecure` does **not** bypass them: an empty `oidc.signing_client_id`, a `viewer_client_id` equal to `signing_client_id` (it would make every signing token a viewing and executing bearer credential), a `signing_max_age` above 5 minutes (signatures made with it could never verify), and an `approval_validity` of 0.
 
 Design intent: the flag is blunt. It's meant to be visible in process listings, systemd units, and audit logs, not to be a routine knob. Operators who need one specific unsafe setting and *not* the others can still use `--insecure` — it turns on whatever the config already enables, not more.
 
@@ -163,7 +163,7 @@ Each ID token in a request may contain:
 ### Risk Scoping
 
 > [!IMPORTANT]
-> **Use two dedicated OIDC clients for Remonce**: a *signing* client (`client_id`) and a *viewer* client (`viewer_client_id`). The JWT's `aud` (audience) claim limits each token to its client. Dedicated clients ensure tokens cannot be replayed against other applications in your organization, and separate ones ensure a signing token carried in a request is never a viewing or executing credential.
+> **Use two dedicated OIDC clients for Remonce**: a *signing* client (`signing_client_id`) and a *viewer* client (`viewer_client_id`). The JWT's `aud` (audience) claim limits each token to its client. Dedicated clients ensure tokens cannot be replayed against other applications in your organization, and separate ones ensure a signing token carried in a request is never a viewing or executing credential.
 
 ### Claim Minimization Best Practices
 

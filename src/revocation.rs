@@ -97,7 +97,7 @@ pub async fn verify_and_authorize(
     // Approvals and revoker attestations are both signing-client tokens;
     // viewer tokens have no place here.
     let verifier_config = crate::security::VerifierConfig {
-        client_id: ctx.config.oidc.client_id.clone(),
+        client_id: ctx.config.oidc.signing_client_id.clone(),
         issuer_url: ctx.config.oidc.issuer_url.clone(),
         jwks: ctx.jwks.clone(),
         trusted_roots: ctx.trusted_roots.to_vec(),

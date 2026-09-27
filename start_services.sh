@@ -49,21 +49,21 @@ echo "Configuring Vault with Terraform..."
 "$TERRAFORM" apply -auto-approve -input=false \
     -var="vault_token=$VAULT_TOKEN" -var="app_user_password=$APP_USER_PASSWORD"
 
-client_id=$("$TERRAFORM" output -raw oidc_client_id)
+signing_client_id=$("$TERRAFORM" output -raw oidc_signing_client_id)
 viewer_client_id=$("$TERRAFORM" output -raw oidc_viewer_client_id)
 issuer_url=$("$TERRAFORM" output -raw oidc_provider_issuer_url)
 
-# Anchored, so the signing client's pattern can't also match viewer_client_id.
-# -i.bak works with both GNU and BSD sed.
-sed -i.bak \
-    -e "s|^client_id = \".*\"|client_id = \"$client_id\"|" \
+# Anchored, so the patterns can't match each other; the first also accepts
+# the older `client_id` name. -i.bak works with both GNU and BSD sed.
+sed -i.bak -E \
+    -e "s|^(signing_)?client_id = \".*\"|signing_client_id = \"$signing_client_id\"|" \
     -e "s|^viewer_client_id = \".*\"|viewer_client_id = \"$viewer_client_id\"|" \
     -e "s|^issuer_url = \".*\"|issuer_url = \"$issuer_url\"|" \
     config.toml
 rm -f config.toml.bak
 
 echo
-echo "Updated config.toml: signing client $client_id, viewer client $viewer_client_id."
+echo "Updated config.toml: signing client $signing_client_id, viewer client $viewer_client_id."
 echo "Users webapp and webapp2 are ready."
 if [ -n "$VAULT_PID" ]; then
     echo "Vault is running; leave this open, Ctrl+C to stop it."

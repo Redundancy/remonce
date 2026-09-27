@@ -14,24 +14,25 @@ graph LR
     A[User] --> B[Vault Login]
     B --> C[ID Token with Claims]
     C --> D[Remonce Agent]
-    D --> E[OPA Policy Check]
+    D --> E[Policy check]
 ```
 
 ## Prerequisites
 
-- HashiCorp Vault server (1.9+) with enterprise auth (LDAP, OIDC, SAML, etc.)
-- Terraform (recommended) or Vault CLI
-- Admin access to Vault
-- Existing identity entities (created automatically by your auth method)
+- HashiCorp Vault 1.9 or later (the open-source edition is fine), acting as the OIDC provider
+- Any Vault auth method for your users: userpass, LDAP, OIDC, and so on
+- Terraform (recommended) or the Vault CLI, with admin access to Vault
+
+Vault creates an identity entity for each user on their first login, whatever the auth method. Create entities ahead of time only if you want to put users in groups before they've logged in, as the local setup does.
 
 > [!TIP]
-> **Local Development**: For dev/test setup using userpass auth, see [DEVELOPMENT.md](../../DEVELOPMENT.md#vault-development-configuration).
+> **Local development**: `vault_setup.tf` and the start scripts set all of this up with a dev-mode Vault and userpass users; see [GETTING_STARTED.md](../../GETTING_STARTED.md#2-start-the-identity-provider) and [DEVELOPMENT.md](../../DEVELOPMENT.md#vault-development-configuration).
 
 ---
 
 ## Step 1: Create Identity Groups
 
-Groups enable role-based access control in OPA policies. Add your existing identity entities to groups:
+Groups become a claim policy can decide on. Add identity entities to groups:
 
 ```hcl
 resource "vault_identity_group" "example_users" {
@@ -92,157 +93,156 @@ EOF
 
 ---
 
-## Step 3: Create the OIDC Clients
+## Step 3: Create the Token Key
 
-Remonce needs **two** clients: a *signing* client, used for a fresh re-authenticating login on every approval and revocation, and a *viewer* client, used for the ordinary login (the command catalog, files and execution logs, and identifying whoever executes a request). Agents accept each only where it belongs, so a signing token carried inside a request can never be used to browse or execute.
+Vault signs every ID token it issues with a key; remonce fetches the public half from the provider's `.well-known/keys` and checks every token against it. (This is Vault's key, not to be confused with the *signing client* in the next step.)
 
 ```hcl
-resource "vault_identity_oidc_client" "remonce_client" {
-  name = "remonce-client"
-
-  redirect_uris = [
-    # Loopback addresses for local CLI/desktop usage
-    "http://localhost:8080/oidc/callback",
-    "http://127.0.0.1:8080/oidc/callback",
-    
-    # Production web server (add your actual URL)
-    "https://remonce.example.com/oidc/callback"
-  ]
-
-  # Public client for browser-based apps (no client secret)
-  client_type = "public"
-
-  # Token lifetimes. Signature validity is measured from the login (`iat`),
-  # so this no longer widens how long a signature is usable.
-  id_token_ttl     = 3600  # 1 hour
-  access_token_ttl = 3600  # 1 hour
-}
-
-# The viewer client. Its tokens are bearer credentials for read-only
-# endpoints, so keep them short-lived.
-resource "vault_identity_oidc_client" "remonce_viewer" {
-  name          = "remonce-viewer"
-  redirect_uris = vault_identity_oidc_client.remonce_client.redirect_uris
-  client_type   = "public"
-
-  id_token_ttl     = 900   # 15 minutes
-  access_token_ttl = 900
+resource "vault_identity_oidc_key" "remonce" {
+  name             = "remonce"
+  algorithm        = "RS256"
+  rotation_period  = 604800  # 1 week; older keys stay published until their tokens expire
+  verification_ttl = 86400
 }
 ```
 
-Assign both clients the same assignment (Step 4).
+## Step 4: Create the Two OIDC Clients
+
+remonce uses **two** clients, and the difference matters:
+
+| Client | Used for | In `config.toml` |
+|---|---|---|
+| **Signing** (`remonce-signing`) | A fresh, re-authenticating login for every approval and revocation, with a one-time key bound through the `nonce` | `signing_client_id` |
+| **Viewer** (`remonce-viewer`) | The ordinary login: the command catalog, files and execution logs, and identifying whoever executes a request | `viewer_client_id` |
+
+Agents accept each client's tokens only where they belong, so a signing token carried inside a request can never be used to browse or execute, and a viewer token can never approve anything.
+
+```hcl
+resource "vault_identity_oidc_client" "remonce_signing" {
+  name = "remonce-signing"
+  key  = vault_identity_oidc_key.remonce.name
+
+  redirect_uris = [
+    # The signer on each user's machine
+    "http://localhost:8080/oidc/callback",
+    "http://127.0.0.1:8080/oidc/callback",
+  ]
+  assignments = [vault_identity_oidc_assignment.remonce_users.name]
+
+  # Public client: no client secret; PKCE protects the code exchange.
+  client_type = "public"
+
+  # Approvals are valid from the login (`iat`), not until `exp`, so this
+  # lifetime doesn't extend how long an approval stays usable.
+  id_token_ttl     = 3600  # 1 hour
+  access_token_ttl = 3600
+}
+
+resource "vault_identity_oidc_client" "remonce_viewer" {
+  name          = "remonce-viewer"
+  key           = vault_identity_oidc_key.remonce.name
+  redirect_uris = vault_identity_oidc_client.remonce_signing.redirect_uris
+  assignments   = [vault_identity_oidc_assignment.remonce_users.name]
+  client_type   = "public"
+
+  # Viewer tokens are bearer credentials: keep them short-lived.
+  id_token_ttl     = 900  # 15 minutes
+  access_token_ttl = 900
+}
+
+# Let both clients use the key. These are separate resources because each
+# client also names the key; listing the clients on the key would be a cycle.
+resource "vault_identity_oidc_key_allowed_client_id" "remonce_signing" {
+  key_name          = vault_identity_oidc_key.remonce.name
+  allowed_client_id = vault_identity_oidc_client.remonce_signing.client_id
+}
+
+resource "vault_identity_oidc_key_allowed_client_id" "remonce_viewer" {
+  key_name          = vault_identity_oidc_key.remonce.name
+  allowed_client_id = vault_identity_oidc_client.remonce_viewer.client_id
+}
+```
 
 > [!IMPORTANT]
-> **Redirect URI Requirements**:
-> - **Loopback addresses** (`localhost`, `127.0.0.1`): Required for local CLI usage or running Remonce on your machine.
-> - **Production URLs**: Required for each managed Remonce web server. OIDC will not allow authentication to servers not in this list.
-> - **All redirect URIs must be explicitly listed**—OIDC does not support wildcards for security reasons.
+> **Redirect URIs**: list the signer's callback exactly as each signer is configured (`oidc.redirect_uri`); OIDC doesn't allow wildcards. The signer runs on each user's machine, so the loopback addresses cover the usual case.
 
 > [!WARNING]
-> **Do Not Reuse This Client**: This configuration creates a dedicated OIDC client for Remonce. Because every approval's JWT travels inside the request to later approvers, the executor and the agent, sharing this client ID with other applications would allow those targets to reuse the token against those applications. Keep this client exclusive to Remonce.
+> **Use these clients only for remonce.** Every approval's ID token travels inside the request to later approvers, the executor and the agent. If another application accepted tokens for these clients, any of them could replay a token against it.
 
 ---
 
-## Step 4: Create an OIDC Assignment
+## Step 5: Create an OIDC Assignment
 
-Assignments **bridge** entities/groups to the OIDC client. Only assigned entities can authenticate.
+Assignments **bridge** entities and groups to the clients. Only assigned entities can log in.
 
 ```hcl
-resource "vault_identity_oidc_assignment" "remonce_assignment" {
-  name       = "remonce-assignment"
-  group_ids  = [vault_identity_group.example_users.id]
-  entity_ids = [vault_identity_entity.example_user.id]
+resource "vault_identity_oidc_assignment" "remonce_users" {
+  name      = "remonce-users"
+  group_ids = [vault_identity_group.example_users.id]
 }
 ```
 
 > [!TIP]
-> **Multiple Assignments**: Create separate assignments if you have different user populations for different clients (e.g., `remonce-approvers` vs `remonce-executors`). Each assignment can reference different groups/entities.
+> **Different people per client**: create separate assignments if, say, only some people may approve (signing client) while more may browse (viewer client). Policy still decides what each person may do; this only decides who can log in at all.
 
 ---
 
-## Step 5: Configure the OIDC Provider
+## Step 6: Configure the OIDC Provider
 
-Finally, create the provider that serves the OIDC endpoints.
+Finally, create the provider that serves the OIDC endpoints, and allow both clients and the scopes from Step 2.
 
 ```hcl
-resource "vault_identity_oidc_provider" "oidc_provider" {
+resource "vault_identity_oidc_provider" "remonce" {
   name = "vaultprovider"
-  
+
   allowed_client_ids = [
-    vault_identity_oidc_client.remonce_client.client_id,
+    vault_identity_oidc_client.remonce_signing.client_id,
     vault_identity_oidc_client.remonce_viewer.client_id,
   ]
-  
+
   scopes_supported = [
     vault_identity_oidc_scope.groups.name,
-    vault_identity_oidc_scope.user_profile.name
-  ]
-}
-```
-
----
-
-## Step 6: Create the Signing Key and Role
-
-The **signing key** is the cryptographic key Vault uses to sign issued JWTs. The **role** binds this key to a specific client, defining how tokens are generated for that client.
-
-```hcl
-# The key Vault uses to sign JWTs (public key is exposed at .well-known/jwks)
-resource "vault_identity_oidc_key" "remonce_key" {
-  name               = "remonce_key"
-  algorithm          = "ES256"
-  rotation_period    = 604800  # 1 week
-  allowed_client_ids = [
-    vault_identity_oidc_client.remonce_client.client_id,
-    vault_identity_oidc_client.remonce_viewer.client_id,
+    vault_identity_oidc_scope.user_profile.name,
   ]
 }
 
-# Binds the signing key to the Remonce client
-resource "vault_identity_oidc_role" "token_role" {
-  name      = "generated-token"
-  key       = vault_identity_oidc_key.remonce_key.name
-  client_id = vault_identity_oidc_client.remonce_client.client_id
+output "oidc_provider_issuer_url" {
+  value = vault_identity_oidc_provider.remonce.issuer
 }
 
-output "oidc_client_id" {
-  description = "Signing client ID for Remonce"
-  value       = vault_identity_oidc_client.remonce_client.client_id
+output "oidc_signing_client_id" {
+  description = "remonce's signing_client_id"
+  value       = vault_identity_oidc_client.remonce_signing.client_id
 }
 
 output "oidc_viewer_client_id" {
-  description = "Viewer client ID for Remonce"
+  description = "remonce's viewer_client_id"
   value       = vault_identity_oidc_client.remonce_viewer.client_id
 }
 ```
-
-> [!NOTE]
-> **Configuration Choices**:
-> - **ES256**: Produces smaller tokens than RS256. Use RS256 if you need broader compatibility with older systems.
-> - **Client-specific key**: The `allowed_client_ids` restriction ensures this key can only be used by the Remonce client.
-> - **Weekly rotation**: Keys rotate automatically; during rotation both old and new keys remain valid for graceful token expiration.
 
 ---
 
 ## Remonce Configuration
 
-After Vault is configured, update your `config.toml`:
+After Vault is configured, put the outputs in your `config.toml`:
 
 ```toml
 [oidc]
-issuer_url       = "https://vault.example.com/v1/identity/oidc/provider/vaultprovider"
-client_id        = "<oidc_client_id from terraform output>"
-viewer_client_id = "<oidc_viewer_client_id from terraform output>"
-redirect_uri     = "http://localhost:8080/oidc/callback"
+issuer_url        = "<oidc_provider_issuer_url>"   # e.g. https://vault.example.com/v1/identity/oidc/provider/vaultprovider
+signing_client_id = "<oidc_signing_client_id>"
+viewer_client_id  = "<oidc_viewer_client_id>"
+redirect_uri      = "http://localhost:8080/oidc/callback"
 ```
 
 Leave `signing_max_age` at its default of `1s`: Vault rejects `max_age=0` ("max_age must be greater than zero").
 
-### Getting the Client IDs
+### Getting the Values
 
 ```bash
-terraform output oidc_client_id
-terraform output oidc_viewer_client_id
+terraform output -raw oidc_provider_issuer_url
+terraform output -raw oidc_signing_client_id
+terraform output -raw oidc_viewer_client_id
 ```
 
 ---
@@ -257,7 +257,7 @@ curl https://vault.example.com/v1/identity/oidc/provider/vaultprovider/.well-kno
 
 ### 2. Verify Token Claims
 
-After signing something through Remonce, the signing JWT in the bundle should contain:
+After an approval, its ID token (inside the request file, under `approvals[].id_token`) should contain:
 
 ```json
 {
@@ -288,7 +288,7 @@ After signing something through Remonce, the signing JWT in the bundle should co
 
 ### "Client not found" or "Unauthorized"
 
-- Verify the client ID matches exactly between Vault and `config.toml`
+- Check `signing_client_id` and `viewer_client_id` in `config.toml` match the `terraform output` values exactly
 - Ensure the entity is included in an assignment linked to the client
 
 ### Redirect URI mismatch
@@ -300,8 +300,8 @@ After signing something through Remonce, the signing JWT in the bundle should co
 
 ## Security Best Practices
 
-1. **Dedicated Client IDs**: Never share the Remonce signing or viewer client ID with other applications, or with each other
-2. **Short Viewer Token TTL**: Viewer tokens are bearer credentials for files and logs; keep their TTL short (5-15 minutes). The signing client's TTL no longer affects how long a signature is usable
-3. **Claim Minimization**: Only request scopes needed for OPA policies
+1. **Dedicated clients**: Never share the signing or viewer client with other applications, or use one client for both
+2. **Short viewer token TTL**: Viewer tokens are bearer credentials for browsing and executing; keep their TTL short (5-15 minutes). The signing client's TTL doesn't affect how long an approval is usable
+3. **Claim minimization**: Only request the scopes your policy needs
 4. **HTTPS in Production**: Never use HTTP issuer URLs in production
 5. **Restrict Assignments**: Only assign entities that should access Remonce
