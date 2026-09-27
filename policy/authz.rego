@@ -24,8 +24,9 @@ default allow := false
 #
 # Viewing (actions "view_docs", "read_file", "view_execution"):
 #
-#   input.jwt:          string  the caller's viewer ID token
-#   input.file:         object  (read_file)
+#   input.viewer:       object  who is looking, from their login session:
+#                               { username, claims } (claims verified by the agent)
+#   input.file:         object  (read_file) { name } or { path }
 #   input.execution_id: string  (view_execution)
 #
 # The agent verifies every signature, token and freshness window before
@@ -63,13 +64,7 @@ allow if {
 
 # --- Viewing ---
 
-claims := payload if {
-	[_, payload, _] := io.jwt.decode(input.jwt)
-}
-
-viewer_groups := g if {
-	g := claims.groups
-} else := []
+viewer_groups := object.get(input.viewer.claims, "groups", [])
 
 allow if {
 	input.action == "view_docs"

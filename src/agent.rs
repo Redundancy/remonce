@@ -34,6 +34,8 @@ pub struct AgentState {
     /// Central revocation service (client, base URL). When set, every
     /// execution checks it and FAILS CLOSED if it is unreachable.
     pub revocation_service: Option<(Client, url::Url)>,
+    /// The authorization policy, evaluated in-process.
+    pub policy: std::sync::Arc<crate::policy::Policy>,
 }
 
 // ExecutionRequest is imported from security module
@@ -147,7 +149,8 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Loaded {} trusted TSA roots", trusted_roots.len());
 
     if config.oidc.viewer_client_id.is_none() {
-        return Err("oidc.viewer_client_id must be set: executors, file and log viewing, and the command catalog                     all authenticate with viewer-client logins"
+        return Err("oidc.viewer_client_id must be set: executors, file and log viewing, and the command catalog \
+             all authenticate with viewer-client logins"
             .into());
     }
 
@@ -187,6 +190,9 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    let policy = std::sync::Arc::new(crate::policy::Policy::from_config(&config)?);
+    tracing::info!(backend = %policy.describe(), "Policy ready");
+
     let state = AgentState {
         http_client,
         config,
@@ -197,6 +203,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         replay_cache: crate::replay::ReplayCache::new(),
         revocations: crate::replay::RevocationCache::new(),
         revocation_service,
+        policy,
     };
 
     let mut app = Router::new()
@@ -386,7 +393,7 @@ async fn execute_handler(
         audit("deny", format!("Executor token rejected: {msg}"), "unauthenticated", AuditContext::default());
         ErrorResponse::new(status, msg)
     })?;
-    let executor = crate::opa::Identity {
+    let executor = crate::policy::Identity {
         username: claims_username(&executor_claims),
         claims: executor_claims,
     };
@@ -503,12 +510,12 @@ async fn execute_handler(
     }
 
     // 7. Policy: are these approvers enough, and may this person execute?
-    let input = crate::opa::OpaInput::Execute {
+    let input = crate::policy::RequestInput::Execute {
         command: command_json.clone(),
         request_id: request_id.clone(),
         approvers: approvers
             .iter()
-            .map(|a| crate::opa::Signer {
+            .map(|a| crate::policy::Signer {
                 username: a.username.clone(),
                 claims: a.claims.clone(),
                 signed_at: rfc3339(a.signed_at),
@@ -517,12 +524,10 @@ async fn execute_handler(
         executor,
         host: hostname.clone(),
     };
-    let decision = crate::opa::check_authorization(&state.http_client, &state.config.opa_url, &cmd_config.opa_rule, &input)
-        .await
-        .map_err(|e| {
-            audit("error", format!("OPA evaluation failed: {e}"), &user, full_ctx());
-            ErrorResponse::new(StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable")
-        })?;
+    let decision = state.policy.decide(&cmd_config.opa_rule, &input).await.map_err(|e| {
+        audit("error", format!("Policy evaluation failed: {e}"), &user, full_ctx());
+        ErrorResponse::new(StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable")
+    })?;
     if !decision.allow {
         audit("deny", decision.reason.clone(), &user, full_ctx());
         return Err(ErrorResponse::new(
@@ -798,7 +803,7 @@ async fn revoke_handler(
         config: &state.config,
         jwks: &state.jwks,
         trusted_roots: &state.trusted_roots,
-        http_client: &state.http_client,
+        policy: &state.policy,
         hostname: &hostname,
         retention: None,
         allow_unknown_commands: false,
@@ -895,26 +900,25 @@ async fn catalog_handler(State(state): State<AgentState>, headers: axum::http::H
     let Some(token) = bearer_token(&headers) else {
         return (StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
     };
-    if let Err((status, msg)) = verify_query_token(&token, &state) {
-        return (status, msg).into_response();
-    }
-    match crate::opa::allows_viewing(
-        &state.http_client,
-        &state.config.opa_url,
-        serde_json::json!({ "action": "view_docs", "jwt": token }),
-    )
-    .await
-    {
+    let claims = match verify_query_token(&token, &state) {
+        Ok(c) => c,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+    let viewer = crate::policy::Identity {
+        username: claims_username(&claims),
+        claims: claims.clone(),
+    };
+    match state.policy.allows_viewing(&crate::policy::ViewInput::ViewDocs { viewer }).await {
         Ok(true) => {}
         Ok(false) => {
             return (StatusCode::FORBIDDEN, "Policy does not allow you to view commands").into_response();
         }
         Err(e) => {
-            tracing::warn!("OPA view_docs check failed: {e}");
+            tracing::warn!("Policy view_docs check failed: {e}");
             return (StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable").into_response();
         }
     }
-    match crate::opa::fetch_requirements(&state.http_client, &state.config.opa_url).await {
+    match state.policy.requirements().await {
         Ok(published) => Json(crate::catalog::build(&state.config, &state.hostname, &published)).into_response(),
         Err(e) => {
             tracing::warn!("Fetching published requirements failed: {e}");
@@ -951,11 +955,16 @@ async fn stream_logs_handler(
         .unwrap_or("unknown")
         .to_string();
 
-    let allowed = opa_allows(
+    let allowed = policy_allows(
         &state,
-        serde_json::json!({ "action": "view_execution", "execution_id": id, "jwt": token }),
-    )
-    .await;
+        &crate::policy::ViewInput::ViewExecution {
+            viewer: crate::policy::Identity {
+                username: claims_username(&claims),
+                claims: claims.clone(),
+            },
+            execution_id: id.to_string(),
+        },
+    ).await;
     let exec_info = Some(serde_json::json!({ "execution_id": id }));
     if !allowed {
         crate::audit::log_audit(
@@ -1000,26 +1009,13 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Ask OPA's `remonce/authz/decision` for a legacy-shape input. Any error
-/// (unreachable, malformed response) denies.
-async fn opa_allows(state: &AgentState, input: serde_json::Value) -> bool {
-    let opa_url = format!("{}/v1/data/remonce/authz/decision", state.config.opa_url);
-    let res = state
-        .http_client
-        .post(&opa_url)
-        .json(&serde_json::json!({ "input": input }))
-        .send()
-        .await;
-    let body: serde_json::Value = match res {
-        Ok(r) => r.json().await.unwrap_or(serde_json::json!({})),
-        Err(e) => {
-            tracing::warn!("OPA request failed: {}", e.without_url());
-            return false;
-        }
-    };
-    body.pointer("/result/allow")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+/// Ask policy about a viewing action. A policy that fails to evaluate
+/// denies (and is logged).
+async fn policy_allows(state: &AgentState, input: &crate::policy::ViewInput) -> bool {
+    state.policy.allows_viewing(input).await.unwrap_or_else(|e| {
+        tracing::warn!("Policy evaluation failed: {e}");
+        false
+    })
 }
 
 async fn list_files_handler(
@@ -1115,14 +1111,19 @@ async fn stream_file_handler(
     };
 
     // 3. Check OPA
-    let allowed = opa_allows(
+    let allowed = policy_allows(
         &state,
-        serde_json::json!({ "action": "read_file", "file": file_info_json, "jwt": token }),
-    )
-    .await;
+        &crate::policy::ViewInput::ReadFile {
+            viewer: crate::policy::Identity {
+                username: claims_username(&claims),
+                claims: claims.clone(),
+            },
+            file: file_info_json.clone(),
+        },
+    ).await;
     if !allowed {
-         log_audit("deny", "OPA Denied".into(), user.clone(), Some(file_info_json));
-         return (axum::http::StatusCode::FORBIDDEN, "OPA Denied").into_response();
+         log_audit("deny", "Denied by policy".into(), user.clone(), Some(file_info_json));
+         return (axum::http::StatusCode::FORBIDDEN, "Denied by policy").into_response();
     }
 
     log_audit("allow", "File Stream Started".into(), user.clone(), Some(file_info_json));

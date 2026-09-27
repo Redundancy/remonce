@@ -27,7 +27,7 @@ pub struct RevocationCtx<'a> {
     pub config: &'a Config,
     pub jwks: &'a jsonwebtoken::jwk::JwkSet,
     pub trusted_roots: &'a [Vec<u8>],
-    pub http_client: &'a reqwest::Client,
+    pub policy: &'a crate::policy::Policy,
     pub hostname: &'a str,
     /// Minimum time to keep a revocation. The central service sets this to
     /// its retention period: agents may allow longer approval validity than
@@ -138,32 +138,31 @@ pub async fn verify_and_authorize(
     // Approvers may always cancel their own request; anyone else needs an
     // explicit OPA decision for action = "revoke".
     if !revocation.self_revoked {
-        let input = crate::opa::OpaInput::Revoke {
+        let input = crate::policy::RequestInput::Revoke {
             command: command_json.clone(),
             request_id: revocation.request_id.clone(),
             approvers: revocation
                 .approvers
                 .iter()
-                .map(|a| crate::opa::Signer {
+                .map(|a| crate::policy::Signer {
                     username: a.username.clone(),
                     claims: a.claims.clone(),
                     signed_at: signed_at(a.signed_at),
                 })
                 .collect(),
-            revoker: crate::opa::Signer {
+            revoker: crate::policy::Signer {
                 username: revoker_user.clone(),
                 claims: revocation.revoker.claims.clone(),
                 signed_at: signed_at(revocation.revoker.signed_at),
             },
             host: ctx.hostname.to_string(),
         };
-        let decision = match crate::opa::check_authorization(ctx.http_client, &ctx.config.opa_url, &opa_rule, &input).await
-        {
+        let decision = match ctx.policy.decide(&opa_rule, &input).await {
             Ok(d) => d,
             Err(e) => {
                 crate::audit::log_audit(
                     "error",
-                    format!("OPA evaluation failed during revocation: {e}"),
+                    format!("Policy evaluation failed during revocation: {e}"),
                     revoker_user.clone(),
                     ip.to_string(),
                     ctx.hostname.to_string(),
@@ -353,7 +352,7 @@ impl PersistentRevocationStore {
 
 #[derive(Clone)]
 pub struct ServiceState {
-    pub http_client: reqwest::Client,
+    pub policy: std::sync::Arc<crate::policy::Policy>,
     pub config: Config,
     pub jwks: jsonwebtoken::jwk::JwkSet,
     pub hostname: String,
@@ -423,8 +422,10 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         "Revocation service starting up"
     );
 
+    let policy = std::sync::Arc::new(crate::policy::Policy::from_config(&config)?);
+    tracing::info!(backend = %policy.describe(), "Policy ready");
     let state = ServiceState {
-        http_client,
+        policy,
         config,
         jwks,
         hostname,
@@ -463,7 +464,7 @@ async fn revoke_handler(
         config: &state.config,
         jwks: &state.jwks,
         trusted_roots: &state.trusted_roots,
-        http_client: &state.http_client,
+        policy: &state.policy,
         hostname: &state.hostname,
         retention: Some(state.retention),
         allow_unknown_commands: true,

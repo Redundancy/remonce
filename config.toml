@@ -111,11 +111,14 @@ description = "Server configuration file"
 # chain = "certs/agent-cert.pem"
 # key = "certs/agent-key.pem"
 #
-# Or for ACME:
+# Or for ACME. The CA must reach the agent to validate: by default on port
+# 443 (listen there, or forward 443 to the agent), or with
+# challenge = "http-01" on port 80, opened only while a certificate is being
+# issued. See CONFIGURATION.md.
 # [agent.tls]
 # mode = "acme"
 # domains = ["agent.example.com"]
-# email = ["ops@example.com"]
+# email = "ops@example.com"
 # cache_dir = "certs/acme-cache"
 # # directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
 

@@ -121,15 +121,16 @@ pub fn validate(config: &Config, insecure_flag: bool) -> Result<InsecureMode, In
         }
     }
 
-    // Gate 4: OPA reached over plaintext on the network. OPA's answer is
-    // the authorization decision; a MITM could simply return allow.
-    if let Ok(url) = Url::parse(&config.opa_url) {
-        if url.scheme() == "http" && !host_is_loopback(&url) {
-            violations.push(format!(
-                "opa_url is http:// and non-loopback ({}); a MITM can forge authorization decisions",
-                config.opa_url
-            ));
-        }
+    // Gate 4: a remote OPA reached over plaintext on the network. OPA's
+    // answer is the authorization decision; a MITM could simply return allow.
+    if let Some(opa_url) = &config.opa_url
+        && let Ok(url) = Url::parse(opa_url)
+        && url.scheme() == "http"
+        && !host_is_loopback(&url)
+    {
+        violations.push(format!(
+            "opa_url is http:// and non-loopback ({opa_url}); a MITM can forge authorization decisions"
+        ));
     }
 
     // Gate 5: agent CORS wildcard.
@@ -204,7 +205,8 @@ mod tests {
             timestamp_authority: TsaConfig::default(),
             commands: vec![],
             logs_dir: "logs".into(),
-            opa_url: "http://127.0.0.1:8181".into(),
+            policy_dir: None,
+            opa_url: None,
             files: vec![],
             agent: None,
             agent_url: "https://localhost:10022".into(),
@@ -276,11 +278,10 @@ mod tests {
     #[test]
     fn http_non_loopback_opa_rejected_without_insecure() {
         let mut cfg = base_config();
-        cfg.opa_url = "http://opa.internal:8181".into();
-        assert!(matches!(
-            validate(&cfg, false),
-            Err(InsecureError::Refused(_))
-        ));
+        cfg.opa_url = Some("http://opa.internal:8181".into());
+        assert!(matches!(validate(&cfg, false), Err(InsecureError::Refused(_))));
+        cfg.opa_url = Some("http://127.0.0.1:8181".into());
+        assert!(validate(&cfg, false).is_ok());
     }
 
     #[test]

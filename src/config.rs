@@ -28,10 +28,14 @@ pub struct Config {
     #[serde(default = "default_logs_dir")]
     pub logs_dir: String,
 
-    /// The URL of the Open Policy Agent (OPA) server.
-    /// Used for authorization decisions (e.g., "http://localhost:8181").
-    #[serde(default = "default_opa_url")]
-    pub opa_url: String,
+    /// Where policy decisions come from. Set one of these, or neither:
+    ///
+    /// `policy_dir`: a directory of Rego (`.rego`) and data (`.json`) files,
+    /// laid out as for `opa run`, evaluated inside remonce. The default,
+    /// with `DEFAULT_POLICY_DIR`.
+    pub policy_dir: Option<String>,
+    /// `opa_url`: an OPA server to ask instead (e.g. "http://localhost:8181").
+    pub opa_url: Option<String>,
 
     /// List of allowed files for read-only access.
     #[serde(default)]
@@ -145,9 +149,9 @@ fn default_listen_address() -> String {
     "127.0.0.1:8080".to_string()
 }
 
-fn default_opa_url() -> String {
-    "http://localhost:8181".to_string()
-}
+/// Where the embedded engine reads policy when neither `policy_dir` nor
+/// `opa_url` is set.
+pub const DEFAULT_POLICY_DIR: &str = "policy";
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -374,7 +378,27 @@ pub enum TlsConfig {
         /// ACME Directory URL (e.g., https://acme-staging-v02.api.letsencrypt.org/directory).
         /// If not provided, defaults to Let's Encrypt Production.
         directory_url: Option<String>,
+        /// How the CA validates the domains. Default: TLS-ALPN-01, which
+        /// the CA checks on port 443.
+        #[serde(default)]
+        challenge: AcmeChallenge,
+        /// For HTTP-01: where to answer the CA while a certificate is being
+        /// issued. Open only then. Default: "0.0.0.0:80".
+        http_challenge_address: Option<String>,
     },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AcmeChallenge {
+    /// Validated on port 443 of each domain; the listener must be there
+    /// (or 443 forwarded to it).
+    #[default]
+    #[serde(rename = "tls-alpn-01")]
+    TlsAlpn01,
+    /// Validated on port 80 of each domain, opened only while a certificate
+    /// is being issued; the listener itself can use any port.
+    #[serde(rename = "http-01")]
+    Http01,
 }
 
 /// Command keys removed in the move to independent approvals, with what to

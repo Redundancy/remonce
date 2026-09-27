@@ -35,7 +35,7 @@ A request is a command plus any number of independent approvals, each one person
     -   **Time window**: `not_before` / `not_after` enforced if present; a present but malformed bound denies.
     -   **Parameters**: signed `params` validated against `[[commands.params]]`, fail-closed.
 6.  **Revocation**: the **request id** (hex SHA-256 of the signed payload) must not be on the agent's revocation list, nor (when configured) on the central revocation service's — an unreachable service denies execution.
-7.  **OPA authorization**: input is the command, request id, every approver (`username`, full claims, `signed_at`), the executor (`username`, claims) and the host. The shipped policy allows when the command's published requirement document is satisfied — every slot filled by a different approver, and the executor accepted — and no extra rule denies. Deny-by-default.
+7.  **Policy authorization** (Rego, embedded or on an OPA server): input is the command, request id, every approver (`username`, full claims, `signed_at`), the executor (`username`, claims) and the host. The shipped policy allows when the command's published requirement document is satisfied — every slot filled by a different approver, and the executor accepted — and no extra rule denies. Deny-by-default.
 8.  **Replay cache**: last, just before spawning. The request id is recorded until every approval that could run it has expired; first-seen wins, and if spawning fails the entry is released so the request can be retried.
 
 ## Threat Model

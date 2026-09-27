@@ -10,7 +10,7 @@ This document tracks known security gaps, "TODO" items, and requirements for mov
 
 ### TLS / ACME Support
 - **Status**: **Fixed**. The agent requires TLS (`src/tls.rs`); there is no plaintext mode.
-- **Modes**: `files` (static certs with hot-reloading) and `acme` (automatic via `rustls-acme`, experimental).
+- **Modes**: `files` (static certs with hot-reloading) and `acme` (automatic via `rustls-acme`, experimental), validated with TLS-ALPN-01 on port 443 or HTTP-01 on port 80. With HTTP-01, port 80 is open only while a certificate is being issued.
 
 ### Replay Attack Mitigation
 - **Status**: **Fixed**. The agent keeps an in-memory replay cache (`src/replay.rs`) keyed by the request id (the hash of the signed request), so a request runs once however it is resubmitted. Entries live until every approval that could run the request has expired: `approval_validity` from the latest possible login. Every signature comes from its own re-authenticating login and must be timestamped within 5 minutes of it, so re-timestamping can't extend that, whatever the IdP's token lifetime.
@@ -42,8 +42,9 @@ This document tracks known security gaps, "TODO" items, and requirements for mov
 - Executing needs no nonce-bound key, only an ID token for the viewer client from the configured issuer, so a machine can execute once it can get one. Workload tokens usually come from a different issuer (GitHub/GitLab OIDC) or, through Vault, as an [identity token](https://developer.hashicorp.com/vault/docs/secrets/identity/identity-token) for a role whose audience must match the viewer client.
 - Planned shape: trust additional workload issuers for the executor role only, pinning issuer, audience and required claims per issuer — bearer-token semantics, mitigated by short token TTLs and tight claim pinning. Machines still can't approve: approving needs a key-bound, re-authenticated login.
 
-### Embedded OPA (planned)
-- Authorization currently requires a running OPA server. Embedding policy evaluation (e.g. Regorus) would remove the last runtime dependency for single-binary deployments.
+### Embedded Policy Engine
+- **Status**: **Implemented**. Rego policy is evaluated in-process with Regorus by default (`policy_dir`), so no OPA server is needed; `opa_url` still selects an OPA server for its full builtin library and tooling. The two are checked against each other in tests.
+- **Caveat**: the embedded engine omits `net.*`, `http.send`, `crypto.*` and `io.jwt.*` builtins; a policy using them is refused at startup and needs `opa_url`.
 
 ### Persistent Replay Cache
 - The replay cache remains in-memory per-agent. Its window runs until the request's approvals expire (`approval_validity`), so the exposure is an agent restart inside that window. Persist it if your threat model requires.

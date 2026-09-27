@@ -1,7 +1,6 @@
 @echo off
 echo Starting Vault in dev mode...
 start "Vault Server" "bin\vault.exe" server -dev -dev-root-token-id=root_token
-start "OPA Server" cmd /k "bin\opa.exe" run --server --watch policy
 echo Waiting for Vault to start (5 seconds)...
 ping 127.0.0.1 -n 6 > nul
 

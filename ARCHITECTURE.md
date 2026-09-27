@@ -49,7 +49,7 @@ OpenPubkey is an open-source protocol that augments OIDC with proof-of-possessio
 |--------|---------|------------|
 | **Use Case** | Remote command execution | General identity signing |
 | **Timestamping** | RFC 3161 TSA for non-repudiation | Not standard |
-| **Policy Engine** | Built-in OPA integration | Application-specific |
+| **Policy Engine** | Rego, embedded or on an OPA server | Application-specific |
 | **Multi-party approval** | N independent approvals, requirements set by policy | Optional MFA cosigner (reduces single IdP trust) |
 
 Remonce extends the OpenPubkey concept with **integrated authorization** (OPA) and **cryptographic timestamping** (TSA), making it purpose-built for auditable command execution rather than general-purpose signing.
@@ -159,11 +159,11 @@ Revoking cancels a **whole request**, whoever approved it: the revocation list i
 
 Any of the request's approvers may revoke it. Anyone else needs policy's permission (`action = "revoke"`, with the approvers and `input.revoker`). A revocation is kept until no approval of the request could still be valid, or for the central service's retention period if that's longer. Agents consult a central revocation service fail-closed (`GET /v2/revoked/{request_id}`), and pin every revocation locally too. See [CONFIGURATION.md](CONFIGURATION.md#revoking-a-request-remonce-revoke).
 
-## Policy Engine (OPA)
+## Policy Engine (Rego)
 
 Authentication proves *who* you are. Authorization proves *what* you can do.
 
-Remonce integrates **Open Policy Agent (OPA)** to decide every execution, revocation by a non-approver, and read of files, logs and the catalog. For an execution, OPA sees the command, request id, every verified approver, the executor and the host. The shipped policy allows a run when the command's requirement document is satisfied and no extra rule denies it; add rules in `extra_denials` (and describe them in the document's `additional_policy`).
+Every execution, revocation by a non-approver, and read of files, logs and the catalog is decided by [Rego](https://www.openpolicyagent.org/docs/latest/policy-language/) policy. By default the agent evaluates it in-process with [Regorus](https://github.com/microsoft/regorus), so a single binary is the whole deployment; with `opa_url` set, it asks an **Open Policy Agent (OPA)** server instead, for the full builtin library and OPA's bundle and logging tooling. Both backends get the same input and are asked the same paths, and a test checks they agree. Policy only ever sees verified identities (claims), never raw tokens. For an execution, it sees the command, request id, every verified approver, the executor and the host. The shipped policy allows a run when the command's requirement document is satisfied and no extra rule denies it; add rules in `extra_denials` (and describe them in the document's `additional_policy`).
 
 Deny-by-default is the posture. Example rules in [policy/authz.rego](policy/authz.rego); tests in `policy_test/`.
 

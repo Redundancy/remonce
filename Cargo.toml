@@ -59,6 +59,8 @@ rustls-webpki = { version = "0.103", features = ["std", "ring"] }
 humantime-serde = "1.1"
 glob = "0.3"
 regex = "1"
+regorus = { version = "0.12", default-features = false, features = ["opa-no-std", "glob", "time", "uuid", "urlquery", "jsonschema", "yaml", "rand"] }
+async-trait = "0.1"
 
 [lib]
 name = "remonce"

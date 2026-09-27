@@ -9,15 +9,15 @@ Ensure you have the following installed and available in `bin/` or your PATH:
 - **Rust**: [Install Rust](https://www.rust-lang.org/tools/install)
 - **Terraform**: [Install Terraform](https://developer.hashicorp.com/terraform/downloads)
 - **Vault**: [Install Vault](https://developer.hashicorp.com/vault/downloads)
-- **OPA**: [Install Open Policy Agent](https://www.openpolicyagent.org/docs/latest/#running-opa)
+- **OPA** (optional): only to try the remote-OPA mode or run `opa test`. Policy is evaluated inside remonce by default.
 
-> **Important**: The `start_services.bat` script **requires** these tools to be present in the `bin/` directory of the project root. Please download the executables and place `vault.exe`, `opa.exe`, and `terraform.exe` inside `bin/`.
+> **Important**: The `start_services.bat` script **requires** these tools to be present in the `bin/` directory of the project root. Please download the executables and place `vault.exe` and `terraform.exe` (and optionally `opa.exe`) inside `bin/`.
 
 ## Initial Setup
 
 1.  **Clone/Open the Repository** in your terminal.
 2.  **Start Background Services**:
-    Run the provided helper script to spin up Vault (Dev Mode) and OPA:
+    Run the provided helper script to spin up Vault (Dev Mode):
     ```powershell
     ./start_services.bat
     ```
@@ -101,11 +101,11 @@ The backend is written in **Rust** using `Axum`.
 
 ### Policy Development (`policy/`)
 
-Authorization logic is handled by **OPA** using Rego.
+Authorization is Rego policy, evaluated inside the agent (embedded [Regorus](https://github.com/microsoft/regorus)) unless `opa_url` points at an OPA server.
 
 -   **Modify Policy**: Edit `policy/authz.rego`, the shared helper `policy/lib.rego`, or the per-command requirement documents in `policy/requirements.json`.
--   **Apply Changes**: The `start_services.bat` script runs OPA with `--watch policy`. Changes to `.rego` and `.json` files are **automatically reloaded** by OPA. You do not need to restart anything; agents fetch requirements for each catalog request.
--   **Test**: `bin\opa.exe test policy policy_test -v`. The tests live outside `policy/` so the served policy doesn't include them.
+-   **Apply Changes**: The agent notices changed `.rego`, `.json` and `.yaml` files on its next decision. You do not need to restart anything.
+-   **Test**: `cargo test` runs `policy_test/` on the embedded engine. With OPA installed, `bin\opa.exe test policy policy_test -v` runs them on OPA; `opa run --server policy` plus `REMONCE_TEST_OPA_URL=http://127.0.0.1:8181 cargo test policy` checks that both engines agree. The tests live outside `policy/` so they aren't loaded as policy.
 
 ## Authentication Flow (Local)
 
@@ -119,5 +119,5 @@ Authorization logic is handled by **OPA** using Rego.
 ## Troubleshooting
 
 -   **"No session state found"**: Ensure you are accessing `http://localhost:8080` and NOT `127.0.0.1:8080` to match the configured Redirect URI.
--   **Vault/OPA not reachable**: Check if the `start_services.bat` terminal is still running.
+-   **Vault not reachable**: Check if the `start_services.bat` terminal is still running.
 -   **Verification Errors**: Ensure the TSA URL in `config.toml` is reachable (defaults to DigiCert).

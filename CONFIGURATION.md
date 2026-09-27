@@ -84,7 +84,8 @@ agent_ca_path = "./certs/agent-fullchain.pem"
 
 Each user can add agents without editing the shared `config.toml`. The signer reads, at startup:
 
-- Windows: `%APPDATA%emoncegents.toml`
+- Windows: `%APPDATA%
+emoncegents.toml`
 - elsewhere: `$XDG_CONFIG_HOME/remonce/agents.toml`, or `~/.config/remonce/agents.toml`
 - or whatever `REMONCE_AGENTS_FILE` names.
 
@@ -153,14 +154,45 @@ Certificates are hot-reloaded on change.
 
 #### Mode: ACME (production)
 
+The agent gets and renews its own certificate from Let's Encrypt, or any ACME CA via `directory_url`: no certificate files to manage. The CA has to reach the agent to validate each name, and there are two ways it can:
+
+**TLS-ALPN-01 (default)** — validated on the agent's own HTTPS listener, which must be on **port 443** of each name in `domains` (RFC 8737 always uses 443):
+
 ```toml
+[agent]
+listen_address = "0.0.0.0:443"
+
 [agent.tls]
 mode = "acme"
 domains = ["agent.example.com"]
-email = ["ops@example.com"]
+email = "ops@example.com"
 cache_dir = "./certs/acme-cache"
 # directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"  # for testing
 ```
+
+Or keep another port and forward 443 to it (firewall, NAT or load-balancer passthrough — not TLS termination, which would answer the challenge itself). The agent warns at startup when it uses TLS-ALPN-01 on a port other than 443.
+
+**HTTP-01** — the agent keeps its HTTPS listener on any port, and opens **port 80 only while a certificate is being issued**: on first start, and at each renewal (when a third of the certificate's lifetime is left, about every two months with Let's Encrypt). While open, port 80 answers only the CA's challenge requests (`/.well-known/acme-challenge/…`, 404 for anything else). It closes as soon as the new certificate is stored, or after 5 minutes without contact with the CA if an attempt fails (the retry reopens it).
+
+```toml
+[agent]
+listen_address = "0.0.0.0:10022"      # any port
+
+[agent.tls]
+mode = "acme"
+domains = ["agent.example.com"]
+email = "ops@example.com"
+cache_dir = "./certs/acme-cache"
+challenge = "http-01"
+# http_challenge_address = "0.0.0.0:80"   # default; another port needs port 80 forwarded to it
+```
+
+Binding port 80 may need privileges (on Linux, `CAP_NET_BIND_SERVICE`); if it can't, the agent logs an error and no certificate is issued. The agent logs each time it opens and closes the port.
+
+Requirements for either:
+
+- **A name the CA can reach.** Each domain must resolve to this host from wherever the CA validates — the public internet for Let's Encrypt. For hosts that aren't publicly reachable, use a private ACME CA that can reach them, or `mode = "files"`.
+- **Clients use the name.** Point `agent_url` at `https://agent.example.com` (or the port you listen on), matching a name in `domains`.
 
 > [!WARNING]
 > ACME support is experimental. When first wiring up a new domain, point `directory_url` at Let's Encrypt **staging** to avoid hitting production rate limits.
@@ -204,15 +236,31 @@ redirect_uri = "http://localhost:8080/oidc/callback"
 - **`iat` and `auth_time`** in the ID token. OIDC requires `auth_time` whenever `max_age` is requested. Agents require a signing token to be timestamped within 5 minutes of its `iat`, and its `auth_time` to be within 5 minutes before `iat`.
 - **`max_age` honored**, or `signing_prompt_login = true`. The signer checks a returned signing token and fails the flow with a clear error if the IdP didn't actually re-authenticate.
 - **Token lifetime is up to you.** A signature's validity is measured from the login, not the token's `exp`, so long-lived tokens no longer widen any window. Keep viewer-token lifetimes short, though: those are bearer credentials.
-### Authorization (OPA)
+### Authorization (policy)
 
-These settings determine how the agent checks permissions.
+Every decision is Rego policy, evaluated one of two interchangeable ways. The same policy files, input and paths work with either.
+
+**Embedded (default).** The agent and revocation service evaluate the policy themselves with [Regorus](https://github.com/microsoft/regorus), a Rego interpreter. Nothing else to install or run.
 
 ```toml
-# URL of the Open Policy Agent service.
-# If omitted, defaults to "http://localhost:8181".
-opa_url = "http://127.0.0.1:8181"
+# Directory of .rego modules and .json/.yaml data, laid out as for `opa run`:
+# data files mount at their directory's path (policy/requirements.json at
+# `data`, policy/teams/db/owners.yaml at `data.teams.db`).
+# Default: "policy".
+policy_dir = "policy"
 ```
+
+Edits are picked up on the next decision, with no restart. A policy that doesn't load stops startup; if a later edit breaks it, decisions fail closed (503) until it's fixed — the previous policy is never kept in force.
+
+**An OPA server (for power users).** Set `opa_url` instead, and decisions go to OPA's data API. Use this when you want what only a full OPA offers: the complete builtin library, bundles and a central policy distribution, decision logs, or OPA's tooling.
+
+```toml
+opa_url = "http://127.0.0.1:8181"   # http:// beyond loopback needs --insecure
+```
+
+Set one of `policy_dir` or `opa_url`, not both.
+
+**What the embedded engine doesn't have.** Regorus implements most of the Rego language (Rego v1) and most OPA builtins. Deliberately left out, to keep dependencies small: `net.*` (CIDR and address functions), `http.send`, `crypto.*` and `io.jwt.*`. A policy that uses a missing builtin is refused at startup with a message saying so; run it on an OPA server instead. Remonce's own inputs never need them: identities arrive as verified claims, not raw tokens.
 
 Policy decisions requested by the agent (`input.action`):
 
@@ -220,11 +268,13 @@ Policy decisions requested by the agent (`input.action`):
 |--------|------|-------|
 | `execute` | Running an approved request | `command`, `request_id`, `approvers` (each `username`, `claims`, `signed_at`), `executor` (`username`, `claims`), `host` |
 | `revoke` | Someone who didn't approve a request revokes it | `command`, `request_id`, `approvers`, `revoker`, `host` |
-| `read_file` | Streaming an allowed file | `jwt`, `file` |
-| `view_execution` | Streaming an execution's output log | `jwt`, `execution_id` |
-| `view_docs` | Reading the agent's command catalog | `jwt` |
+| `read_file` | Streaming an allowed file | `viewer` (`username`, `claims`), `file` |
+| `view_execution` | Streaming an execution's output log | `viewer`, `execution_id` |
+| `view_docs` | Reading the agent's command catalog | `viewer` |
 
-The agent also reads `data.remonce.requirements` (see [Requirement documents](#requirement-documents)) to publish in its catalog.
+Execution and revocation decisions come from each command's `opa_rule` (the shipped policy's is `data.remonce.authz.decision`, returning `{allow, reason}`); viewing decisions from `data.remonce.authz.allow`. The agent also reads `data.remonce.requirements` (see [Requirement documents](#requirement-documents)) to publish in its catalog.
+
+**Extending it.** Requirement documents cover the common cases without writing Rego. Beyond them, policy is ordinary Rego: add modules and data to the policy directory, add rules to `extra_denials` in `authz.rego`, or point a command's `opa_rule` at a decision rule of your own. Keep the command's `additional_policy` set so people see that more applies.
 
 The agent's catalog, file and log-stream endpoints, and `/execute`, take the caller's **viewer** ID token as an `Authorization: Bearer` header (never a query parameter), and reject tokens for any other audience. The signer attaches it when proxying.
 
@@ -370,7 +420,7 @@ What a command needs before it runs — how many approvals, from whom, and who m
 
 The agent serves each command's document in its catalog (`GET /api/commands`), so the UI can show what a command needs and which slots a request's approvals already fill. The shipped [policy/authz.rego](policy/authz.rego) allows an execution exactly when `lib.satisfied(requirement, input)` holds and no `extra_denials` rule fires, and denies a command with no document. The agent verifies every approval before asking, and rejects two approvals from the same person outright.
 
-Run the policy tests with `bin/opa test policy policy_test`. One of them checks that meeting each published document is enough to be allowed (unless it declares `additional_policy`), so the documents can't silently drift from the rules.
+`cargo test` runs the policy tests in `policy_test/` on the embedded engine (`opa test policy policy_test` runs them on OPA). One of them checks that meeting each published document is enough to be allowed (unless it declares `additional_policy`), so the documents can't silently drift from the rules.
 
 ## Handing requests and approvals to someone
 
@@ -457,7 +507,7 @@ Semantics:
 - When `revocation_service_url` is set, the agent checks `GET /v2/revoked/{request_id}` (64 lowercase hex characters) before every execution, and a revocation submitted to any agent is forwarded to the service.
 - **Fail-closed**: if the service is configured but unreachable, the agent denies execution (`Revocation Check Failed`). A configured revocation service must be available — there is deliberately no fail-open mode.
 - Revocations expire from the store once they can no longer matter (see `retention`); expired entries are compacted out of the JSONL file on service restart.
-- The service reads the same `config.toml` sections as the agent (`[oidc]`, `[timestamp_authority]`, `[[commands]]`, `opa_url`), since it performs the same verification. It also accepts revocations for commands missing from its own `[[commands]]` (verified with the default `approval_validity`; third parties judged by the default OPA rule), since it serves agents whose command sets it may not mirror.
+- The service reads the same `config.toml` sections as the agent (`[oidc]`, `[timestamp_authority]`, `[[commands]]`, and `policy_dir` or `opa_url`), since it performs the same verification. It also accepts revocations for commands missing from its own `[[commands]]` (verified with the default `approval_validity`; third parties judged by the default OPA rule), since it serves agents whose command sets it may not mirror.
 - `retention` must be at least the longest `approval_validity` any agent allows; each revocation is kept until the latest approver's `iat` plus the larger of the two.
 - Writes are fsync'd before the service acknowledges them. A torn final line left by a crash is ignored at startup; corruption anywhere else refuses to start (agents then fail closed).
 
@@ -478,3 +528,10 @@ This release replaces approver/operator bundles, again with no compatibility mod
 3. **Replace validity settings.** `approver_max_validity` and `operator_max_validity` are replaced by `approval_validity`; the old keys are rejected with a hint.
 4. **Agents need `viewer_client_id`.** Submitting a request now requires a viewer login, which identifies the executor.
 5. **Upgrade agents and the revocation service together**, and archive the revocation log. Revocations are now by request id at `/v2/revoked/{request_id}`, and the service refuses to start on an older `revocations.jsonl`.
+
+## Upgrading to embedded policy
+
+Policy is now evaluated inside remonce by default:
+
+1. **No `opa_url` means embedded.** It used to default to `http://localhost:8181`; now, without `opa_url`, the agent and revocation service read `policy_dir` (default `policy/`) themselves. Keep a running OPA by setting `opa_url` explicitly.
+2. **Viewing input carries verified claims.** `read_file`, `view_execution` and `view_docs` decisions now get `input.viewer` (`username` and the agent-verified `claims`) instead of the raw viewer token as `input.jwt`, so policies don't need `io.jwt.decode` and bearer tokens stay out of OPA's decision logs. Replace `io.jwt.decode(input.jwt)` payload lookups with `input.viewer.claims`.

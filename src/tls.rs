@@ -282,6 +282,9 @@ where
     }
 }
 
+/// The port an ACME CA connects to for TLS-ALPN-01 validation (RFC 8737 §3).
+pub const ACME_VALIDATION_PORT: u16 = 443;
+
 /// Serve an Axum `Router` over TLS using the given `TlsConfig`.
 ///
 /// Supports both file-based certificates (with hot-reload via `notify`) and
@@ -324,7 +327,10 @@ pub async fn serve_with_tls(
             email,
             cache_dir,
             directory_url,
+            challenge,
+            http_challenge_address,
         } => {
+            use crate::config::AcmeChallenge;
             use futures::StreamExt;
             use hyper_util::rt::{TokioExecutor, TokioIo};
             use hyper_util::server::conn::auto::Builder;
@@ -332,7 +338,28 @@ pub async fn serve_with_tls(
             use rustls_acme::{caches::DirCache, AcmeConfig};
             use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
-            let state = DirCache::new(cache_dir.clone());
+            if *challenge == AcmeChallenge::TlsAlpn01 && http_challenge_address.is_some() {
+                return Err("http_challenge_address only applies with challenge = \"http-01\"".into());
+            }
+            // TLS-ALPN-01 is always checked on port 443 (RFC 8737 §3).
+            // Another port works only if 443 is forwarded here, so say so
+            // rather than fail silently at the CA. HTTP-01 has no such
+            // constraint on this listener.
+            if *challenge == AcmeChallenge::TlsAlpn01
+                && let Ok(addr) = listener.local_addr()
+                && addr.port() != ACME_VALIDATION_PORT
+            {
+                tracing::warn!(
+                    port = addr.port(),
+                    "ACME: the CA validates on port {ACME_VALIDATION_PORT} of {}. Listen on \
+                     {ACME_VALIDATION_PORT}, forward {ACME_VALIDATION_PORT} to this port, or use \
+                     challenge = \"http-01\"; otherwise no certificate will be issued",
+                    domains.join(", ")
+                );
+            }
+
+            let (signals, signal_rx) = crate::acme_http01::channel();
+            let cache = crate::acme_http01::NotifyingCache::new(DirCache::new(cache_dir.clone()), signals.clone());
 
             let mut root_store = rustls::RootCertStore::empty();
             for cert in rustls_native_certs::load_native_certs()
@@ -341,18 +368,33 @@ pub async fn serve_with_tls(
                 root_store.add(cert).ok();
             }
 
-            let client_config = rustls::client::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+            // The client the ACME library talks to the CA with. Its verifier
+            // reports each connection, which is how HTTP-01 knows an order
+            // has started; with resumption off, every connection verifies.
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(root_store),
+                provider.clone(),
+            )
+            .build()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("ACME client: {e}").into() })?;
+            let mut client_config = rustls::client::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::acme_http01::NotifyingVerifier::new(
+                    verifier, signals,
+                )))
+                .with_no_client_auth();
+            client_config.resumption = rustls::client::Resumption::disabled();
 
             let mut acme_config =
                 AcmeConfig::new_with_client_config(domains.clone(), Arc::new(client_config))
                     .contact(email.iter().map(|e| format!("mailto:{}", e)))
-                    .cache_option(Some(state));
+                    .cache(cache);
+            if *challenge == AcmeChallenge::Http01 {
+                acme_config = acme_config.challenge_type(rustls_acme::UseChallenge::Http01);
+            }
 
             if let Some(url) = directory_url {
                 acme_config = acme_config.directory(url);
@@ -363,8 +405,21 @@ pub async fn serve_with_tls(
             let listener_stream = tokio_stream::wrappers::TcpListenerStream::new(listener)
                 .map(|res| res.map(|s| s.compat()));
 
-            let mut incoming = acme_config
-                .incoming(listener_stream, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+            let state = acme_config.state();
+            if *challenge == AcmeChallenge::Http01 {
+                let address = http_challenge_address
+                    .clone()
+                    .unwrap_or_else(|| crate::acme_http01::DEFAULT_ADDRESS.to_string());
+                if !address.ends_with(":80") {
+                    tracing::warn!(
+                        "ACME: the CA validates HTTP-01 on port 80 of {}; {address} works only \
+                         if port 80 is forwarded to it",
+                        domains.join(", ")
+                    );
+                }
+                tokio::spawn(crate::acme_http01::run(address, state.resolver(), signal_rx));
+            }
+            let mut incoming = state.incoming(listener_stream, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
 
             while let Some(tls) = incoming.next().await {
                 match tls {
