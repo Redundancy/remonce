@@ -2,6 +2,7 @@ pub mod config;
 pub mod security;
 pub mod agent;
 pub mod agent_proxy;
+pub mod known_agents;
 pub mod cli;
 pub mod catalog;
 pub mod requirements;

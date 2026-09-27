@@ -259,45 +259,69 @@ function signedPayloadText(command) {
 const AGENT_KEY = 'remonce.agentUrl';
 
 function agentUrl() {
-    const input = $('agent-url');
-    return input ? input.value.trim() : '';
+    const select = $('agent-url');
+    return select ? select.value : '';
 }
 
-// The signer reaches agents from its own process, so a loopback agent URL
-// means the machine running the signer — not the one running this browser.
-function isLoopbackAgent(raw) {
-    let host;
-    try { host = new URL(raw).hostname.toLowerCase(); } catch (_) { return false; }
-    return host === 'localhost' || host.endsWith('.localhost') || host === '[::1]' ||
-        /^127(\.\d{1,3}){3}$/.test(host);
+function agentOption() {
+    const select = $('agent-url');
+    return (select && select.selectedOptions[0]) || null;
 }
 
+// The signer reaches agents from its own process, so a localhost agent is
+// the one on the machine running the signer — not the one running this
+// browser. The signer marks those options data-local="true".
+function agentIsLocal() {
+    const o = agentOption();
+    return Boolean(o && o.dataset.local === 'true');
+}
+
+// The selected agent, for use in a sentence.
 function agentDisplay() {
-    const url = agentUrl() || document.body.dataset.agentUrl || 'the default agent';
-    const signer = document.body.dataset.signerHost;
-    return isLoopbackAgent(url) && signer ? `${url} (on ${signer})` : url;
+    const o = agentOption();
+    if (!o) return 'the default agent';
+    if (o.dataset.local === 'true') return `this machine (${document.body.dataset.signerHost})`;
+    return o.dataset.name || o.value.replace(/^https:\/\//, '');
+}
+
+function showAgentKind() {
+    const local = agentIsLocal();
+    $('agent-field').classList.toggle('is-local', local);
+    $('agent-local').hidden = !local;
+}
+
+function originOf(raw) {
+    try { return new URL(raw).origin; } catch (_) { return null; }
+}
+
+// Select the agent at `raw` without remembering it (for links that name an
+// agent). One the signer doesn't know is shown as such; requests to it are
+// refused.
+function setAgent(raw) {
+    const select = $('agent-url');
+    const origin = originOf(raw);
+    if (!select || !origin) return;
+    let option = [...select.options].find(o => o.value === origin);
+    if (!option) {
+        option = h('option', { value: origin }, 'not configured — ' + origin.replace(/^https:\/\//, ''));
+        select.append(option);
+    }
+    select.value = origin;
+    showAgentKind();
 }
 
 function initAgentField() {
-    const input = $('agent-url');
-    if (!input) return;
+    const select = $('agent-url');
+    if (!select) return;
     let stored = null;
     try { stored = localStorage.getItem(AGENT_KEY); } catch (_) { /* storage blocked */ }
-    input.value = stored || document.body.dataset.agentUrl || '';
-    const where = $('agent-where');
-    const signer = document.body.dataset.signerHost;
-    const showWhere = () => {
-        const local = isLoopbackAgent(input.value.trim()) && Boolean(signer);
-        where.hidden = !local;
-        where.textContent = local ? 'on ' + signer : '';
-        where.title = local ? `The signer contacts agents itself, so this is the agent on ${signer}, where the signer runs` : '';
-    };
-    input.addEventListener('input', showWhere);
-    input.addEventListener('change', () => {
-        showWhere();
-        try { localStorage.setItem(AGENT_KEY, input.value.trim()); } catch (_) { /* ignore */ }
+    const origin = stored && originOf(stored);
+    if (origin && [...select.options].some(o => o.value === origin)) select.value = origin;
+    select.addEventListener('change', () => {
+        showAgentKind();
+        try { localStorage.setItem(AGENT_KEY, select.value); } catch (_) { /* ignore */ }
     });
-    showWhere();
+    showAgentKind();
 }
 
 async function errorText(res) {
@@ -1150,7 +1174,7 @@ function initMonitorPage() {
     const id = params.get('id');
     const path = params.get('path');
     const name = params.get('name');
-    if (params.get('agent_url')) $('agent-url').value = params.get('agent_url');
+    if (params.get('agent_url')) setAgent(params.get('agent_url'));
 
     if (!id && !path && !name) {
         $('monitor-open').hidden = false;
@@ -1177,6 +1201,8 @@ function initMonitorPage() {
     let follow = true;
     let wrap = true;
     const lines = [];
+    // Rows received while follow is off: kept, shown when it's turned on.
+    const held = [];
     let partial = '';
     let inHeader = false;
     let finished = false;
@@ -1202,7 +1228,7 @@ function initMonitorPage() {
     $('run-title').textContent = isRun ? 'Run ' + id.slice(0, 8) : (name || displayPath(path).split(/[\\/]/).pop());
     $('term-title').textContent = isRun ? 'execution log · ' + id : (name || displayPath(path));
     setFact(isRun ? 'Execution ID' : 'File', isRun ? id : (name || displayPath(path)));
-    setFact('Agent', agentDisplay());
+    setFact('Agent', agentIsLocal() ? `This machine · ${document.body.dataset.signerHost}` : agentDisplay());
     if (!isRun) setFact('Showing', tail === '-1' ? 'whole file' : `last ${tail} lines, then new lines`);
 
     const matches = (text) => {
@@ -1222,8 +1248,10 @@ function initMonitorPage() {
         el.append(text.slice(i));
     };
     const updateCount = () => {
-        const visible = lines.filter(l => !l.el.classList.contains('hidden')).length;
-        shown.textContent = `${visible.toLocaleString()} of ${lines.length.toLocaleString()} lines`;
+        const onScreen = lines.length - held.length;
+        const visible = lines.filter(l => l.el.isConnected && !l.el.classList.contains('hidden')).length;
+        shown.textContent = `${visible.toLocaleString()} of ${onScreen.toLocaleString()} lines` +
+            (held.length ? ` · paused, ${held.length.toLocaleString()} new ${held.length === 1 ? 'line' : 'lines'} held` : '');
     };
 
     // The agent writes a header block before the command's output and a
@@ -1265,7 +1293,8 @@ function initMonitorPage() {
         renderMsg(msg, text);
         if (!matches(text)) row.classList.add('hidden');
         lines.push({ text, el: row, msg });
-        out.append(row);
+        if (follow) out.append(row);
+        else held.push(row);
     };
 
     const ingest = (chunk) => {
@@ -1289,10 +1318,16 @@ function initMonitorPage() {
         wrapBtn.classList.toggle('on', wrap);
         out.classList.toggle('wrap', wrap);
     });
+    // Like tail -f: off pauses the view. Lines keep arriving and are held
+    // (nothing is lost), then shown when follow is turned back on.
     followBtn.addEventListener('click', () => {
         follow = !follow;
         followBtn.classList.toggle('on', follow);
-        if (follow) out.scrollTop = out.scrollHeight;
+        if (follow) {
+            out.append(...held.splice(0));
+            out.scrollTop = out.scrollHeight;
+        }
+        updateCount();
     });
     const allText = () => lines.map(l => l.text).concat(partial ? [partial] : []).join('\n');
     $('term-copy').addEventListener('click', () => copyText(allText(), 'Log copied'));

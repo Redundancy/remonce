@@ -51,9 +51,10 @@ pub struct Config {
     /// of the system trust store.
     pub agent_ca_path: Option<String>,
 
-    /// Additional agents the signer UI may target besides `agent_url`. The
-    /// web tier refuses any other browser-supplied agent URL, since it sends
-    /// the user's ID token and signatures to whichever agent is chosen.
+    /// Additional agents the signer UI may target besides `agent_url` (and
+    /// the user's agents file, see `known_agents`). The signer refuses any
+    /// other browser-supplied agent URL, since it sends the user's ID token
+    /// and approvals to whichever agent is chosen.
     #[serde(default)]
     pub allowed_agent_urls: Vec<String>,
 

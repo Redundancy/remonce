@@ -107,6 +107,9 @@ pub struct AppState {
     pub agent_tls: std::sync::Arc<rustls::ClientConfig>,
     /// TSA trust anchors, to check each timestamp before handing out a bundle.
     pub trusted_roots: Vec<Vec<u8>>,
+    /// Agents the UI may use: `config.toml` first (`agent_url` leading), then
+    /// the user's agents file. Never empty.
+    pub known_agents: Vec<crate::known_agents::KnownAgent>,
 }
 
 /// Data stored in the session during a viewer login.
@@ -220,6 +223,17 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         config.timestamp_authority.trust_system_store,
     );
 
+    let known_agents = crate::known_agents::load(&config).map_err(AppError::Config)?;
+    match crate::known_agents::user_file_path() {
+        Some(path) => tracing::info!(
+            agents = known_agents.len(),
+            "Known agents: config.toml plus {} ({})",
+            path.display(),
+            if path.exists() { "found" } else { "not present" }
+        ),
+        None => tracing::info!(agents = known_agents.len(), "Known agents: config.toml (no user agents file location)"),
+    }
+
     let app_state = AppState {
         http_client: http_client.clone(),
         config: config.clone(),
@@ -229,6 +243,7 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         agent_http,
         agent_tls,
         trusted_roots,
+        known_agents,
     };
 
     // Session layer for storing OIDC state and user profile.
@@ -371,10 +386,7 @@ async fn render_template(
         .filter_map(|w| w.chars().next())
         .collect::<String>()
         .to_uppercase();
-    let agent_options: String = std::iter::once(&state.config.agent_url)
-        .chain(state.config.allowed_agent_urls.iter())
-        .map(|u| format!("<option value=\"{}\"></option>", html_escape(u)))
-        .collect();
+    let agent_options = crate::known_agents::options_html(&state.known_agents, &state.hostname);
 
     let body = layout
         .replace("{{content}}", &content)
@@ -383,7 +395,6 @@ async fn render_template(
         .replace("{{username}}", &html_escape(&profile.username))
         .replace("{{initials}}", &html_escape(&initials))
         .replace("{{hostname}}", &html_escape(&state.hostname))
-        .replace("{{agent_url}}", &html_escape(&state.config.agent_url))
         .replace("{{agent_options}}", &agent_options);
 
     Ok(Html(body).into_response())

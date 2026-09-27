@@ -22,6 +22,10 @@
   --accent-glow: oklch(0.88 0.17 150 / 0.35);
   --on-accent: oklch(0.16 0.02 170);
 
+  --local: oklch(0.82 0.11 245);
+  --local-bg: oklch(0.82 0.11 245 / 0.12);
+  --local-line: oklch(0.68 0.12 245 / 0.7);
+
   --warn: oklch(0.82 0.14 75);
   --danger: oklch(0.72 0.18 28);
   --danger-fg: oklch(0.82 0.13 28);
@@ -91,6 +95,9 @@ a:hover { text-decoration: underline; }
 .brand-wordmark .dot { color: var(--accent); }
 
 .nav { display: flex; flex-direction: column; gap: 2px; }
+/* The name's origin, kept quiet: the letters that spell it are a shade brighter. */
+.tagline { font-size: 10.5px; letter-spacing: 0.02em; color: var(--fg-4); padding: 0 6px; margin-top: -12px; }
+.tagline b { font-weight: 500; color: var(--fg-3); }
 .nav-section-label {
   font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.08em;
   color: var(--fg-4); padding: 10px 10px 6px; font-weight: 600;
@@ -154,14 +161,25 @@ a:hover { text-decoration: underline; }
   font-size: 12px;
   width: min(420px, 50%);
 }
-.agent-where { flex: 0 0 auto; font-size: 11.5px; color: var(--fg-3); white-space: nowrap; }
 .agent-field:focus-within { border-color: var(--accent-dim); box-shadow: 0 0 0 3px var(--accent-bg); }
 .agent-field label { text-transform: uppercase; letter-spacing: 0.08em; font-size: 10.5px; font-weight: 600; color: var(--fg-4); }
-.agent-field input {
+.agent-field select {
   flex: 1; min-width: 0;
   border: 0; outline: 0; background: transparent;
   font-family: var(--mono); font-size: 12px; color: var(--fg-1);
+  cursor: pointer;
 }
+.agent-field select optgroup, .agent-field select option { background: var(--bg-1); color: var(--fg-1); }
+/* A localhost agent is the one on the signer's machine: make that unmistakable. */
+.agent-field.is-local { border-color: var(--local-line); background: var(--local-bg); box-shadow: inset 3px 0 0 var(--local); }
+.agent-field.is-local label { color: var(--local); }
+.agent-local {
+  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--local-line); background: oklch(0.82 0.11 245 / 0.18);
+  color: var(--local); font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+.agent-local .icon { width: 13px; height: 13px; }
 
 .content { padding: 28px 28px 64px; max-width: 1400px; width: 100%; }
 .page-head { display: flex; align-items: flex-end; gap: 16px; margin-bottom: 22px; }
@@ -556,6 +574,7 @@ button.cmd-card:hover .cmd-sign { background: var(--accent); border-color: var(-
   .nav-section-label { display: none; }
   .nav-item.active::before { display: none; }
   .sidebar-footer { margin: 0 0 0 auto; border: 0; padding: 0; }
+  .tagline { flex-basis: 100%; margin-top: -6px; }
   .topbar { flex-wrap: wrap; padding: 12px 16px; }
   .agent-field { width: 100%; }
   .content { padding: 20px 16px 48px; }

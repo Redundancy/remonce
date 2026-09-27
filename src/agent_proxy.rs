@@ -71,45 +71,20 @@ pub fn build_agent_http(agent_ca_path: Option<&str>) -> Result<reqwest::Client, 
         .map_err(|e| format!("Failed to build agent HTTP client: {e}"))
 }
 
-/// Normalize an agent URL to its origin (`https://host:port/`). Only https is
-/// accepted — the agent has no plaintext mode.
-fn normalize_agent_url(raw: &str) -> Result<url::Url, AppError> {
-    let mut parsed: url::Url = raw
-        .trim()
-        .parse()
-        .map_err(|e| AppError::Config(format!("Invalid agent URL '{raw}': {e}")))?;
-    if parsed.scheme() != "https" {
-        return Err(AppError::Config(format!(
-            "Agent URL must be https (got '{raw}'); the agent has no plaintext mode"
-        )));
-    }
-    if parsed.host_str().is_none() {
-        return Err(AppError::Config(format!("Agent URL '{raw}' has no host")));
-    }
-    // Normalize: drop any path/query so .join() behaves predictably.
-    parsed.set_path("/");
-    parsed.set_query(None);
-    parsed.set_fragment(None);
-    Ok(parsed)
-}
-
 /// Resolve the target agent URL. A browser-supplied override must be one of
-/// the configured agents (`agent_url` or `allowed_agent_urls`): the proxy
-/// attaches the user's ID token and signs on their behalf, so an arbitrary
-/// host would receive credentials and could answer with hostile content.
+/// the signer's known agents (`config.toml` or the user's agents file): the
+/// proxy attaches the user's ID token and signs on their behalf, so an
+/// arbitrary host would receive credentials and could answer with hostile
+/// content.
 pub(crate) fn resolve_agent_url(state: &AppState, override_url: Option<&str>) -> Result<url::Url, AppError> {
-    let default = normalize_agent_url(&state.config.agent_url)?;
+    let default = &state.known_agents[0].url;
     let Some(raw) = override_url.filter(|s| !s.trim().is_empty()) else {
-        return Ok(default);
+        return Ok(default.clone());
     };
-    let requested = normalize_agent_url(raw)?;
-    let allowed = std::iter::once(Ok(default))
-        .chain(state.config.allowed_agent_urls.iter().map(|u| normalize_agent_url(u)))
-        .filter_map(Result::ok)
-        .any(|a| a.origin() == requested.origin());
-    if !allowed {
+    let requested = crate::known_agents::normalize(raw).map_err(AppError::Config)?;
+    if !state.known_agents.iter().any(|a| a.url.origin() == requested.origin()) {
         return Err(AppError::Forbidden(format!(
-            "Agent '{raw}' is not configured; add it to allowed_agent_urls in config.toml"
+            "Agent '{raw}' is not configured; add it to allowed_agent_urls in config.toml or to your agents file"
         )));
     }
     Ok(requested)

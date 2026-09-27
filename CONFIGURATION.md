@@ -68,9 +68,10 @@ logs_dir = "logs"
 # Default: "https://localhost:10022"
 agent_url = "https://agent.example.com:10022"
 
-# Other agents the UI may be pointed at. The agent box in the UI can only
-# select agent_url or one of these; any other URL is refused, because the
-# signer sends the user's viewer token and approvals to whichever agent is used.
+# Other agents the UI may be pointed at. The agent picker in the UI offers
+# agent_url, these, and the agents in your own agents file (below); any
+# other URL is refused, because the signer sends the user's viewer token and
+# approvals to whichever agent is used.
 allowed_agent_urls = ["https://db01.example.com:10022", "https://web01.example.com:10022"]
 
 # Optional: PEM file with extra CA roots trusted when the signer connects to
@@ -78,6 +79,27 @@ allowed_agent_urls = ["https://db01.example.com:10022", "https://web01.example.c
 # always trusted; this is additive.
 agent_ca_path = "./certs/agent-fullchain.pem"
 ```
+
+#### Your own agents file
+
+Each user can add agents without editing the shared `config.toml`. The signer reads, at startup:
+
+- Windows: `%APPDATA%emoncegents.toml`
+- elsewhere: `$XDG_CONFIG_HOME/remonce/agents.toml`, or `~/.config/remonce/agents.toml`
+- or whatever `REMONCE_AGENTS_FILE` names.
+
+```toml
+[[agents]]
+name = "db01"                                  # optional label for the picker
+url = "https://db01.example.com:10022"
+
+[[agents]]
+url = "https://web01.example.com:10022"
+```
+
+A missing file is fine; an invalid one stops the signer with the file's name. The known agents are the union of both sources (an agent in both keeps its `config.toml` place and takes the file's name), and they share `agent_ca_path` for TLS trust.
+
+The picker groups them: **This machine** (any `localhost` or loopback-IP agent), **config.toml**, and **Your agents**. The signer makes every agent call itself, so a `localhost` agent is the one on the machine running the signer, not the one running the browser; when one is selected, the Agent bar turns blue and shows "This machine · <signer hostname>".
 
 ### Web tier TLS (optional)
 
