@@ -10,10 +10,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use tower_http::{
-    services::ServeDir,
-    trace::{DefaultMakeSpan, TraceLayer},
-};
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tower_sessions::MemoryStore;
 use tower_sessions::{Expiry, Session, SessionManagerLayer, cookie::SameSite};
 
@@ -273,7 +270,7 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         .route("/ws/file", get(crate::agent_proxy::file_stream_proxy))
         .route("/ui", get(index_page_handler))
         .route("/ui/{page}", get(ui_handler))
-        .nest_service("/static", ServeDir::new("ui/static"))
+        .route("/static/{name}", get(crate::ui_assets::static_handler))
         .with_state(app_state)
         .layer(session_layer)
         .layer(axum::middleware::from_fn(security_headers))
@@ -303,15 +300,6 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
     Ok(())
 }
 
-/// The UI pages: `/ui/{name}` renders `ui/{name}.html` inside the layout.
-const UI_PAGES: &[(&str, &str)] = &[
-    ("commands", "Commands"),
-    ("review", "Sign a request"),
-    ("execute", "Execute"),
-    ("monitor", "Runs"),
-    ("files", "Files"),
-];
-
 /// `/ui` — the command registry.
 async fn index_page_handler(
     State(state): State<AppState>,
@@ -321,7 +309,7 @@ async fn index_page_handler(
     render_template(session, "commands", &state, &uri).await
 }
 
-/// `/ui/{page}` for the pages in `UI_PAGES`.
+/// `/ui/{page}` for the pages in `ui_assets::PAGES`.
 async fn ui_handler(
     State(state): State<AppState>,
     session: Session,
@@ -353,15 +341,15 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Render a page into `ui/layout.html`. Every substituted value is
-/// HTML-escaped; page fragments contain no script.
+/// Render a page into the layout (both embedded; see `ui_assets`). Every
+/// substituted value is HTML-escaped; page fragments contain no script.
 async fn render_template(
     session: Session,
     page: &str,
     state: &AppState,
     uri: &axum::http::Uri,
 ) -> Result<axum::response::Response, AppError> {
-    let Some(&(page, title)) = UI_PAGES.iter().find(|(name, _)| *name == page) else {
+    let Some(page) = crate::ui_assets::page(page) else {
         return Ok((axum::http::StatusCode::NOT_FOUND, "Page not found").into_response());
     };
     let profile: UserProfile = session.get(PROFILE_KEY).await?.unwrap_or_default();
@@ -371,12 +359,6 @@ async fn render_template(
         return Ok(Redirect::to(&format!("/auth/login?next={next}")).into_response());
     }
 
-    let read = |path: &str| {
-        std::fs::read_to_string(path)
-            .map_err(|e| AppError::Internal(format!("Failed to load {path}: {e}")))
-    };
-    let layout = read("ui/layout.html")?;
-    let content = read(&format!("ui/{page}.html"))?;
 
     let initials: String = profile
         .username
@@ -388,10 +370,10 @@ async fn render_template(
         .to_uppercase();
     let agent_options = crate::known_agents::options_html(&state.known_agents, &state.hostname);
 
-    let body = layout
-        .replace("{{content}}", &content)
-        .replace("{{page}}", page)
-        .replace("{{title}}", title)
+    let body = crate::ui_assets::LAYOUT
+        .replace("{{content}}", page.template)
+        .replace("{{page}}", page.name)
+        .replace("{{title}}", page.title)
         .replace("{{username}}", &html_escape(&profile.username))
         .replace("{{initials}}", &html_escape(&initials))
         .replace("{{hostname}}", &html_escape(&state.hostname))

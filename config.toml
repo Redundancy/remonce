@@ -1,5 +1,12 @@
 # Configuration for the Remonce local server
 
+# Agent the signer UI proxies the catalog, executions, log streams and
+# revocations to. Must be https://. Default: "https://localhost:10022".
+# For a self-signed agent certificate, point agent_ca_path at it (additive to
+# system roots). These are top-level settings: keep them above [oidc].
+#agent_url = "https://localhost:10022"
+#agent_ca_path = "certs/agent-fullchain.pem"
+
 [oidc]
 # The base URL of the OIDC provider (Vault)
 # This should match the 'issuer' URL from the Terraform outputs.
@@ -24,12 +31,6 @@ viewer_client_id = "GG38cQ1gJZkfcowh66k8FkXxHCyRwJNu"
 
 # Explicit redirect URI to avoid cookie domain mismatch (localhost vs 127.0.0.1)
 redirect_uri = "http://localhost:8080/oidc/callback"
-
-# Agent the web UI proxies execution/files/log-streams to. Must be https://.
-# Default: "https://localhost:10022". For self-signed agent certs, point
-# agent_ca_path at the cert/CA PEM (additive to system roots).
-#agent_url = "https://localhost:10022"
-#agent_ca_path = "certs/agent-cert.pem"
 
 # Default TSA is DigiCert's free public service and the bundled DigiCert G4
 # root is always trusted. Uncomment only if you need to point at a different
@@ -60,7 +61,7 @@ args = ["-n", "{{count}}", "127.0.0.1"]
 
 # Declared parameters. Validation is fail-closed: a param with no `allowed`,
 # `pattern`, or `min`/`max` rule gets a conservative default pattern
-# (alphanumeric-ish, max 64 chars, no leading dash — prevents flag injection).
+# (alphanumeric-ish, max 64 chars, no leading dash â€” prevents flag injection).
 [[commands.params]]
 name = "count"
 description = "Number of pings"
@@ -93,12 +94,12 @@ description = "Access to execution logs"
 path = "config.toml"
 description = "Server configuration file"
 
-# Agent configuration — required when running `remonce agent`.
+# Agent configuration â€” required when running `remonce agent`.
 # TLS is mandatory; use `mode = "files"` with a self-signed cert for local dev,
 # or `mode = "acme"` with a public DNS name in production.
 #
 # [agent]
-# listen_address = "0.0.0.0:10022"
+# listen_address = "0.0.0.0:10022"   # "127.0.0.1:10022" to keep it on this machine
 # cors_allowed_origins = []  # empty = no CORS layer
 #
 # Optional central revocation service. FAIL-CLOSED: when set, the agent
@@ -108,7 +109,7 @@ description = "Server configuration file"
 #
 # [agent.tls]
 # mode = "files"
-# chain = "certs/agent-cert.pem"
+# chain = "certs/agent-fullchain.pem"
 # key = "certs/agent-key.pem"
 #
 # Or for ACME. The CA must reach the agent to validate: by default on port
@@ -122,7 +123,7 @@ description = "Server configuration file"
 # cache_dir = "certs/acme-cache"
 # # directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
 
-# Central revocation service — required when running `remonce revocation-service`.
+# Central revocation service â€” required when running `remonce revocation-service`.
 # Persists revocations to a JSONL file so they survive restarts and apply
 # estate-wide from a single submission.
 #

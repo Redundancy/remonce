@@ -6,6 +6,11 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg) ![Rust](https://img.shields.io/badge/built_with-Rust-orange.svg)
 
+> [!WARNING]
+> **A proof-of-concept demonstrator.** remonce hasn't been hardened, refactored through close code review, or security audited. Use it at your own risk.
+
+![The remonce signer's Commands page: the commands an agent on this machine offers, each with what it needs before it runs — who must approve, who may run it, and how long approvals stay valid](docs/images/remonce-ui.png)
+
 > [!TIP]
 > **Nothing central to run.** There is no remonce server, database or control plane. Each agent stands alone with its own commands and policy, and each person's signer runs on their own machine. The only shared pieces are ones you already have: your identity provider, and a timestamp authority (a public one by default). **You can run remonce by itself on a single machine** — the agent and your signer side by side, with policy built in — and grow from there. A central revocation service exists if you want one; nothing requires it.
 
@@ -54,6 +59,16 @@ The approved file can't be altered on the way (any change breaks the signatures)
 
 ## A command, start to finish
 
+Every host decides for itself, in three places:
+
+| On the host | Says | Written in |
+|---|---|---|
+| `config.toml` | What this machine offers: commands, their parameters, the files it will show | TOML |
+| `policy/requirements.json` | Who must approve each command, and who may run it | JSON data — no Rego needed |
+| `policy/*.rego` | The decisions the agent asks for | [Rego](https://www.openpolicyagent.org/docs/latest/policy-language/) |
+
+On every request, the agent verifies the signatures and then asks the Rego policy for a decision. The shipped policy (`authz.rego`) makes that decision from the requirement documents, so most setups only ever edit the JSON. When you need more — rules on parameter values, hosts, times — you add Rego rules beside it; nothing about the rest changes.
+
 On the host, `config.toml` says what the command runs — callers never see this part:
 
 ```toml
@@ -68,7 +83,7 @@ name = "service"
 allowed = ["nginx", "postgres"]
 ```
 
-In policy, a requirement document says what it takes, and the UI shows it to anyone looking at the command:
+In `policy/requirements.json`, a requirement document says what it takes, and the UI shows it to anyone looking at the command:
 
 ```json
 "restart-service": {
@@ -77,7 +92,24 @@ In policy, a requirement document says what it takes, and the UI shows it to any
 }
 ```
 
-That's the whole setup for one command. See [USECASES.md](USECASES.md) for delegation to a NOC, CI pipelines, cross-team access and two-person rules.
+That's the whole setup for one command. A rule of your own is a few lines of Rego in `policy/authz.rego`:
+
+```rego
+# Restarting postgres also needs someone from the DBA team among the approvers.
+extra_denials contains "Restarting postgres needs a DBA's approval" if {
+	input.action == "execute"
+	input.command.command == "restart-service"
+	input.command.params.service == "postgres"
+	not dba_approved
+}
+
+dba_approved if {
+	some approver in input.approvers
+	"dba" in object.get(approver.claims, "groups", [])
+}
+```
+
+[Getting started](GETTING_STARTED.md) builds all of this up step by step. [USECASES.md](USECASES.md) has more: delegation to a NOC, CI pipelines, cross-team access and two-person rules.
 
 ## Security at a glance
 
@@ -90,32 +122,28 @@ The details are in [SECURITY.md](SECURITY.md) and [ARCHITECTURE.md](ARCHITECTURE
 
 ## Quick start (local)
 
+**[Getting started](GETTING_STARTED.md)** walks through it all on one machine: your own command, who may approve and run it, a two-person rule, a Rego rule of your own, and reading logs. The short version:
+
 1.  **Prerequisites**: Rust, Vault, Terraform (see the [Dev Guide](DEVELOPMENT.md)).
-2.  **Generate a self-signed cert for the agent** (first time only):
-    ```powershell
-    mkdir certs
-    openssl req -x509 -newkey rsa:2048 -nodes -days 365 `
-      -keyout certs/agent-key.pem -out certs/agent-fullchain.pem `
-      -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" `
+2.  **Start Vault** with its dev users and OIDC clients: `./start_services.sh` (Linux, macOS) or `.\start_services.bat` (Windows). Vault and Terraform can be on your `PATH` or in `bin/`.
+3.  **Give the agent a certificate** (first time only; on Windows, in Git Bash):
+    ```sh
+    mkdir -p certs
+    openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+      -keyout certs/agent-key.pem -out certs/agent-fullchain.pem \
+      -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
       -addext "basicConstraints=critical,CA:FALSE"
     ```
-    Then uncomment the `[agent]` / `[agent.tls]` block in [config.toml](config.toml).
-3.  **Start Vault**, and configure its dev users and OIDC clients:
-    ```powershell
-    ./start_services.bat
-    ```
-4.  **Run the signer** (your workstation) and **the agent** (the target host; here, the same machine):
-    ```powershell
-    cargo run -- web
-    cargo run -- agent
-    ```
+    In [config.toml](config.toml), uncomment `agent_ca_path` at the top (so the signer trusts that certificate) and the `[agent]` / `[agent.tls]` block at the bottom.
+4.  **Run the agent and the signer**: `cargo run -- agent` and `cargo run -- web`.
 5.  **Open** [http://localhost:8080](http://localhost:8080) and log in as `webapp`. A second user, `webapp2`, lets you try `ping-pair`, which needs two approvals.
 
 Prefer a terminal? `remonce approve`, `remonce submit` and `remonce revoke` do the same with request files.
 
 ## Documentation
 
-*   [**Dev Guide**](DEVELOPMENT.md): run everything locally.
+*   [**Getting Started**](GETTING_STARTED.md): a step-by-step tutorial, from nothing to your own commands and rules.
+*   [**Dev Guide**](DEVELOPMENT.md): working on remonce itself.
 *   [**Configuration**](CONFIGURATION.md): every setting, requirement documents, the CLI, revocation.
 *   [**Use Cases**](USECASES.md): solo VM checks, CI pipelines, NOC handoff, cross-team access, two-person rules.
 *   [**Architecture**](ARCHITECTURE.md): the signing protocol and design decisions.

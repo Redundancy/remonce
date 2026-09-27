@@ -159,12 +159,14 @@ a:hover { text-decoration: underline; }
   background: var(--bg-1);
   color: var(--fg-3);
   font-size: 12px;
-  width: min(420px, 50%);
+  /* Grow with the badge and agent name rather than clip them. */
+  min-width: min(420px, 50%);
+  max-width: 100%;
 }
 .agent-field:focus-within { border-color: var(--accent-dim); box-shadow: 0 0 0 3px var(--accent-bg); }
 .agent-field label { text-transform: uppercase; letter-spacing: 0.08em; font-size: 10.5px; font-weight: 600; color: var(--fg-4); }
 .agent-field select {
-  flex: 1; min-width: 0;
+  flex: 1 0 auto;
   border: 0; outline: 0; background: transparent;
   font-family: var(--mono); font-size: 12px; color: var(--fg-1);
   cursor: pointer;

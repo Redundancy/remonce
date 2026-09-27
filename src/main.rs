@@ -4,7 +4,7 @@ use remonce::web;
 
 #[derive(Parser)]
 #[command(name = "remonce")]
-#[command(about = "Remote Monitoring and Secure Execution")]
+#[command(about = "Remote monitor and command execution: run approved commands on a host")]
 struct Cli {
     /// Run with a security-degraded configuration. Unlocks settings that
     /// broaden the trust surface (HTTP non-loopback OIDC issuer, OS TSA

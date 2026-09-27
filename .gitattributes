@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings to run, whatever the checkout platform;
+# batch files expect CRLF.
+*.sh text eol=lf
+*.bat text eol=crlf

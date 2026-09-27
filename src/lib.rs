@@ -7,6 +7,7 @@ pub mod cli;
 pub mod catalog;
 pub mod requirements;
 pub mod web;
+pub mod ui_assets;
 pub mod web_sign;
 pub mod oidc_client;
 pub mod signing;

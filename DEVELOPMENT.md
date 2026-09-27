@@ -11,23 +11,24 @@ Ensure you have the following installed and available in `bin/` or your PATH:
 - **Vault**: [Install Vault](https://developer.hashicorp.com/vault/downloads)
 - **OPA** (optional): only to try the remote-OPA mode or run `opa test`. Policy is evaluated inside remonce by default.
 
-> **Important**: The `start_services.bat` script **requires** these tools to be present in the `bin/` directory of the project root. Please download the executables and place `vault.exe` and `terraform.exe` (and optionally `opa.exe`) inside `bin/`.
+> The start scripts use Vault and Terraform from the project's `bin/` folder if they're there, otherwise from your `PATH`. See [GETTING_STARTED.md](GETTING_STARTED.md#1-prerequisites) for ways to install them.
 
 ## Initial Setup
 
 1.  **Clone/Open the Repository** in your terminal.
 2.  **Start Background Services**:
-    Run the provided helper script to spin up Vault (Dev Mode):
-    ```powershell
-    ./start_services.bat
+    Run the helper script to spin up Vault (dev mode):
+    ```sh
+    ./start_services.sh      # Linux and macOS
+    .\start_services.bat     # Windows
     ```
-    *This script also initializes Terraform to configure Vault with the necessary OIDC clients and policies.*
+    *This script also initializes Terraform to configure Vault with the necessary OIDC clients and policies, and writes their IDs into `config.toml`.*
 
-    Keep this terminal window open.
+    Keep Vault running (the terminal on Linux and macOS, the window it opens on Windows).
 
 ## Vault Development Configuration
 
-`start_services.bat` configures Vault for local development, which differs from production in two ways.
+The start script configures Vault for local development, which differs from production in two ways.
 
 ### 1. Userpass Authentication
 
@@ -81,14 +82,12 @@ In a **new terminal** window:
 
 ### Frontend Development (`ui/`)
 
-The UI is plain HTML, CSS and JavaScript with no framework, build step or third-party assets. Everything is served from the `ui/` directory, under a strict Content Security Policy (no inline script or styles, no external origins).
+The UI is plain HTML, CSS and JavaScript with no framework, build step or third-party assets. The files in `ui/` are compiled into the binary (`src/ui_assets.rs`), so a signer needs nothing beside it. They're served under a strict Content Security Policy (no inline script or styles, no external origins).
 
 -   **Pages**: `ui/layout.html` is the shell (sidebar, top bar); each page is a fragment (`ui/commands.html`, `review.html`, `execute.html`, `monitor.html`, `files.html`) rendered into it.
-    -   *Note*: The Rust server loads these templates **at runtime** on each request, so you **do not** need to restart `cargo run` to see HTML changes. Just refresh your browser.
 -   **Modify CSS**: Edit `ui/static/remonce.css`.
-    -   You may need to hard-refresh (Ctrl+F5) to clear browser cache.
 -   **Modify JS**: Edit `ui/static/app.js`. It builds the DOM without `innerHTML`, and must not add inline handlers (the CSP blocks them).
-    -   Refresh browser to see changes.
+-   **See changes**: because the UI is embedded, restart `cargo run -- web` (it rebuilds) and refresh. Static files are sent with an ETag and `Cache-Control: no-cache`, so a plain refresh picks them up. A new page needs an entry in `ui_assets::PAGES`, a new static file one in `ASSETS`.
 
 ### Backend Development (`src/`)
 
@@ -119,5 +118,23 @@ Authorization is Rego policy, evaluated inside the agent (embedded [Regorus](htt
 ## Troubleshooting
 
 -   **"No session state found"**: Ensure you are accessing `http://localhost:8080` and NOT `127.0.0.1:8080` to match the configured Redirect URI.
--   **Vault not reachable**: Check if the `start_services.bat` terminal is still running.
+-   **Vault not reachable**: Check that Vault is still running (the `start_services` terminal or window).
 -   **Verification Errors**: Ensure the TSA URL in `config.toml` is reachable (defaults to DigiCert).
+
+## CI and releases
+
+GitHub Actions builds and tests every push to `main` and every pull request on Linux and Windows (`.github/workflows/ci.yml`), including the Rego policy tests.
+
+To publish a release (`.github/workflows/release.yml`):
+
+1.  Set the new version in `Cargo.toml` (it stays below 1.0 for now: `0.x.y`), run `cargo build` so `Cargo.lock` follows, and commit.
+2.  Tag that commit with the same version and push the tag:
+    ```sh
+    git tag v0.2.0
+    git push origin v0.2.0
+    ```
+
+The workflow refuses a tag that doesn't match `Cargo.toml`, then builds a static Linux binary (`x86_64-unknown-linux-musl`) and a Windows one (`x86_64-pc-windows-msvc`), packages each with `scripts/package.sh`, and publishes them as a GitHub pre-release with SHA-256 checksums. The UI is inside the binary; each archive adds a sample `config.toml`, `policy/`, the local identity-provider scripts and the docs, so [GETTING_STARTED.md](GETTING_STARTED.md) works from it.
+
+To build a package locally: `cargo build --release --locked --bin remonce --target <target>`, then `scripts/package.sh <version> <target>`; it lands in `dist/`.
+
