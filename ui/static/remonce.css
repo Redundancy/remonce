@@ -366,6 +366,14 @@ button.cmd-card:hover .cmd-sign { background: var(--accent); border-color: var(-
 .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
 .actions .spacer { flex: 1; }
 
+.drop-zone { transition: border-color 120ms, background 120ms, box-shadow 120ms; }
+.drop-zone.dragover {
+  border-style: dashed;
+  border-color: var(--accent-dim);
+  background: var(--accent-bg);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
 .empty { color: var(--fg-3); padding: 28px; text-align: center; border: 1px dashed var(--line-2); border-radius: var(--radius-md); }
 
 /* Delegation requirement rows */
@@ -415,7 +423,7 @@ button.cmd-card:hover .cmd-sign { background: var(--accent); border-color: var(-
 .modal-foot {
   padding: 14px 22px;
   border-top: 1px solid var(--line-1);
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   background: oklch(0.18 0.008 170);
 }
 .modal-foot .spacer { flex: 1; }

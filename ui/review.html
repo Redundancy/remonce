@@ -7,13 +7,17 @@
 
 <div id="review-result"></div>
 
-<section class="panel">
+<section id="review-input" class="panel drop-zone">
   <div class="field">
     <label for="review-token">Request or approval</label>
-    <textarea id="review-token" class="input" spellcheck="false" placeholder="Paste the token (base64) or JSON you were sent"></textarea>
+    <textarea id="review-token" class="input" spellcheck="false" placeholder="Drop the .json file you were sent here, or paste its token"></textarea>
   </div>
   <div class="actions">
-    <button id="review-btn" class="btn">Review</button>
+    <button id="review-file" type="button" class="btn">Open file…</button>
+    <input id="review-file-input" type="file" accept=".json,.txt,application/json,text/plain" hidden>
+    <span class="hint-line">Files are read here in your browser, not uploaded.</span>
+    <span class="spacer"></span>
+    <button id="review-btn" type="button" class="btn">Review</button>
   </div>
 </section>
 

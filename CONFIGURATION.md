@@ -349,16 +349,28 @@ The predicates are enforced by the agent *before* OPA:
 
 Semantics: if `any_of` is non-empty, at least one predicate must match the operator's OIDC token claims; an empty list means any authenticated operator in OPA's allow-set. Claims are evaluated at **execution time** against the operator's fresh token, so group changes propagate immediately. An approver co-signing their own delegation is reported to OPA as `self_executed: true`, so four-eyes rules still hold.
 
+## Handing requests and approvals to someone
+
+Requests, approvals and co-signed bundles travel as files (or as the same content pasted as base64), so they work across any path you already use: chat and ticket attachments, email, SCP, remote-desktop clipboard or file transfer. The web UI saves them as:
+
+| File | Contains | Open it in |
+|---|---|---|
+| `remonce-<command>-<id>.request.json` | An unsigned request (`command` + `operator_requires`) | **Sign a request** |
+| `remonce-<command>-<id>.approval.json` | A signed approval | **Execute** (self-execute) or **Sign a request** (delegated, to co-sign) |
+| `remonce-<command>-<id>.cosigned.json` | An approval plus operator co-signature | **Execute** |
+
+On those pages, drop the file onto the input panel, use **Open file…**, or paste anywhere on the page. Files are read in the browser and never uploaded. Approval files are the same JSON `remonce cosign` and `remonce revoke` read.
+
 ## CLI cosigning (`remonce cosign`)
 
 Operators who receive a delegated approval can co-sign it without running the web UI:
 
 ```bash
 # Co-sign a bundle (JSON file or base64 token; '-' reads stdin) and submit it
-remonce cosign --bundle approval.json --submit
+remonce cosign --bundle remonce-backup-db-1a2b3c4d.approval.json --submit
 
 # Or just emit the cosigned ExecutionBundle for later submission
-remonce cosign -b approval.json -o execution-bundle.json
+remonce cosign -b remonce-backup-db-1a2b3c4d.approval.json -o remonce-backup-db-1a2b3c4d.cosigned.json
 ```
 
 The command reads `[oidc]` and `agent_url` / `agent_ca_path` from `config.toml`. It generates a fresh ephemeral keypair, runs a browser-based OIDC authorization-code flow against the signing client (PKCE, the nonce bound to the ephemeral key, and forced re-authentication — same pattern as the web UI), obtains an RFC 3161 timestamp on the cosignature, and produces an ExecutionBundle.

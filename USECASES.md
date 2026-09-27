@@ -113,7 +113,7 @@ allow if {
 ```
 
 **UI status.** ✅ Supported, with one identity-provider caveat.
-- ✅ Preparing a command has a **Delegate** option with an `operator_requires` builder; the signed approval is exported as copyable base64 or downloadable JSON.
+- ✅ Preparing a command has a **Delegate** option with an `operator_requires` builder; the signed approval is handed over as a file (`….approval.json`) or copied as base64.
 - ✅ `remonce cosign` covers the executor side: reads the bundle from a file or stdin, does the cosign locally, and `--submit`s to the agent.
 - ⚠️ Caveat: the cosigner's OIDC token must carry a `nonce` bound to its ephemeral key. Machine-minted tokens generally can't: GitHub Actions OIDC has fixed claims, and Vault's machine flows ([identity tokens](https://developer.hashicorp.com/vault/docs/secrets/identity/identity-token)) take no caller-selected nonce either. Until the planned machine-operator path lands (see PRODUCTION_READINESS.md), a human runs the cosign step.
 
@@ -152,7 +152,7 @@ allow if {
 The `not input.self_executed` is a four-eyes constraint — even if you happen to also be in `noc-l2`, you can't both authorize and execute the same bundle. Drop the line if you don't need separation of duties.
 
 **UI status.** ✅ Fully supported.
-- ✅ The approver prepares the command with **Delegate** (operator-requirements builder), signs it, and exports via copy or Download JSON.
+- ✅ The approver prepares the command with **Delegate** (operator-requirements builder), signs it, and hands it over as a file or copied token.
 - ✅ The NOC side uses **Sign a request**: paste the bundle, check the command and who approved it, co-sign, Execute now — or `remonce cosign` from a terminal.
 
 ---
@@ -224,6 +224,6 @@ A few cross-cutting notes that fall out of these four:
 
 The delegation use cases (2 and 3) are covered by:
 
-1. **"Create a delegation"** — when preparing a command choose **Delegate** and optionally add `operator_requires` rows (claim/op/value); the signed approval is exported via copy-to-clipboard or Download JSON.
+1. **"Create a delegation"** — when preparing a command choose **Delegate** and optionally add `operator_requires` rows (claim/op/value); the signed approval is saved as a file (`….approval.json`) or copied to the clipboard; the operator drops the file onto "Sign a request".
 2. **Sign a request** (`/ui/review`) — paste an approver bundle, check the command + claimed approver identity (best-effort; the agent is the final authority), co-sign with a fresh login, and submit.
 3. **`remonce cosign` CLI** — reads an approver bundle from a file or stdin, runs its own browser-based OIDC login (PKCE + nonce-bound ephemeral key), cosigns locally, and writes the ExecutionBundle to stdout/a file or `--submit`s it to the agent. See CONFIGURATION.md.

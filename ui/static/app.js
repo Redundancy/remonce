@@ -108,6 +108,24 @@ async function copyText(text, label) {
     }
 }
 
+// Handoff files: remonce-<command>-<id prefix>.<kind>.json, where kind is
+// request (unsigned), approval (signed) or cosigned (ready to run). The
+// content is the same JSON the CLI reads (`remonce cosign --bundle FILE`).
+function tokenFileName(obj) {
+    const t = classifyToken(obj);
+    const command = t.kind === 'draft' ? t.command : t.bundle.approver.command;
+    const name = String(command.command || 'command').replace(/[^A-Za-z0-9._-]+/g, '_');
+    const id = String(command.id || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 8);
+    const kind = t.kind === 'draft' ? 'request' : (t.bundle.operator ? 'cosigned' : 'approval');
+    return `remonce-${name}${id ? '-' + id : ''}.${kind}.json`;
+}
+
+function saveTokenFile(obj) {
+    const filename = tokenFileName(obj);
+    downloadJson(filename, obj);
+    toast('Saved ' + filename);
+}
+
 function downloadJson(filename, obj) {
     const url = URL.createObjectURL(new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' }));
     const a = h('a', { href: url, download: filename });
@@ -324,6 +342,66 @@ async function takeSignResult() {
     }
 }
 
+// Load a token into `textarea` from a file (button or drag-and-drop onto
+// `dropZone`) or from a paste anywhere on the page, then call `onLoad`.
+// Files are read locally; nothing is uploaded.
+const MAX_TOKEN_FILE = 1024 * 1024;
+function acceptTokens(textarea, fileButton, fileInput, dropZone, onLoad) {
+    const load = (text) => {
+        textarea.value = text.trim();
+        onLoad();
+    };
+    const readFile = async (file) => {
+        if (!file) return;
+        if (file.size > MAX_TOKEN_FILE) {
+            toast(`${file.name} is too large to be a Remonce file`, true);
+            return;
+        }
+        load(await file.text());
+    };
+
+    // Pasting straight into the box reviews it too.
+    textarea.addEventListener('paste', () => setTimeout(onLoad));
+    fileButton.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+        readFile(fileInput.files[0]);
+        fileInput.value = '';
+    });
+
+    let depth = 0;
+    const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+    dropZone.addEventListener('dragenter', (e) => {
+        if (!hasFiles(e)) return;
+        e.preventDefault();
+        depth++;
+        dropZone.classList.add('dragover');
+    });
+    dropZone.addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault(); });
+    dropZone.addEventListener('dragleave', () => {
+        if (--depth <= 0) { depth = 0; dropZone.classList.remove('dragover'); }
+    });
+    dropZone.addEventListener('drop', (e) => {
+        if (!hasFiles(e)) return;
+        e.preventDefault();
+        depth = 0;
+        dropZone.classList.remove('dragover');
+        readFile(e.dataTransfer.files[0]);
+    });
+    // A file dropped outside the zone must not navigate the page away.
+    window.addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault(); });
+    window.addEventListener('drop', (e) => { if (hasFiles(e)) e.preventDefault(); });
+
+    document.addEventListener('paste', (e) => {
+        const t = e.target;
+        if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t?.isContentEditable) return;
+        const text = e.clipboardData?.getData('text');
+        if (text && text.trim()) {
+            e.preventDefault();
+            load(text);
+        }
+    });
+}
+
 // Pass a bundle to another page without putting it in the URL.
 const HANDOFF_KEY = 'remonce.handoff';
 function handOff(page, bundle) {
@@ -479,8 +557,7 @@ function renderSignedResult(target, result) {
 
     const actions = h('div', { class: 'actions' },
         h('button', { class: 'btn', onclick: () => copyText(token, 'Signed token copied') }, icon('copy'), 'Copy token'),
-        h('button', { class: 'btn', onclick: () => downloadJson(`remonce-${name}-${isCosign ? 'cosigned' : 'approval'}.json`, bundle) },
-            icon('download'), 'Download JSON'),
+        h('button', { class: 'btn', onclick: () => saveTokenFile(bundle) }, icon('download'), 'Save file'),
         h('span', { class: 'spacer' }),
         delegatedApproval ? null : h('button', {
             class: 'btn btn-primary',
@@ -662,7 +739,9 @@ function openSignModal(cmd) {
 
     const signBtn = h('button', { class: 'btn btn-primary', type: 'button' }, icon('sign'), 'Sign');
     const copyBtn = h('button', { class: 'btn', type: 'button', title: 'Copy an unsigned request for someone else to review and sign' },
-        icon('copy'), 'Copy as request');
+        icon('copy'), 'Copy request');
+    const saveBtn = h('button', { class: 'btn', type: 'button', title: 'Save an unsigned request as a file for someone else to review and sign' },
+        icon('download'), 'Save request');
 
     function update() {
         const draft = build();
@@ -671,6 +750,7 @@ function openSignModal(cmd) {
         error.textContent = problems[0] || 'Signing asks you to log in again.';
         signBtn.disabled = problems.length > 0;
         copyBtn.disabled = problems.length > 0;
+        saveBtn.disabled = problems.length > 0;
     }
 
     [targets, notBefore, notAfter, ...paramInputs.map(x => x.input)].forEach(el => {
@@ -681,6 +761,7 @@ function openSignModal(cmd) {
     copyBtn.addEventListener('click', () => {
         copyText(encodeToken(build()), 'Request copied — send it to whoever should sign it');
     });
+    saveBtn.addEventListener('click', () => saveTokenFile(build()));
     signBtn.addEventListener('click', async () => {
         const draft = build();
         try { localStorage.setItem(TARGETS_KEY, targets.value.trim()); } catch (_) { /* ignore */ }
@@ -744,6 +825,7 @@ function openSignModal(cmd) {
                 h('span', { class: 'spacer' }),
                 h('button', { class: 'btn btn-ghost', type: 'button', onclick: close }, 'Cancel'),
                 copyBtn,
+                saveBtn,
                 signBtn)));
 
     document.body.append(scrim);
@@ -775,9 +857,11 @@ async function initReviewPage() {
         else await renderApprovalReview(detail, parsed.bundle);
     };
     $('review-btn').addEventListener('click', show);
+    acceptTokens(input, $('review-file'), $('review-file-input'), $('review-input'), show);
 
-    // A link may prefill a request; it is never signed without a click.
-    const prefill = new URLSearchParams(window.location.search).get('token');
+    // A link or another page may prefill a request; nothing is signed
+    // without a click.
+    const prefill = takeHandOff() || new URLSearchParams(window.location.search).get('token');
     if (prefill) {
         input.value = prefill;
         show();
@@ -887,12 +971,19 @@ async function initExecutePage() {
             return;
         }
         if (parsed.kind === 'draft') {
-            detail.append(notice('error', 'This is an unsigned request. Sign it first under "Sign a request".'));
+            const draft = { command: parsed.command, operator_requires: parsed.operator_requires };
+            detail.append(h('section', { class: 'panel' },
+                notice('warn', 'This is an unsigned request, so there is nothing to run yet. Review and sign it first.'),
+                h('div', { class: 'actions' },
+                    h('span', { class: 'spacer' }),
+                    h('button', { class: 'btn btn-primary', onclick: () => handOff('/ui/review', draft) },
+                        icon('fingerprint'), 'Open in Sign a request'))));
             return;
         }
         await renderExecuteDetail(detail, parsed.bundle);
     };
     $('exec-btn').addEventListener('click', show);
+    acceptTokens(input, $('exec-file'), $('exec-file-input'), $('exec-input'), show);
 
     const handed = takeHandOff();
     const legacy = new URLSearchParams(window.location.search).get('signed_token');

@@ -7,13 +7,17 @@
 
 <div id="exec-result"></div>
 
-<section class="panel">
+<section id="exec-input" class="panel drop-zone">
   <div class="field">
     <label for="exec-token">Signed approval</label>
-    <textarea id="exec-token" class="input" spellcheck="false" placeholder="Paste the signed token (base64) or JSON bundle"></textarea>
+    <textarea id="exec-token" class="input" spellcheck="false" placeholder="Drop the signed .json file here, or paste its token"></textarea>
   </div>
   <div class="actions">
-    <button id="exec-btn" class="btn">Review</button>
+    <button id="exec-file" type="button" class="btn">Open file…</button>
+    <input id="exec-file-input" type="file" accept=".json,.txt,application/json,text/plain" hidden>
+    <span class="hint-line">Files are read here in your browser, not uploaded.</span>
+    <span class="spacer"></span>
+    <button id="exec-btn" type="button" class="btn">Review</button>
   </div>
 </section>
 
