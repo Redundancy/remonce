@@ -14,9 +14,9 @@ use crate::config::Config;
 use std::time::Duration;
 use url::Url;
 
-/// Maximum `operator_max_validity` the agent will accept without `--insecure`.
-/// Longer windows effectively turn off the at-execution-time freshness bound.
-const OPERATOR_MAX_VALIDITY_SAFE_CEILING: Duration = Duration::from_secs(60 * 60);
+/// Longest `approval_validity` accepted without `--insecure`. Past a week an
+/// approval stops meaning "these people agreed recently".
+const APPROVAL_VALIDITY_SAFE_CEILING: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct InsecureMode {
@@ -60,6 +60,14 @@ fn invalid_config(config: &Config) -> Vec<String> {
         ),
         _ => {}
     }
+    for cmd in &config.commands {
+        if cmd.approval_validity_or_default().is_zero() {
+            errors.push(format!(
+                "command '{}' has approval_validity 0; every approval would already be expired",
+                cmd.name
+            ));
+        }
+    }
     let max_age = oidc.signing_max_age_or_default();
     if max_age > crate::security::MAX_AUTH_AGE {
         errors.push(format!(
@@ -100,13 +108,15 @@ pub fn validate(config: &Config, insecure_flag: bool) -> Result<InsecureMode, In
         );
     }
 
-    // Gate 3: operator_max_validity too long on any command.
+    // Gate 3: approvals that stay usable for too long.
     for cmd in &config.commands {
-        let v = cmd.operator_max_validity_or_default();
-        if v > OPERATOR_MAX_VALIDITY_SAFE_CEILING {
+        let v = cmd.approval_validity_or_default();
+        if v > APPROVAL_VALIDITY_SAFE_CEILING {
             violations.push(format!(
-                "command '{}' has operator_max_validity {:?} (> {:?}); defeats the freshness bound",
-                cmd.name, v, OPERATOR_MAX_VALIDITY_SAFE_CEILING
+                "command '{}' has approval_validity {} (> {}); approvals would stay usable long after anyone reviewed them",
+                cmd.name,
+                humantime_serde::re::humantime::format_duration(v),
+                humantime_serde::re::humantime::format_duration(APPROVAL_VALIDITY_SAFE_CEILING)
             ));
         }
     }
@@ -229,26 +239,38 @@ mod tests {
         assert!(!r.enabled);
     }
 
-    #[test]
-    fn long_operator_validity_rejected() {
-        let mut cfg = base_config();
-        cfg.commands.push(CommandConfig {
-            name: "risky".into(),
+    fn command_with_validity(v: Duration) -> CommandConfig {
+        CommandConfig {
+            name: "cmd".into(),
             description: None,
             opa_rule: "data.x.allow".into(),
             executable: None,
             args: vec![],
             cwd: None,
-            approver_max_validity: None,
-            operator_max_validity: Some(Duration::from_secs(3 * 60 * 60)),
+            approval_validity: Some(v),
             command_timeout: None,
             env: Default::default(),
             params: vec![],
-        });
-        assert!(matches!(
-            validate(&cfg, false),
-            Err(InsecureError::Refused(_))
-        ));
+        }
+    }
+
+    #[test]
+    fn long_approval_validity_needs_insecure() {
+        let mut cfg = base_config();
+        cfg.commands.push(command_with_validity(Duration::from_secs(8 * 24 * 60 * 60)));
+        assert!(matches!(validate(&cfg, false), Err(InsecureError::Refused(_))));
+        assert!(validate(&cfg, true).is_ok());
+
+        let mut week = base_config();
+        week.commands.push(command_with_validity(APPROVAL_VALIDITY_SAFE_CEILING));
+        assert!(validate(&week, false).is_ok());
+    }
+
+    #[test]
+    fn zero_approval_validity_refused_even_with_insecure() {
+        let mut cfg = base_config();
+        cfg.commands.push(command_with_validity(Duration::ZERO));
+        assert!(matches!(validate(&cfg, true), Err(InsecureError::Invalid(_))));
     }
 
     #[test]

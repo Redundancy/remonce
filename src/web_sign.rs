@@ -1,6 +1,6 @@
 //! Per-signature signing in the local signer.
 //!
-//! Every approval, cosign and revocation gets its own OIDC login to the
+//! Every approval and revocation gets its own OIDC login to the
 //! *signing* client, with a fresh ephemeral key and forced re-authentication:
 //!
 //! 1. `POST /api/sign/begin` validates the request, generates the key, and
@@ -17,10 +17,7 @@
 //! completes someone else's flow lands in a session that never issued that
 //! `state`, and the browser can't swap the payload during the redirect.
 
-use crate::security::{
-    ApproverBundle, ExecutionBundle, OperatorConstraint, OperatorCosign, RevocationBundle,
-    RevokerAttestation,
-};
+use crate::security::{Approval, RequestBundle, RevocationBundle};
 use crate::web::{AppError, AppState, CallbackQuery, require_profile};
 use axum::{
     extract::{Path, State},
@@ -41,17 +38,16 @@ const TTL_SECS: i64 = 10 * 60;
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum SignAction {
-    /// Approve a command (self-execute, or delegated via `operator_requires`).
+    /// Approve a request: sign it and append the approval to any already
+    /// collected. Approvals are independent; order doesn't matter.
     Approve {
         command: serde_json::Value,
         #[serde(default)]
-        operator_requires: Option<OperatorConstraint>,
+        approvals: Vec<Approval>,
     },
-    /// Co-sign someone else's delegated approval as the operator.
-    Cosign { approver: ApproverBundle },
-    /// Revoke an approval on an agent.
+    /// Revoke (cancel) a request on an agent.
     Revoke {
-        approver: ApproverBundle,
+        request: RequestBundle,
         #[serde(default)]
         agent_url: Option<String>,
     },
@@ -61,7 +57,6 @@ impl SignAction {
     fn name(&self) -> &'static str {
         match self {
             SignAction::Approve { .. } => "approve",
-            SignAction::Cosign { .. } => "cosign",
             SignAction::Revoke { .. } => "revoke",
         }
     }
@@ -70,7 +65,7 @@ impl SignAction {
     /// the request — so the callback is not an open redirect.
     fn return_page(&self) -> &'static str {
         match self {
-            SignAction::Approve { .. } | SignAction::Cosign { .. } => "/ui/review",
+            SignAction::Approve { .. } => "/ui/review",
             SignAction::Revoke { .. } => "/ui/execute",
         }
     }
@@ -91,7 +86,9 @@ struct PendingSign {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SignOutcome {
     Bundle {
-        bundle: Box<ExecutionBundle>,
+        bundle: Box<RequestBundle>,
+        /// The request's id, which every approval of it shares.
+        request_id: String,
         /// Who signed, from the verified ID token.
         signer: String,
         /// RFC 3339 time from the verified TSA timestamp.
@@ -147,21 +144,32 @@ pub async fn begin_handler(
 
     // Validate before sending the user through a login.
     match &mut action {
-        SignAction::Approve { command, .. } => {
+        SignAction::Approve { command, approvals } => {
             if !command.is_object() {
                 return Err(AppError::Forbidden("The command must be a JSON object".into()));
             }
-        }
-        SignAction::Cosign { approver } => {
-            if approver.operator_requires.is_none() {
-                return Err(AppError::Forbidden(
-                    "This approval is self-execute only and cannot be co-signed; ask the \
-                     approver for a delegated approval"
-                        .into(),
-                ));
+            // The id is what makes one request distinct from another with
+            // the same content; without one it could be replayed forever.
+            let id_ok = command
+                .get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+            if !id_ok {
+                return Err(AppError::Forbidden("The request needs a UUID 'id'".into()));
+            }
+            if approvals.len() >= crate::security::MAX_APPROVALS {
+                return Err(AppError::Forbidden(format!(
+                    "This request already has {} approvals, the most one request can carry",
+                    approvals.len()
+                )));
             }
         }
-        SignAction::Revoke { agent_url, .. } => {
+        SignAction::Revoke { request, agent_url } => {
+            if request.approvals.is_empty() {
+                return Err(AppError::Forbidden(
+                    "Only an approved request can be revoked; an unapproved one can't run".into(),
+                ));
+            }
             let resolved = crate::agent_proxy::resolve_agent_url(&state, agent_url.as_deref())?;
             *agent_url = Some(resolved.to_string());
         }
@@ -304,10 +312,21 @@ async fn sign(
     match entry.action {
         SignAction::Approve {
             command,
-            operator_requires,
+            mut approvals,
         } => {
-            let payload = crate::security::canonical_approver_payload(&command, &operator_requires);
-            let a = crate::signing::attest(
+            // Two approvals must be two people. The agent enforces this on
+            // verified tokens; refusing here saves a wasted signature.
+            let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or_default();
+            if approvals
+                .iter()
+                .any(|a| crate::security::claimed_subject(&a.id_token).as_deref() == Some(sub))
+            {
+                return Err(format!(
+                    "{signer} has already approved this request; another person must add the next approval"
+                ));
+            }
+            let payload = crate::security::canonical_request_payload(&command);
+            let approval = crate::signing::attest(
                 &state.http_client,
                 tsa_url,
                 &key,
@@ -316,59 +335,21 @@ async fn sign(
                 payload.as_bytes(),
             )
             .await?;
-            let signed_at = timestamp_time(state, &a)?;
+            let signed_at = timestamp_time(state, &approval)?;
+            approvals.push(approval);
             Ok(SignOutcome::Bundle {
+                request_id: crate::security::request_id(&command),
                 signer,
                 signed_at,
-                bundle: Box::new(ExecutionBundle {
-                    approver: ApproverBundle {
-                        command,
-                        operator_requires,
-                        signature: a.signature,
-                        id_token: a.id_token,
-                        public_key: a.public_key,
-                        timestamp_token: a.timestamp_token,
-                    },
-                    operator: None,
-                }),
+                bundle: Box::new(RequestBundle { command, approvals }),
             })
         }
-        SignAction::Cosign { approver } => {
-            let payload = crate::security::operator_payload(&approver.signature, pem);
-            let a = crate::signing::attest(&state.http_client, tsa_url, &key, pem, id_token, &payload)
-                .await?;
-            let signed_at = timestamp_time(state, &a)?;
-            Ok(SignOutcome::Bundle {
-                signer,
-                signed_at,
-                bundle: Box::new(ExecutionBundle {
-                    operator: Some(OperatorCosign {
-                        approver_sig: approver.signature.clone(),
-                        signature: a.signature,
-                        id_token: a.id_token,
-                        public_key: a.public_key,
-                        timestamp_token: a.timestamp_token,
-                    }),
-                    approver,
-                }),
-            })
-        }
-        SignAction::Revoke {
-            approver,
-            agent_url,
-        } => {
-            let payload = crate::security::revocation_payload(&approver.signature, pem);
-            let a = crate::signing::attest(&state.http_client, tsa_url, &key, pem, id_token, &payload)
-                .await?;
-            let bundle = RevocationBundle {
-                approver,
-                revoker: RevokerAttestation {
-                    signature: a.signature,
-                    id_token: a.id_token,
-                    public_key: a.public_key,
-                    timestamp_token: a.timestamp_token,
-                },
-            };
+        SignAction::Revoke { request, agent_url } => {
+            let request_id = crate::security::request_id(&request.command);
+            let payload = crate::security::revocation_payload(&request_id, pem);
+            let revoker =
+                crate::signing::attest(&state.http_client, tsa_url, &key, pem, id_token, &payload).await?;
+            let bundle = RevocationBundle { request, revoker };
             // Resolved and allow-listed at begin; re-check in case the
             // config changed while the user was at the IdP.
             let base = crate::agent_proxy::resolve_agent_url(state, agent_url.as_deref())
@@ -390,13 +371,10 @@ async fn sign(
     }
 }
 
-/// Verify the attestation's TSA token the way an agent will, and return its
+/// Verify the approval's TSA token the way an agent will, and return its
 /// time. Catches a misconfigured or untrusted TSA here, before the bundle is
 /// handed out, rather than at execution.
-fn timestamp_time(
-    state: &AppState,
-    a: &crate::signing::Attestation,
-) -> Result<String, String> {
+fn timestamp_time(state: &AppState, a: &Approval) -> Result<String, String> {
     let token = hex::decode(&a.timestamp_token).map_err(|_| "Invalid TSA token".to_string())?;
     let mut data = hex::decode(&a.signature).map_err(|_| "Invalid signature".to_string())?;
     data.extend_from_slice(a.id_token.as_bytes());

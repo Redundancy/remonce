@@ -94,7 +94,7 @@ EOF
 
 ## Step 3: Create the OIDC Clients
 
-Remonce needs **two** clients: a *signing* client, used for a fresh re-authenticating login on every approval, cosign and revocation, and a *viewer* client, used for the ordinary browsing login (files and execution logs). Agents accept each only where it belongs, so a signing token carried inside a delegated bundle can never be used to browse.
+Remonce needs **two** clients: a *signing* client, used for a fresh re-authenticating login on every approval and revocation, and a *viewer* client, used for the ordinary login (the command catalog, files and execution logs, and identifying whoever executes a request). Agents accept each only where it belongs, so a signing token carried inside a request can never be used to browse or execute.
 
 ```hcl
 resource "vault_identity_oidc_client" "remonce_client" {
@@ -139,7 +139,7 @@ Assign both clients the same assignment (Step 4).
 > - **All redirect URIs must be explicitly listed**—OIDC does not support wildcards for security reasons.
 
 > [!WARNING]
-> **Do Not Reuse This Client**: This configuration creates a dedicated OIDC client for Remonce. Because Remonce exposes the JWT to execution targets (see delegation model), sharing this client ID with other applications would allow those targets to reuse the token against those applications. Keep this client exclusive to Remonce.
+> **Do Not Reuse This Client**: This configuration creates a dedicated OIDC client for Remonce. Because every approval's JWT travels inside the request to later approvers, the executor and the agent, sharing this client ID with other applications would allow those targets to reuse the token against those applications. Keep this client exclusive to Remonce.
 
 ---
 
@@ -156,7 +156,7 @@ resource "vault_identity_oidc_assignment" "remonce_assignment" {
 ```
 
 > [!TIP]
-> **Multiple Assignments**: Create separate assignments if you have different user populations for different clients (e.g., `remonce-admins` vs `remonce-operators`). Each assignment can reference different groups/entities.
+> **Multiple Assignments**: Create separate assignments if you have different user populations for different clients (e.g., `remonce-approvers` vs `remonce-executors`). Each assignment can reference different groups/entities.
 
 ---
 

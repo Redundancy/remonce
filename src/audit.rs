@@ -30,18 +30,15 @@ pub struct AuditLog {
     pub command: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<serde_json::Value>,
-    /// The approver (authorizing identity). For file access / unauthenticated
-    /// rejections this is just the caller identity.
+    /// Who acted: the executor for a run, the revoker for a revocation, the
+    /// viewer for file access; "unauthenticated" before anyone is known.
     pub user: String,
+    /// The request's id (hex SHA-256 of the signed request).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub signed_at: Option<String>,
-    /// The operator (executing identity). Equals `user` when self-executing.
+    pub request_id: Option<String>,
+    /// Everyone who approved the request, with their signing times.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub operator_user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operator_signed_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub self_executed: Option<bool>,
+    pub approvers: Option<Vec<AuditSigner>>,
     pub source_ip: String,
     pub agent_host: String,
     pub decision: &'static str,
@@ -52,14 +49,19 @@ pub struct AuditLog {
     pub insecure: Option<bool>,
 }
 
+#[derive(Serialize, Clone)]
+pub struct AuditSigner {
+    pub username: String,
+    pub sub: String,
+    pub signed_at: String,
+}
+
 #[derive(Default)]
 pub struct AuditContext {
-    pub signed_at: Option<String>,
     pub command: Option<serde_json::Value>,
     pub file: Option<serde_json::Value>,
-    pub operator_user: Option<String>,
-    pub operator_signed_at: Option<String>,
-    pub self_executed: Option<bool>,
+    pub request_id: Option<String>,
+    pub approvers: Option<Vec<AuditSigner>>,
     /// Overrides the event type inferred from which fields are set.
     pub event_type: Option<&'static str>,
 }
@@ -95,10 +97,8 @@ pub fn log_audit(
         command: ctx.command,
         file: ctx.file,
         user,
-        signed_at: ctx.signed_at,
-        operator_user: ctx.operator_user,
-        operator_signed_at: ctx.operator_signed_at,
-        self_executed: ctx.self_executed,
+        request_id: ctx.request_id,
+        approvers: ctx.approvers,
         source_ip,
         agent_host,
         decision,

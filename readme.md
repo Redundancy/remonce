@@ -21,18 +21,18 @@ Remonce is built to be an easily configured, lightweight system that lowers the 
 *   **Low Touch**: Lightweight deployment with minimal configuration.
 *   **Flexible Centralization**: Teams decide their own trade-offs—run fully decentralized or enforce global policies centrally.
 *   **Secure Defaults**: Architecture enforces a **deny-by-default** posture, ensuring **least-privileged access**.
-*   **Delegated Permissions**: Two-signature protocol where a senior approver authorizes commands with a long validity (days) and an on-call operator adds a fresh co-signature (minutes) at execution time. The approver can restrict *who* may execute via OIDC claim predicates.
+*   **Multi-party Approval**: A request collects independent approvals from different people; policy publishes, per command, how many are needed, from whom, and who may run it, and the UI shows it next to each command.
 *   **Cloud Agnostic**: Works on AWS, Azure, GCP, or On-Prem.
 
 ---
 
 ## How It Works
 
-The process begins when a user authenticates via their corporate Identity Provider (e.g., Vault, Okta, Azure AD). The local client generates a **Signed Command** bundled with a short-lived Proof-of-Identity (JWT) and an RFC 3161 timestamp.
+A user picks a command from the agent's catalog, which also shows what the command needs. They prepare a **request** and **approve** it: a fresh login to their Identity Provider (e.g., Vault, Okta, Azure AD) binds a one-time key, which signs the request, and an RFC 3161 timestamp proves when.
 
-For synchronous work, the same user submits the bundle directly to the Agent — a "self-execute" path where freshness is enforced at the short (minutes) window. For delegated work (e.g., overnight NOC maintenance), the approver's bundle is handed off to an operator who adds a fresh co-signature under their own identity before submitting; the approver's authorization can remain valid for days while the operator's attestation proves the command was actually sent in the current moment.
+If the command needs more approvals, the request goes to the next approver as a file — chat, ticket, SCP, remote desktop — and each adds their own. Once it has enough, anyone policy allows can submit it from any machine; they are identified by their login and recorded as the executor. A command that needs one approval is simply approve, then execute.
 
-The Agent cryptographically verifies signatures, timestamps, nonce-bound identities, and any approver-embedded constraints on *who* may execute, then consults **Open Policy Agent (OPA)** for the final business-logic allow/deny. Authorized commands run immediately with stdout and stderr streamed back in real-time; an in-memory replay cache prevents duplicate executions within the freshness window.
+The Agent cryptographically verifies every approval's signature, timestamp and nonce-bound identity, requires them to be from different people, then consults **Open Policy Agent (OPA)**, which checks the approvals and the executor against the command's published requirements. Authorized commands run immediately with stdout and stderr streamed back in real-time; an in-memory replay cache makes each request run once.
 
 ---
 
@@ -74,7 +74,7 @@ Read-only access to files can be configured via `[[files]]` entries.
 ## Documentation
 
 *   [**Getting Started (Dev Guide)**](DEVELOPMENT.md): Spin up the environment locally.
-*   [**Use Cases**](USECASES.md): Concrete scenarios — solo VM ops, CI workflows, NOC delegation, cross-team authorization.
+*   [**Use Cases**](USECASES.md): Concrete scenarios — solo VM ops, CI workflows, NOC handoff, cross-team authorization, two-person rules.
 *   [**Architecture Deep Dive**](ARCHITECTURE.md): The cryptographic protocols and design decisions.
 *   [**Security Model**](SECURITY.md): How we secure the chain of trust.
 *   [**Production Readiness**](PRODUCTION_READINESS.md): Roadmap to going live.
@@ -88,10 +88,10 @@ Read-only access to files can be configured via `[[files]]` entries.
 
 Remonce is split into two processes that usually live on different machines:
 
-- **`remonce web`** — the **signer**, runs on the operator's workstation. Always binds to loopback (`127.0.0.1` / `::1`); no TLS needed. The browser never talks to the agent directly: the signer proxies execution, file reads, and log streams to the agent over TLS (`agent_url`, with `agent_ca_path` for self-signed/private-CA agent certs).
-- **`remonce agent`** — the **executor**, runs on the remote target server. TLS is mandatory (file-based cert or ACME); there is no plaintext mode.
+- **`remonce web`** — the **signer**, runs on each user's workstation. Always binds to loopback (`127.0.0.1` / `::1`); no TLS needed. The browser never talks to the agent directly: the signer proxies the catalog, execution, file reads, and log streams to the agent over TLS (`agent_url`, with `agent_ca_path` for self-signed/private-CA agent certs).
+- **`remonce agent`** — runs on the remote target server: serves its command catalog and runs approved requests. TLS is mandatory (file-based cert or ACME); there is no plaintext mode.
 
-There is also **`remonce cosign`** — a headless CLI for operators who receive a delegated approval bundle: it runs its own OIDC login, co-signs the bundle, and optionally submits it to the agent (see [CONFIGURATION.md](CONFIGURATION.md)).
+There is also a headless CLI: **`remonce approve`** adds your approval to a request file, **`remonce submit`** runs an approved request as you, and **`remonce revoke`** cancels one (see [CONFIGURATION.md](CONFIGURATION.md)).
 
 ## Quick Start (Local)
 

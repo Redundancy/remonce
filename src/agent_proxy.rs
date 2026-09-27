@@ -156,16 +156,22 @@ fn origin_matches_host(origin: &url::Url, host: &str) -> bool {
 pub struct ExecuteProxyRequest {
     #[serde(default)]
     pub agent_url: Option<String>,
-    pub bundle: crate::security::ExecutionBundle,
+    pub bundle: crate::security::RequestBundle,
 }
 
-/// POST /api/agent/execute — forward an ExecutionBundle to the agent.
+/// POST /api/agent/execute — submit an approved request to the agent. The
+/// session's viewer token goes with it: whoever submits is the executor,
+/// identified to the agent and subject to its policy.
 pub async fn execute_proxy(
     State(state): State<AppState>,
     session: Session,
+    headers: axum::http::HeaderMap,
     axum::Json(req): axum::Json<ExecuteProxyRequest>,
 ) -> Result<Response, AppError> {
-    crate::web::require_profile(&session).await?;
+    // It runs a command as this user, so another localhost origin must not
+    // be able to trigger it with the session cookie.
+    require_same_origin(&headers)?;
+    let profile = crate::web::require_profile(&session).await?;
 
     let url = resolve_agent_url(&state, req.agent_url.as_deref())?
         .join("execute")
@@ -174,6 +180,7 @@ pub async fn execute_proxy(
     let resp = state
         .agent_http
         .post(url)
+        .bearer_auth(&profile.viewer_id_token)
         .json(&req.bundle)
         .send()
         .await
@@ -186,6 +193,30 @@ pub async fn execute_proxy(
 pub struct FilesProxyParams {
     #[serde(default)]
     pub agent_url: Option<String>,
+}
+
+/// GET /api/agent/commands — the selected agent's command catalog: what can
+/// be requested there and what each command needs.
+pub async fn commands_proxy(
+    State(state): State<AppState>,
+    session: Session,
+    Query(params): Query<FilesProxyParams>,
+) -> Result<Response, AppError> {
+    let profile = crate::web::require_profile(&session).await?;
+
+    let url = resolve_agent_url(&state, params.agent_url.as_deref())?
+        .join("api/commands")
+        .map_err(|e| AppError::Internal(format!("URL join: {e}")))?;
+
+    let resp = state
+        .agent_http
+        .get(url)
+        .bearer_auth(&profile.viewer_id_token)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Agent unreachable: {}", e.without_url())))?;
+
+    passthrough(resp).await
 }
 
 /// GET /api/agent/files — list the agent's readable files. The session's

@@ -8,7 +8,7 @@ use remonce::web;
 struct Cli {
     /// Run with a security-degraded configuration. Unlocks settings that
     /// broaden the trust surface (HTTP non-loopback OIDC issuer, OS TSA
-    /// trust store, long operator_max_validity, wildcard CORS). Each
+    /// trust store, long approval_validity, wildcard CORS). Each
     /// active gate is logged at startup and every audit entry includes
     /// `insecure: true`.
     #[arg(long, global = true)]
@@ -24,26 +24,29 @@ enum Commands {
     Web,
     /// Run the Execution Agent (remote executor)
     Agent,
-    /// Co-sign an approver bundle as the executing operator (headless flow)
-    Cosign {
-        /// Path to the approver bundle (JSON or base64 token), or '-' for stdin
+    /// Add your approval to a request (one fresh login per signature)
+    Approve {
+        /// Path to the request file (with or without approvals), or '-' for stdin
+        #[arg(long, short = 'b')]
+        bundle: String,
+        /// Write the approved request to this file instead of stdout
+        #[arg(long, short = 'o')]
+        output: Option<String>,
+    },
+    /// Run an approved request on an agent; you are logged in as the executor
+    Submit {
+        /// Path to the approved request file, or '-' for stdin
         #[arg(long, short = 'b')]
         bundle: String,
         /// Agent URL to submit to (defaults to `agent_url` from config.toml)
         #[arg(long)]
         agent: Option<String>,
-        /// Write the cosigned ExecutionBundle to this file instead of stdout
-        #[arg(long, short = 'o')]
-        output: Option<String>,
-        /// Submit the cosigned bundle to the agent's /execute endpoint
-        #[arg(long)]
-        submit: bool,
     },
     /// Run the central revocation service (persistent, estate-wide revocations)
     RevocationService,
-    /// Revoke an approver bundle on an agent (headless flow)
+    /// Revoke (cancel) an approved request on an agent
     Revoke {
-        /// Path to the approver bundle (JSON or base64 token), or '-' for stdin
+        /// Path to the approved request file, or '-' for stdin
         #[arg(long, short = 'b')]
         bundle: String,
         /// Agent URL to submit to (defaults to `agent_url` from config.toml)
@@ -70,29 +73,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Starting Revocation Service...");
             remonce::revocation::run(cli.insecure).await
         }
-        Commands::Cosign {
-            bundle,
-            agent,
-            output,
-            submit,
-        } => {
-            remonce::cosign::run(
-                remonce::cosign::CosignArgs {
-                    bundle,
-                    agent,
-                    output,
-                    submit,
-                },
-                cli.insecure,
-            )
-            .await
+        Commands::Approve { bundle, output } => {
+            remonce::cli::run_approve(remonce::cli::ApproveArgs { bundle, output }, cli.insecure).await
+        }
+        Commands::Submit { bundle, agent } => {
+            remonce::cli::run_submit(remonce::cli::SubmitArgs { bundle, agent }, cli.insecure).await
         }
         Commands::Revoke { bundle, agent } => {
-            remonce::cosign::run_revoke(
-                remonce::cosign::RevokeArgs { bundle, agent },
-                cli.insecure,
-            )
-            .await
+            remonce::cli::run_revoke(remonce::cli::RevokeArgs { bundle, agent }, cli.insecure).await
         }
     }
 }

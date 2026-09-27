@@ -1,0 +1,48 @@
+{
+  "remonce": {
+    "requirements": {
+      "test": {
+        "description": "Connectivity check",
+        "approvals": [
+          {
+            "description": "a Remonce user",
+            "any_of": [{ "op": "contains", "claim": "groups", "value": "webapp-users" }]
+          }
+        ],
+        "executors": {
+          "description": "a Remonce user",
+          "any_of": [{ "op": "contains", "claim": "groups", "value": "webapp-users" }]
+        }
+      },
+      "ping-test": {
+        "approvals": [
+          {
+            "description": "a Remonce user",
+            "any_of": [{ "op": "contains", "claim": "groups", "value": "webapp-users" }]
+          }
+        ],
+        "executors": {
+          "description": "a Remonce user",
+          "any_of": [{ "op": "contains", "claim": "groups", "value": "webapp-users" }]
+        }
+      },
+      "ping-pair": {
+        "description": "Two people must agree before this runs",
+        "approvals": [
+          {
+            "description": "a Remonce user",
+            "any_of": [{ "op": "contains", "claim": "groups", "value": "webapp-users" }]
+          },
+          {
+            "description": "another Remonce user",
+            "any_of": [{ "op": "contains", "claim": "groups", "value": "webapp-users" }]
+          }
+        ],
+        "executors": {
+          "description": "a Remonce user",
+          "any_of": [{ "op": "contains", "claim": "groups", "value": "webapp-users" }]
+        }
+      }
+    }
+  }
+}

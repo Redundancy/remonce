@@ -8,7 +8,6 @@ use axum::{
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tower_http::{
@@ -161,10 +160,7 @@ pub(crate) async fn require_profile(session: &Session) -> Result<UserProfile, Ap
 
 pub async fn run(insecure: bool) -> Result<(), AppError> {
     // Load configuration from `config.toml`
-    let config_str = std::fs::read_to_string("config.toml")
-        .map_err(|e| AppError::Config(format!("Failed to read config.toml: {e}")))?;
-    let config: Config = toml::from_str(&config_str)
-        .map_err(|e| AppError::Config(format!("Failed to parse config.toml: {e}")))?;
+    let config: Config = crate::config::load("config.toml").map_err(|e| AppError::Config(e.to_string()))?;
 
     // Validate the `--insecure` posture up front; refuses to start when any
     // degraded setting is active without the flag.
@@ -255,7 +251,7 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         .route("/oidc/callback", get(callback_handler))
         .route("/api/sign/begin", post(crate::web_sign::begin_handler))
         .route("/api/sign/result/{id}", get(crate::web_sign::result_handler))
-        .route("/api/commands", get(get_commands_handler))
+        .route("/api/agent/commands", get(crate::agent_proxy::commands_proxy))
         .route("/api/agent/execute", post(crate::agent_proxy::execute_proxy))
         .route("/api/agent/files", get(crate::agent_proxy::files_proxy))
         .route("/ws/exec", get(crate::agent_proxy::exec_stream_proxy))
@@ -552,88 +548,3 @@ impl From<tower_sessions::session::Error> for AppError {
     }
 }
 
-/// Helper handler to fetch available commands if authorized.
-/// What the UI needs to know about a command. Deliberately excludes the
-/// executable, arguments, working directory and environment.
-#[derive(Serialize)]
-struct CommandView {
-    name: String,
-    description: Option<String>,
-    /// Seconds a delegated approval stays usable after signing.
-    approver_max_validity_secs: u64,
-    /// Seconds the executing signature stays usable after signing.
-    operator_max_validity_secs: u64,
-    params: Vec<ParamView>,
-}
-
-#[derive(Serialize)]
-struct ParamView {
-    name: String,
-    description: Option<String>,
-    required: bool,
-    default: Option<String>,
-    allowed: Option<Vec<String>>,
-    min: Option<i64>,
-    max: Option<i64>,
-}
-
-async fn get_commands_handler(
-    State(state): State<AppState>,
-    session: Session,
-) -> Result<axum::Json<Vec<CommandView>>, AppError> {
-    let profile = require_profile(&session).await?;
-
-    // Query OPA for "view_docs" permission
-    let check_input = json!({
-        "input": {
-            "action": "view_docs",
-            "jwt": profile.viewer_id_token
-        }
-    });
-
-    let opa_url = format!("{}/v1/data/remonce/authz/decision", state.config.opa_url);
-
-    let opa_response: serde_json::Value = state
-        .http_client
-        .post(&opa_url)
-        .json(&check_input)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let allowed = opa_response
-        .pointer("/result/allow")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    if !allowed {
-        return Err(AppError::Forbidden("Policy does not allow you to view commands".into()));
-    }
-
-    let commands = state
-        .config
-        .commands
-        .iter()
-        .map(|c| CommandView {
-            name: c.name.clone(),
-            description: c.description.clone(),
-            approver_max_validity_secs: c.approver_max_validity_or_default().as_secs(),
-            operator_max_validity_secs: c.operator_max_validity_or_default().as_secs(),
-            params: c
-                .params
-                .iter()
-                .map(|p| ParamView {
-                    name: p.name.clone(),
-                    description: p.description.clone(),
-                    required: p.required,
-                    default: p.default.clone(),
-                    allowed: p.allowed.clone(),
-                    min: p.min,
-                    max: p.max,
-                })
-                .collect(),
-        })
-        .collect();
-    Ok(axum::Json(commands))
-}

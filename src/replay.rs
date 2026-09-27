@@ -1,12 +1,13 @@
-//! In-memory replay cache for recently-used executions.
+//! In-memory replay cache for executed requests, and the agent's local set
+//! of revoked requests.
 //!
-//! Keyed by the *executor's key binding* (operator if delegated, else
-//! approver) — the IdP-attested `nonce`, which unlike signature bytes can't
-//! be mauled into a fresh-looking variant. First-seen wins; a second
-//! submission of the same bundle is rejected.
+//! Both are keyed by request id — the hash of the signed request, which
+//! every approval of it signs, so no re-signing or re-encoding yields a
+//! different key for the same request. First-seen wins; a second submission
+//! of the same request is rejected, whoever approved it.
 //!
-//! Each entry expires when the executor signature would fail freshness
-//! anyway, so there's no need to keep it pinned past that.
+//! Each entry expires once no approval that could run the request is still
+//! valid (see `security::replay_ttl`), so there's no need to keep it longer.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -62,10 +63,10 @@ impl ReplayCache {
     }
 }
 
-/// In-memory set of revoked approvals, keyed by the approver's key binding.
-/// Each entry carries
-/// its own expiry: the moment the underlying bundle would have aged out of
-/// `approver_max_validity` anyway, after which keeping it is pointless.
+/// In-memory set of revoked requests, keyed by request id. Each entry
+/// carries its own expiry: the moment every approval of the request would
+/// have aged out of `approval_validity` anyway, after which keeping it is
+/// pointless.
 #[derive(Clone, Default)]
 pub struct RevocationCache {
     inner: Arc<Mutex<HashMap<String, Instant>>>,

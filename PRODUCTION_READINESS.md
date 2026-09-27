@@ -13,18 +13,22 @@ This document tracks known security gaps, "TODO" items, and requirements for mov
 - **Modes**: `files` (static certs with hot-reloading) and `acme` (automatic via `rustls-acme`, experimental).
 
 ### Replay Attack Mitigation
-- **Status**: **Fixed**. The agent keeps an in-memory replay cache (`src/replay.rs`) keyed by the executor's key binding (the IdP-attested `nonce`, `SHA256(public_key_pem)`; operator if delegated, else approver). Entries live until the signature could no longer pass freshness — the executor's `iat` plus `operator_max_validity`. Every signature comes from its own re-authenticating login and must be timestamped within 5 minutes of it, so re-timestamping can't extend that, whatever the IdP's token lifetime.
-- **Caveat**: the cache is per-process. An agent restart clears it, so a bundle could be replayed across a restart within `operator_max_validity` of its signing login. Persist the cache if this matters for your threat model.
+- **Status**: **Fixed**. The agent keeps an in-memory replay cache (`src/replay.rs`) keyed by the request id (the hash of the signed request), so a request runs once however it is resubmitted. Entries live until every approval that could run the request has expired: `approval_validity` from the latest possible login. Every signature comes from its own re-authenticating login and must be timestamped within 5 minutes of it, so re-timestamping can't extend that, whatever the IdP's token lifetime.
+- **Caveat**: the cache is per-process. An agent restart clears it, so a request could be replayed across a restart while its approvals are still valid. Persist the cache if this matters for your threat model.
 
 ### Signature Malleability and Re-timestamping
-- **Status**: **Fixed**. ECDSA's `s → n−s` twin of a valid signature, and fresh TSA timestamps over old signatures, previously let a holder resubmit a byte-different bundle — dodging the replay cache and the revocation list (which keyed on signature hex) — for as long as the ID token lived. Signers now normalize to low-S and verifiers reject high-S; both caches key on the key binding; and freshness is measured from the token's `iat`.
+- **Status**: **Fixed**. ECDSA's `s → n−s` twin of a valid signature, and fresh TSA timestamps over old signatures, previously let a holder resubmit a byte-different bundle — dodging the replay cache and the revocation list (which keyed on signature hex) — for as long as the ID token lived. Signers now normalize to low-S and verifiers reject high-S; both caches key on the request id, which no change to the signatures affects; and freshness is measured from the token's `iat`.
 
 ### Input Sanitization / Parameterized Commands
 - **Status**: **Fixed**. `executable` and `args` come exclusively from `config.toml`. Signer-supplied values only enter argv through declared `[[commands.params]]`, validated fail-closed (`src/params.rs`): allow-list, integer range, or anchored regex, with a conservative default pattern that bars leading dashes (flag injection) and shell metacharacters. Commands are spawned without a shell and with a scrubbed environment.
 - **Caveat**: a custom `pattern` that admits values starting with `-` re-opens argv flag injection. Review patterns accordingly.
 
-### Approval Revocation
-- **Status**: **Implemented**. `POST /revoke` on the agent accepts a `RevocationBundle` (the approver bundle plus a fresh, nonce-bound revoker attestation over a domain-separated payload). Self-revocation (same OIDC `sub`) is always allowed; third-party revocation requires an OPA `action = "revoke"` decision. Revocations are recorded by the approval's key binding. Available via the Execute page (its own re-authenticating login) and `remonce revoke`.
+### Multi-party Approval
+- **Status**: **Implemented**. A request collects independent approvals (up to 16), each a different person. Policy publishes per-command requirement documents (approval slots and allowed executors) that the agent serves in its catalog and enforces through a shared Rego helper; the executor is identified by their login. See [ARCHITECTURE.md](ARCHITECTURE.md#requests-and-approvals).
+- **Caveat**: the executor's credential is a viewer bearer token with no proof of possession. Keep viewer-token lifetimes short, and use `executors` to limit who can run what.
+
+### Request Revocation
+- **Status**: **Implemented**. `POST /revoke` on the agent accepts a `RevocationBundle` (the request with at least one genuine approval, plus a fresh, nonce-bound revoker attestation over a domain-separated payload). Any approver of the request may revoke it; anyone else needs an OPA `action = "revoke"` decision. Revocation is by request id, so it cancels the request whoever approved it. Available via the Execute page (its own re-authenticating login) and `remonce revoke`.
 - **Estate-wide**: `remonce revocation-service` runs a central, persistent (JSONL) revocation store. Agents configured with `[agent] revocation_service_url` check it before every execution (**fail-closed** — if the service is set and unreachable, execution is denied) and forward locally-submitted revocations to it. The service performs the same full bundle verification as the agent, so it cannot be poisoned.
 - **Caveat**: without the central service, the revocation list is in-memory and per-agent: a revocation must be submitted to every agent and a restart forgets it.
 
@@ -34,15 +38,15 @@ This document tracks known security gaps, "TODO" items, and requirements for mov
 - **Current**: The dev setup uses a local Vault instance (`vault_setup.tf`) over HTTP (allowed for loopback only; anything else needs `--insecure`).
 - **Production**: Use a production Vault cluster or managed OIDC provider (Auth0, Okta, etc.) with HTTPS enforced for the issuer URL.
 
-### Machine Identity for CI Cosigning (planned)
-- Workload JWTs generally cannot carry the custom nonce that binds tokens to ephemeral keys, so machines cannot currently act as operators. GitHub/GitLab OIDC tokens have fixed claims; a machine using Vault would mint an [identity token](https://developer.hashicorp.com/vault/docs/secrets/identity/identity-token), which likewise takes no nonce parameter (role templates can interpolate entity metadata, but dynamically updating metadata per ephemeral key is rarely practical).
-- Planned shape: a machine-operator verification path that pins issuer/audience/required claims per trusted workload issuer, **without** the key-binding requirement — bearer-token semantics, mitigated by short token TTLs and tight claim pinning. Where a deployment *can* surface a key-binding claim, a configurable claim name re-enables the stronger check.
+### Machine Identity for CI Executors (planned)
+- Executing needs no nonce-bound key, only an ID token for the viewer client from the configured issuer, so a machine can execute once it can get one. Workload tokens usually come from a different issuer (GitHub/GitLab OIDC) or, through Vault, as an [identity token](https://developer.hashicorp.com/vault/docs/secrets/identity/identity-token) for a role whose audience must match the viewer client.
+- Planned shape: trust additional workload issuers for the executor role only, pinning issuer, audience and required claims per issuer — bearer-token semantics, mitigated by short token TTLs and tight claim pinning. Machines still can't approve: approving needs a key-bound, re-authenticated login.
 
 ### Embedded OPA (planned)
 - Authorization currently requires a running OPA server. Embedding policy evaluation (e.g. Regorus) would remove the last runtime dependency for single-binary deployments.
 
 ### Persistent Replay Cache
-- The replay cache remains in-memory per-agent. Its window runs to the executor's `iat` plus `operator_max_validity`, so the exposure is an agent restart inside that window. Persist it if your threat model requires.
+- The replay cache remains in-memory per-agent. Its window runs until the request's approvals expire (`approval_validity`), so the exposure is an agent restart inside that window. Persist it if your threat model requires.
 
 ### Kill the Whole Process Tree on Timeout
 - **Current**: on `command_timeout` the agent kills the direct child and stops draining output after 5 seconds, so the log trailer is always written. Grandchildren that ignore the parent's death keep running.

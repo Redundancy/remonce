@@ -1,112 +1,110 @@
 package remonce.authz
-import future.keywords.if
-import future.keywords.in
 
-default allow = false
-default reason = "Denied by default"
+import data.remonce.lib
 
-# Input Documentation
-# -------------------
-# For command execution requests, `input` contains:
+default allow := false
+
+# Input
+# -----
+# Executing a request (action "execute"):
 #
-#   input.action: string           - "execute" for command execution,
-#                                    "revoke" for third-party revocation
-#   input.command: object          - the approver's signed command payload
-#   input.approver:                - the authorizing identity
-#     .username: string
-#     .claims:   object            - the approver's OIDC JWT claims (groups, etc.)
-#     .signed_at: string           - RFC3339 approver TSA timestamp
-#   input.operator:                - the executing identity (equals approver
-#                                    when self-executing). For "revoke" this
-#                                    is the revoker's identity.
-#     .username: string
-#     .claims:   object
-#     .signed_at: string
-#   input.self_executed: bool      - true iff approver == operator
-#   input.host: string             - agent hostname
+#   input.command:    object  the signed command (command, id, target_machines, params, ...)
+#   input.request_id: string  hex SHA-256 of the signed request
+#   input.approvers:  array   one entry per approval, each a different person:
+#                             { username, claims (OIDC claims), signed_at (RFC 3339) }
+#   input.executor:   object  who is submitting it, from their login session:
+#                             { username, claims }
+#   input.host:       string  the agent's hostname
 #
-# Revocation note: an approver revoking their own bundle (same OIDC `sub`)
-# is always allowed by the agent without consulting OPA. Policy is only
-# asked when someone ELSE wants to revoke (action == "revoke").
+# Revoking a request (action "revoke") — asked only when the revoker is not
+# one of the request's approvers (approvers may always revoke):
 #
-# For file access / log streaming / command listing, a simpler shape is used:
-#   input.action:       string  ("view_docs" | "read_file" | "view_execution")
-#   input.jwt:          string  (the caller's bearer ID token)
-#   input.file:         object  (when action == "read_file")
-#   input.execution_id: string  (when action == "view_execution")
+#   input.command, input.request_id, input.approvers, input.host as above
+#   input.revoker:    object  { username, claims, signed_at }
 #
-# The agent enforces cryptographic checks (signatures, TSA freshness, operator
-# claim predicates) BEFORE calling OPA. Policy here encodes business-level
-# authorization: who may authorize what, separation of duties, etc.
+# Viewing (actions "view_docs", "read_file", "view_execution"):
+#
+#   input.jwt:          string  the caller's viewer ID token
+#   input.file:         object  (read_file)
+#   input.execution_id: string  (view_execution)
+#
+# The agent verifies every signature, token and freshness window before
+# asking. Policy decides whether the approvals and the executor are enough.
 
-# --- Helpers ---
+# --- Executing: published requirements ---
 
-approver_groups := g if { g := input.approver.claims.groups } else := []
-operator_groups := g if { g := input.operator.claims.groups } else := []
+# Each command's requirements are published in requirements.json. The same
+# document is shown to people in the UI, so allowing through it keeps what
+# they see and what is enforced the same.
+requirement := data.remonce.requirements[input.command.command]
 
-# --- File access / command listing ---
-# These keep the legacy `jwt`-in-input shape for the file streaming handler.
+allow if {
+	input.action == "execute"
+	lib.satisfied(requirement, input)
+	not denied
+}
+
+# Further restrictions go here as messages. When a command has one, set its
+# "additional_policy" in requirements.json so the UI says so.
+extra_denials contains "restart-db may only run on db-* hosts" if {
+	input.action == "execute"
+	input.command.command == "restart-db"
+	not startswith(input.host, "db-")
+}
+
+denied if some _ in extra_denials
+
+# --- Revoking someone else's request ---
+
+allow if {
+	input.action == "revoke"
+	"webapp-users" in object.get(input.revoker.claims, "groups", [])
+}
+
+# --- Viewing ---
+
 claims := payload if {
-    [_, payload, _] := io.jwt.decode(input.jwt)
+	[_, payload, _] := io.jwt.decode(input.jwt)
 }
-legacy_user_groups := g if { g := claims.groups } else := []
+
+viewer_groups := g if {
+	g := claims.groups
+} else := []
 
 allow if {
-    input.action == "view_docs"
-    "webapp-users" in legacy_user_groups
+	input.action == "view_docs"
+	"webapp-users" in viewer_groups
 }
 
 allow if {
-    input.action == "read_file"
-    "webapp-users" in legacy_user_groups
+	input.action == "read_file"
+	"webapp-users" in viewer_groups
 }
 
-# Streaming an execution's output log.
 allow if {
-    input.action == "view_execution"
-    "webapp-users" in legacy_user_groups
+	input.action == "view_execution"
+	"webapp-users" in viewer_groups
 }
 
-# --- Command execution rules ---
+# --- Decision ---
 
-# test: any approver in `webapp-users` can authorize; no operator restriction.
-allow if {
-    input.action == "execute"
-    input.command.command == "test"
-    "webapp-users" in approver_groups
-}
+reason := "Authorized" if {
+	allow
+} else := msg if {
+	input.action == "execute"
+	not requirement
+	msg := sprintf("No published requirements for '%s'", [input.command.command])
+} else := "The approvals do not meet the published requirements" if {
+	input.action == "execute"
+	not lib.approvals_satisfied(requirement, input.approvers)
+} else := "You are not allowed to execute this command" if {
+	input.action == "execute"
+	not lib.executor_allowed(requirement, input.executor)
+} else := msg if {
+	some msg in extra_denials
+} else := "Denied by default"
 
-# ping-test: same.
-allow if {
-    input.action == "execute"
-    input.command.command == "ping-test"
-    "webapp-users" in approver_groups
-}
-
-# Third-party revocation: anyone in `webapp-users` may revoke another
-# user's approval. Tighten this (e.g. to an admin group) in production.
-allow if {
-    input.action == "revoke"
-    "webapp-users" in operator_groups
-}
-
-# Example (disabled — add your own rules below):
-# Restrict a "restart-service" command to approvers in `oncall-managers`, and
-# require a distinct operator (four-eyes).
-#
-# allow if {
-#     input.action == "execute"
-#     input.command.command == "restart-service"
-#     "oncall-managers" in approver_groups
-#     not input.self_executed
-#     "noc-l2" in operator_groups
-# }
-
-reason = "Authorized" if {
-    allow
-}
-
-decision = {
-    "allow": allow,
-    "reason": reason,
+decision := {
+	"allow": allow,
+	"reason": reason,
 }

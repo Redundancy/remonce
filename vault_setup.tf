@@ -75,6 +75,31 @@ resource "vault_generic_endpoint" "app_user" {
   ]
 }
 
+# A second user, so requests that need two different people's approval can
+# be tried locally. Same password as the first.
+resource "vault_generic_endpoint" "app_user2" {
+  path = "auth/userpass/users/webapp2"
+
+  data_json = jsonencode({
+    password = var.app_user_password
+    policies = [vault_policy.app_user_policy.name]
+  })
+
+  depends_on = [
+    vault_auth_backend.userpass
+  ]
+}
+
+resource "vault_identity_entity" "webapp_user2" {
+  name = "webapp-user2"
+}
+
+resource "vault_identity_entity_alias" "webapp_user2_alias" {
+  name           = "webapp2"
+  mount_accessor = vault_auth_backend.userpass.accessor
+  canonical_id   = vault_identity_entity.webapp_user2.id
+}
+
 # Create an entity for the webapp user so we can assign it to the OIDC client
 resource "vault_identity_entity" "webapp_user" {
   name = "webapp-user"
@@ -91,7 +116,10 @@ resource "vault_identity_entity_alias" "webapp_user_alias" {
 resource "vault_identity_group" "webapp_users" {
   name = "webapp-users"
   type = "internal"
-  member_entity_ids = [vault_identity_entity.webapp_user.id]
+  member_entity_ids = [
+    vault_identity_entity.webapp_user.id,
+    vault_identity_entity.webapp_user2.id,
+  ]
 }
 
 # Create an OIDC Assignment - this is the "Bridge" between entities/groups and the Client

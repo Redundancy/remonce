@@ -2,7 +2,7 @@
 //! service, plus the service itself (`remonce revocation-service`).
 //!
 //! The service is a small TLS server holding a persistent (JSONL append-log)
-//! set of revoked approver signatures. Agents configured with
+//! set of revoked requests, by request id. Agents configured with
 //! `[agent] revocation_service_url` consult it before every execution and
 //! fail closed if it is unreachable.
 
@@ -29,16 +29,15 @@ pub struct RevocationCtx<'a> {
     pub trusted_roots: &'a [Vec<u8>],
     pub http_client: &'a reqwest::Client,
     pub hostname: &'a str,
-    /// Lower bound on the approver validity used for verification and for
-    /// how long the revocation is kept. The central service sets this to its
-    /// retention period: agents may allow longer approver validity than the
-    /// service's own `[[commands]]` say, and a revocation must not lapse
-    /// while any agent would still accept the bundle.
-    pub min_approver_validity: Option<std::time::Duration>,
+    /// Minimum time to keep a revocation. The central service sets this to
+    /// its retention period: agents may allow longer approval validity than
+    /// the service's own `[[commands]]` say, and a revocation must not lapse
+    /// while any agent would still accept the request.
+    pub retention: Option<std::time::Duration>,
     /// Accept revocations for commands missing from this process's config
-    /// (verified with default windows, third parties judged by the default
-    /// OPA rule). The central service serves agents whose command sets it
-    /// may not mirror; an agent only needs its own commands.
+    /// (default validity, third parties judged by the default OPA rule). The
+    /// central service serves agents whose command sets it may not mirror;
+    /// an agent only needs its own commands.
     pub allow_unknown_commands: bool,
 }
 
@@ -47,147 +46,124 @@ const DEFAULT_OPA_RULE: &str = "data.remonce.authz.decision";
 
 pub struct VerifiedRevocation {
     pub authorized: crate::security::AuthorizedRevocation,
-    pub approver_max_validity: std::time::Duration,
+    /// Until when to keep the revocation.
+    pub keep_until: time::OffsetDateTime,
 }
 
-/// Verify a revocation bundle and authorize the revoker: self-revocation
-/// (same OIDC `sub`) is always allowed, anyone else needs an OPA decision
-/// for `action = "revoke"`. Audit-logs every denial; the caller logs the
-/// success path. The returned error string is safe to show the client.
+/// Verify a revocation and authorize the revoker: any of the request's
+/// approvers may revoke it; anyone else needs an OPA decision for
+/// `action = "revoke"`. Audit-logs every denial; the caller logs success.
+/// The returned error string is safe to show the client.
 pub async fn verify_and_authorize(
     ctx: &RevocationCtx<'_>,
     req: &crate::security::RevocationBundle,
     ip: &str,
 ) -> Result<VerifiedRevocation, &'static str> {
-    use crate::audit::AuditContext;
+    use crate::audit::{AuditContext, AuditSigner};
 
-    let command_json = req.approver.command.clone();
+    let command_json = req.request.command.clone();
     let audit_ctx = || AuditContext {
-        event_type: Some("approval_revocation"),
+        event_type: Some("request_revocation"),
         command: Some(command_json.clone()),
         ..Default::default()
     };
+    let deny = |reason: String, user: &str, ctx_: AuditContext| {
+        crate::audit::log_audit("deny", reason, user.to_string(), ip.to_string(), ctx.hostname.to_string(), ctx_);
+    };
 
-    // Resolve the command config: it supplies the validity windows and the
-    // OPA rule governing third-party revocation.
-    let command_name = match command_json.get("command").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
+    let Some(command_name) = command_json.get("command").and_then(|v| v.as_str()) else {
+        deny("Revocation rejected: missing 'command' field".into(), "unauthenticated", audit_ctx());
+        return Err("Invalid Request");
+    };
+
+    // The command's config supplies the approval validity (for retention)
+    // and the OPA rule governing third-party revocation.
+    let (validity, opa_rule) = match ctx.config.commands.iter().find(|c| c.name == command_name) {
+        Some(c) => (c.approval_validity_or_default(), c.opa_rule.clone()),
+        None if ctx.allow_unknown_commands => (
+            crate::config::DEFAULT_APPROVAL_VALIDITY,
+            DEFAULT_OPA_RULE.to_string(),
+        ),
         None => {
-            crate::audit::log_audit(
-                "deny",
-                "Revocation rejected: missing 'command' field".into(),
-                "unauthenticated".into(),
-                ip.to_string(),
-                ctx.hostname.to_string(),
+            deny(
+                format!("Revocation rejected: command '{command_name}' not configured"),
+                "unauthenticated",
                 audit_ctx(),
             );
             return Err("Invalid Request");
         }
     };
 
-    let (approver_max, operator_max, opa_rule) =
-        match ctx.config.commands.iter().find(|c| c.name == command_name) {
-            Some(c) => (
-                c.approver_max_validity_or_default(),
-                c.operator_max_validity_or_default(),
-                c.opa_rule.clone(),
-            ),
-            None if ctx.allow_unknown_commands => (
-                crate::config::DEFAULT_APPROVER_MAX_VALIDITY,
-                crate::config::DEFAULT_OPERATOR_MAX_VALIDITY,
-                DEFAULT_OPA_RULE.to_string(),
-            ),
-            None => {
-                crate::audit::log_audit(
-                    "deny",
-                    format!("Revocation rejected: command '{}' not configured", command_name),
-                    "unauthenticated".into(),
-                    ip.to_string(),
-                    ctx.hostname.to_string(),
-                    audit_ctx(),
-                );
-                return Err("Invalid Request");
-            }
-        };
-    let approver_max = approver_max.max(ctx.min_approver_validity.unwrap_or_default());
-
-    // Approver bundles and revoker attestations are both signing-client
-    // tokens; viewer tokens have no place here.
+    // Approvals and revoker attestations are both signing-client tokens;
+    // viewer tokens have no place here.
     let verifier_config = crate::security::VerifierConfig {
         client_id: ctx.config.oidc.client_id.clone(),
         issuer_url: ctx.config.oidc.issuer_url.clone(),
         jwks: ctx.jwks.clone(),
         trusted_roots: ctx.trusted_roots.to_vec(),
-        approver_max_validity: approver_max,
-        operator_max_validity: operator_max,
+        approval_validity: validity,
     };
-
-    let revocation = match crate::security::verify_revocation(req, &verifier_config) {
+    let now = time::OffsetDateTime::now_utc();
+    let revocation = match crate::security::verify_revocation(req, &verifier_config, now) {
         Ok(r) => r,
         Err(e) => {
-            crate::audit::log_audit(
-                "deny",
-                format!("Revocation verification failed: {}", e),
-                "unauthenticated".into(),
-                ip.to_string(),
-                ctx.hostname.to_string(),
-                audit_ctx(),
-            );
+            deny(format!("Revocation verification failed: {e}"), "unauthenticated", audit_ctx());
             return Err("Verification Failed");
         }
     };
 
+    let signed_at = |t: time::OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "unknown_time".to_string())
+    };
     let revoker_user = revocation.revoker.username.clone();
-    let approver_user = revocation.approver.username.clone();
-
     let revoke_ctx = || AuditContext {
-        event_type: Some("approval_revocation"),
+        event_type: Some("request_revocation"),
         command: Some(command_json.clone()),
-        operator_user: Some(approver_user.clone()),
+        request_id: Some(revocation.request_id.clone()),
+        approvers: Some(
+            revocation
+                .approvers
+                .iter()
+                .map(|a| AuditSigner {
+                    username: a.username.clone(),
+                    sub: a.subject().to_string(),
+                    signed_at: signed_at(a.signed_at),
+                })
+                .collect(),
+        ),
         ..Default::default()
     };
 
-    // Authorization: self-revocation is always allowed; anyone else needs an
+    // Approvers may always cancel their own request; anyone else needs an
     // explicit OPA decision for action = "revoke".
     if !revocation.self_revoked {
-        let opa_input = crate::opa::OpaInput {
-            action: "revoke".into(),
+        let input = crate::opa::OpaInput::Revoke {
             command: command_json.clone(),
-            approver: crate::opa::SignerContext {
-                username: approver_user.clone(),
-                claims: revocation.approver.claims.clone(),
-                signed_at: revocation
-                    .approver
-                    .signed_at
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "unknown_time".to_string()),
-            },
-            operator: crate::opa::SignerContext {
+            request_id: revocation.request_id.clone(),
+            approvers: revocation
+                .approvers
+                .iter()
+                .map(|a| crate::opa::Signer {
+                    username: a.username.clone(),
+                    claims: a.claims.clone(),
+                    signed_at: signed_at(a.signed_at),
+                })
+                .collect(),
+            revoker: crate::opa::Signer {
                 username: revoker_user.clone(),
                 claims: revocation.revoker.claims.clone(),
-                signed_at: revocation
-                    .revoker
-                    .signed_at
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "unknown_time".to_string()),
+                signed_at: signed_at(revocation.revoker.signed_at),
             },
-            self_executed: false,
             host: ctx.hostname.to_string(),
         };
-
-        let decision = match crate::opa::check_authorization(
-            ctx.http_client,
-            &ctx.config.opa_url,
-            &opa_rule,
-            opa_input,
-        )
-        .await
+        let decision = match crate::opa::check_authorization(ctx.http_client, &ctx.config.opa_url, &opa_rule, &input).await
         {
             Ok(d) => d,
             Err(e) => {
                 crate::audit::log_audit(
                     "error",
-                    format!("OPA evaluation failed during revocation: {}", e),
+                    format!("OPA evaluation failed during revocation: {e}"),
                     revoker_user.clone(),
                     ip.to_string(),
                     ctx.hostname.to_string(),
@@ -196,39 +172,45 @@ pub async fn verify_and_authorize(
                 return Err("Internal Error");
             }
         };
-
         if !decision.allow {
-            crate::audit::log_audit(
-                "deny",
+            deny(
                 format!("Third-party revocation denied: {}", decision.reason),
-                revoker_user.clone(),
-                ip.to_string(),
-                ctx.hostname.to_string(),
+                &revoker_user,
                 revoke_ctx(),
             );
             return Err("Authorization Denied");
         }
     }
 
+    let keep_until = crate::security::revocation_keep_until(
+        now,
+        &revocation.approvers,
+        validity,
+        ctx.retention.unwrap_or(validity),
+    );
     Ok(VerifiedRevocation {
         authorized: revocation,
-        approver_max_validity: approver_max,
+        keep_until,
     })
 }
 
 // --- Persistent store -----------------------------------------------------
 
+/// Version tag on every stored line.
+const STORE_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredRevocation {
-    /// The revoked approval's key binding (`hex(SHA256(approver pubkey))`).
-    key: String,
+    v: u32,
+    /// The revoked request's id (hex SHA-256 of the signed request).
+    request_id: String,
     expires_at_unix: i64,
 }
 
-/// Revoked approvals (by approver key binding) backed by a JSONL append log,
-/// so the set survives service restarts. Expired entries are dropped (and
-/// the file compacted) on load.
+/// Revoked requests (by request id) backed by a JSONL append log, so the
+/// set survives service restarts. Expired entries are dropped (and the file
+/// compacted) on load.
 #[derive(Clone)]
 pub struct PersistentRevocationStore {
     inner: Arc<Mutex<StoreInner>>,
@@ -253,17 +235,17 @@ impl PersistentRevocationStore {
                 .filter(|l| !l.is_empty())
                 .collect();
             for (idx, line) in lines.iter().enumerate() {
-                // Logs from before key-binding revocation keyed on signature
-                // hex, which no longer matches anything. Refuse rather than
-                // silently dropping them — even as the last line, where the
-                // torn-write tolerance below would otherwise swallow it.
+                // Older logs keyed revocations on approvals, which no longer
+                // name anything. Refuse rather than silently dropping them —
+                // even as the last line, where the torn-write tolerance
+                // below would otherwise swallow it.
                 if let Ok(serde_json::Value::Object(obj)) =
                     serde_json::from_str::<serde_json::Value>(line)
-                    && obj.contains_key("sig")
+                    && obj.get("v").and_then(|v| v.as_u64()) != Some(STORE_VERSION as u64)
                 {
                     return Err(format!(
-                        "'{}' is a pre-key-binding revocation log (line {}); archive it \
-                         and start a fresh one (see the upgrade notes in CONFIGURATION.md)",
+                        "'{}' is a revocation log from an older version of Remonce (line {}); \
+                         archive it and start a fresh one (see the upgrade notes in CONFIGURATION.md)",
                         path.display(),
                         idx + 1
                     ));
@@ -291,7 +273,7 @@ impl PersistentRevocationStore {
                 if entry.expires_at_unix <= now {
                     continue;
                 }
-                let slot = map.entry(entry.key).or_insert(entry.expires_at_unix);
+                let slot = map.entry(entry.request_id).or_insert(entry.expires_at_unix);
                 if *slot < entry.expires_at_unix {
                     *slot = entry.expires_at_unix;
                 }
@@ -311,7 +293,8 @@ impl PersistentRevocationStore {
         let mut out = String::new();
         for (key, expires_at_unix) in &inner.map {
             let line = serde_json::to_string(&StoredRevocation {
-                key: key.clone(),
+                v: STORE_VERSION,
+                request_id: key.clone(),
                 expires_at_unix: *expires_at_unix,
             })
             .map_err(|e| format!("Serialize error: {e}"))?;
@@ -338,7 +321,8 @@ impl PersistentRevocationStore {
         // must not claim the revocation exists (a retry would short-circuit
         // above and the revocation would vanish on restart).
         let line = serde_json::to_string(&StoredRevocation {
-            key: key.to_string(),
+            v: STORE_VERSION,
+            request_id: key.to_string(),
             expires_at_unix,
         })
         .map_err(|e| format!("Serialize error: {e}"))?;
@@ -380,7 +364,7 @@ pub struct ServiceState {
 
 #[derive(Serialize)]
 struct ErrorResponse {
-    error: String,
+    error: &'static str,
 }
 
 impl IntoResponse for ErrorResponse {
@@ -395,8 +379,7 @@ pub struct RevokedStatus {
 }
 
 pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let config_str = std::fs::read_to_string("config.toml")?;
-    let config: Config = toml::from_str(&config_str)?;
+    let config: Config = crate::config::load("config.toml")?;
 
     let insecure_mode = crate::insecure::validate(&config, insecure)
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
@@ -452,7 +435,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/revoke", post(revoke_handler))
-        .route("/revoked/{key}", get(revoked_handler))
+        .route("/v2/revoked/{request_id}", get(revoked_handler))
         .with_state(state);
 
     let addr: SocketAddr = svc_config
@@ -482,77 +465,65 @@ async fn revoke_handler(
         trusted_roots: &state.trusted_roots,
         http_client: &state.http_client,
         hostname: &state.hostname,
-        min_approver_validity: Some(state.retention),
+        retention: Some(state.retention),
         allow_unknown_commands: true,
     };
-
     let verified = verify_and_authorize(&ctx, &req, &ip)
         .await
-        .map_err(|e| ErrorResponse { error: e.into() })?;
+        .map_err(|error| ErrorResponse { error })?;
     let revocation = &verified.authorized;
+    let audit_ctx = || crate::audit::AuditContext {
+        event_type: Some("request_revocation"),
+        command: Some(req.request.command.clone()),
+        request_id: Some(revocation.request_id.clone()),
+        ..Default::default()
+    };
 
-    let expiry = revocation
-        .approver
-        .usable_until(verified.approver_max_validity);
-    if expiry > time::OffsetDateTime::now_utc() {
-        state
-            .store
-            .revoke(&revocation.approver_key_binding, expiry.unix_timestamp())
-            .map_err(|e| {
-                crate::audit::log_audit(
-                    "error",
-                    format!("Failed to persist revocation: {}", e),
-                    revocation.revoker.username.clone(),
-                    ip.clone(),
-                    state.hostname.clone(),
-                    crate::audit::AuditContext {
-                        event_type: Some("approval_revocation"),
-                        command: Some(req.approver.command.clone()),
-                        ..Default::default()
-                    },
-                );
-                ErrorResponse {
-                    error: "Internal Error".into(),
-                }
-            })?;
-    }
+    state
+        .store
+        .revoke(&revocation.request_id, verified.keep_until.unix_timestamp())
+        .map_err(|e| {
+            crate::audit::log_audit(
+                "error",
+                format!("Failed to persist revocation: {e}"),
+                revocation.revoker.username.clone(),
+                ip.clone(),
+                state.hostname.clone(),
+                audit_ctx(),
+            );
+            ErrorResponse { error: "Internal Error" }
+        })?;
 
     crate::audit::log_audit(
         "allow",
         format!(
-            "Approval by '{}' revoked by '{}'{}",
-            revocation.approver.username,
+            "Request revoked by '{}'{}",
             revocation.revoker.username,
-            if revocation.self_revoked { " (self)" } else { "" }
+            if revocation.self_revoked { " (an approver)" } else { "" }
         ),
         revocation.revoker.username.clone(),
         ip,
         state.hostname.clone(),
-        crate::audit::AuditContext {
-            event_type: Some("approval_revocation"),
-            command: Some(req.approver.command.clone()),
-            operator_user: Some(revocation.approver.username.clone()),
-            ..Default::default()
-        },
+        audit_ctx(),
     );
 
     Ok(Json(crate::agent::RevocationResponse {
         status: "revoked".to_string(),
-        message: "Approval revoked on revocation service".to_string(),
+        message: "Request revoked on the revocation service".to_string(),
     }))
 }
 
 async fn revoked_handler(
     State(state): State<ServiceState>,
-    Path(key): Path<String>,
+    Path(request_id): Path<String>,
 ) -> Result<Json<RevokedStatus>, (axum::http::StatusCode, &'static str)> {
-    // A key binding is a lowercase hex SHA-256. Rejecting anything else
+    // A request id is a lowercase hex SHA-256. Rejecting anything else
     // keeps a malformed query from ever reading as "not revoked".
-    if key.len() != 64 || !key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return Err((axum::http::StatusCode::BAD_REQUEST, "Invalid key binding"));
+    if request_id.len() != 64 || !request_id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "Invalid request id"));
     }
     Ok(Json(RevokedStatus {
-        revoked: state.store.is_revoked(&key),
+        revoked: state.store.is_revoked(&request_id),
     }))
 }
 
@@ -626,7 +597,7 @@ mod tests {
     fn corrupt_middle_entry_is_rejected() {
         let path = temp_path("corrupt");
         let live = format!(
-            "{{\"key\":\"abc\",\"expires_at_unix\":{}}}",
+            "{{\"v\":2,\"request_id\":\"abc\",\"expires_at_unix\":{}}}",
             far_future()
         );
         std::fs::write(&path, format!("not json\n{live}\n")).unwrap();
@@ -639,24 +610,28 @@ mod tests {
         // A crash mid-append must not stop the service from starting.
         let path = temp_path("torn");
         let live = format!(
-            "{{\"key\":\"abc\",\"expires_at_unix\":{}}}",
+            "{{\"v\":2,\"request_id\":\"abc\",\"expires_at_unix\":{}}}",
             far_future()
         );
-        std::fs::write(&path, format!("{live}\n{{\"key\":\"de")).unwrap();
+        std::fs::write(&path, format!("{live}\n{{\"v\":2,\"request_id\":\"de")).unwrap();
         let store = PersistentRevocationStore::load(path.clone()).unwrap();
         assert!(store.is_revoked("abc"));
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn old_format_log_refused() {
-        let path = temp_path("oldformat");
-        let old = format!("{{\"sig\":\"abc\",\"expires_at_unix\":{}}}", far_future());
-        let new = format!("{{\"key\":\"def\",\"expires_at_unix\":{}}}", far_future());
-        std::fs::write(&path, format!("{old}\n{new}\n")).unwrap();
-        let err = PersistentRevocationStore::load(path.clone()).err().unwrap();
-        assert!(err.contains("pre-key-binding"), "{err}");
-        let _ = std::fs::remove_file(path);
+    fn older_log_formats_refused() {
+        // Both earlier formats: keyed on approver signature, then on
+        // approver key binding.
+        for old_key in ["sig", "key"] {
+            let path = temp_path("oldformat");
+            let old = format!("{{\"{old_key}\":\"abc\",\"expires_at_unix\":{}}}", far_future());
+            let new = format!("{{\"v\":2,\"request_id\":\"def\",\"expires_at_unix\":{}}}", far_future());
+            std::fs::write(&path, format!("{old}\n{new}\n")).unwrap();
+            let err = PersistentRevocationStore::load(path.clone()).err().unwrap();
+            assert!(err.contains("older version"), "{err}");
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -664,7 +639,7 @@ mod tests {
         // A one-line old log is also the "last line"; it must not be
         // silently dropped by the torn-write tolerance.
         let path = temp_path("oldsingle");
-        let old = format!("{{\"sig\":\"abc\",\"expires_at_unix\":{}}}", far_future());
+        let old = format!("{{\"key\":\"abc\",\"expires_at_unix\":{}}}", far_future());
         std::fs::write(&path, format!("{old}\n")).unwrap();
         assert!(PersistentRevocationStore::load(path.clone()).is_err());
         let _ = std::fs::remove_file(path);

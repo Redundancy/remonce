@@ -103,17 +103,18 @@ The backend is written in **Rust** using `Axum`.
 
 Authorization logic is handled by **OPA** using Rego.
 
--   **Modify Policy**: Edit `policy/authz.rego`.
--   **Apply Changes**: The `start_services.bat` script runs OPA with `--watch policy`. Changes to `.rego` files are **automatically reloaded** by OPA. You do not need to restart anything.
+-   **Modify Policy**: Edit `policy/authz.rego`, the shared helper `policy/lib.rego`, or the per-command requirement documents in `policy/requirements.json`.
+-   **Apply Changes**: The `start_services.bat` script runs OPA with `--watch policy`. Changes to `.rego` and `.json` files are **automatically reloaded** by OPA. You do not need to restart anything; agents fetch requirements for each catalog request.
+-   **Test**: `bin\opa.exe test policy policy_test -v`. The tests live outside `policy/` so the served policy doesn't include them.
 
 ## Authentication Flow (Local)
 
 1.  Visit [http://localhost:8080](http://localhost:8080).
 2.  You will be redirected to Vault for login.
-    -   **Username**: `webapp`
-    -   **Password**: *See `vault_setup.tf` or Terraform output (commonly `password` or similar in dev setups)*.
-3.  Upon success, you are redirected back to the `remonce` Commands page. This login uses the *viewer* client and only lets you browse.
-4.  Every signature (Sign, Co-sign, Revoke) sends you back to Vault to log in again: each gets its own login to the *signing* client and a one-time key. Both client IDs are written to `config.toml` by `configure_local.ps1`.
+    -   **Username**: `webapp` (a second user, `webapp2`, lets you try commands that need two approvals, such as `ping-pair`)
+    -   **Password**: the `app_user_password` that `configure_local.ps1` passes to Terraform (both users share it).
+3.  Upon success, you are redirected back to the `remonce` Commands page. This login uses the *viewer* client: it lets you browse and identifies you when you execute.
+4.  Every signature (Approve, Revoke) sends you back to Vault to log in again: each gets its own login to the *signing* client and a one-time key. Both client IDs are written to `config.toml` by `configure_local.ps1`. To add a second approval, approve as `webapp`, then approve the result again logged in as `webapp2`.
 
 ## Troubleshooting
 

@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{title}} · Remonce</title>
-<link rel="stylesheet" href="/static/remonce.css?v=2">
+<link rel="stylesheet" href="/static/remonce.css?v=3">
 </head>
-<body data-page="{{page}}" data-agent-url="{{agent_url}}">
+<body data-page="{{page}}" data-agent-url="{{agent_url}}" data-signer-host="{{hostname}}">
 <div class="app">
   <aside class="sidebar">
     <a class="brand" href="/ui">
@@ -65,6 +65,7 @@
       <div class="agent-field" title="The agent this page executes on, streams from and revokes on">
         <label for="agent-url">Agent</label>
         <input id="agent-url" list="agent-urls" spellcheck="false" autocomplete="off">
+        <span id="agent-where" class="agent-where" hidden></span>
         <datalist id="agent-urls">{{agent_options}}</datalist>
       </div>
     </header>
@@ -74,6 +75,6 @@
     </main>
   </div>
 </div>
-<script src="/static/app.js?v=2"></script>
+<script src="/static/app.js?v=3"></script>
 </body>
 </html>

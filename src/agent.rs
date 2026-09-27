@@ -84,25 +84,39 @@ fn parse_time_bound(
 #[derive(Serialize)]
 pub struct ExecutionResponse {
     pub status: String,
+    /// The execution id: the client streams the run's log by it.
     pub message: String,
+    pub request_id: String,
+    /// When the run started (RFC 3339).
     pub execution_time: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ErrorResponse {
+    #[serde(skip)]
+    status: axum::http::StatusCode,
     error: String,
+}
+
+impl ErrorResponse {
+    fn new(status: axum::http::StatusCode, error: impl Into<String>) -> Self {
+        Self { status, error: error.into() }
+    }
+
+    fn bad(error: impl Into<String>) -> Self {
+        Self::new(axum::http::StatusCode::BAD_REQUEST, error)
+    }
 }
 
 impl IntoResponse for ErrorResponse {
     fn into_response(self) -> Response {
-        (axum::http::StatusCode::BAD_REQUEST, Json(self)).into_response()
+        (self.status, Json(self)).into_response()
     }
 }
 
 pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load Config (Reuse web::Config for simplicity)
-    let config_str = std::fs::read_to_string("config.toml")?;
-    let config: Config = toml::from_str(&config_str)?;
+    let config: Config = crate::config::load("config.toml")?;
 
     let insecure_mode = crate::insecure::validate(&config, insecure)
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
@@ -133,9 +147,8 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Loaded {} trusted TSA roots", trusted_roots.len());
 
     if config.oidc.viewer_client_id.is_none() {
-        tracing::warn!(
-            "oidc.viewer_client_id is not set: file and execution-log viewing is disabled on this agent"
-        );
+        return Err("oidc.viewer_client_id must be set: executors, file and log viewing, and the command catalog                     all authenticate with viewer-client logins"
+            .into());
     }
 
     let hostname = hostname::get()
@@ -189,6 +202,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Router::new()
         .route("/execute", post(execute_handler))
         .route("/revoke", post(revoke_handler))
+        .route("/api/commands", get(catalog_handler))
         .route("/stream/{id}", get(stream_logs_handler))
         .route("/api/files", get(list_files_handler))
         .route("/api/files/stream", get(stream_file_handler))
@@ -224,424 +238,328 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Replace control characters so a value can't break the log's line
+/// structure (e.g. forge an `--- EXIT ---` trailer through a username).
+fn sanitize_log_field(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+fn claims_username(claims: &serde_json::Value) -> String {
+    claims
+        .get("username")
+        .or_else(|| claims.get("sub"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn rfc3339(t: time::OffsetDateTime) -> String {
+    t.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown_time".to_string())
+}
+
+/// The block written at the top of every execution log. The run page reads
+/// these lines back, so every field is sanitized.
+#[allow(clippy::too_many_arguments)]
+fn log_header(
+    execution_id: &str,
+    request_id: &str,
+    approvers: &[crate::security::SignerIdentity],
+    executor: &str,
+    started: &str,
+    command: &str,
+    executable: &str,
+    args: &[String],
+) -> String {
+    let mut h = String::from("--- EXECUTION LOG ---\n");
+    h += &format!("ID: {}\n", sanitize_log_field(execution_id));
+    h += &format!("Request: {}\n", sanitize_log_field(request_id));
+    for a in approvers {
+        h += &format!(
+            "Approver: {} ({})\n",
+            sanitize_log_field(&a.username),
+            rfc3339(a.signed_at)
+        );
+    }
+    h += &format!("Executor: {}\n", sanitize_log_field(executor));
+    h += &format!("Time: {}\n", sanitize_log_field(started));
+    h += &format!("Command: {}\n", sanitize_log_field(command));
+    h += &format!(
+        "Executable: {}\n",
+        sanitize_log_field(&format!("{} {}", executable, args.join(" ")))
+    );
+    h += "---------------------\n";
+    h
+}
+
+/// Command-level checks that need no policy: this host is a target, the
+/// time bounds hold, and the parameters validate. Returns the rendered
+/// argv, or (audit reason, client message).
+fn check_command(
+    command_json: &serde_json::Value,
+    cmd_config: &crate::config::CommandConfig,
+    hostname: &str,
+    now: time::OffsetDateTime,
+) -> Result<Vec<String>, (String, String)> {
+    let targets: Vec<String> = match command_json.get("target_machines").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        None => {
+            return Err((
+                "Missing mandatory 'target_machines' field".into(),
+                "Missing Target Restriction".into(),
+            ));
+        }
+    };
+    if !targets.iter().any(|t| t == hostname) {
+        return Err((
+            format!("Hostname '{hostname}' not in target list {targets:?}"),
+            format!("Target Machine Mismatch ({hostname} not in {targets:?})"),
+        ));
+    }
+
+    // A time bound that is present but unparsable must deny, not vanish:
+    // the approvers believe the command is time-limited.
+    let (not_before, not_after) = match (
+        parse_time_bound(command_json, "not_before"),
+        parse_time_bound(command_json, "not_after"),
+    ) {
+        (Ok(nbf), Ok(naf)) => (nbf, naf),
+        (Err(field), _) | (_, Err(field)) => {
+            return Err((
+                format!("Malformed '{field}' (expected an RFC 3339 string)"),
+                "Invalid Time Constraint".into(),
+            ));
+        }
+    };
+    if let Some(nbf) = not_before
+        && now < nbf
+    {
+        return Err((
+            format!("Command not yet valid (nbf: {nbf}, now: {now})"),
+            format!("Command Not Yet Valid (Starts at {nbf})"),
+        ));
+    }
+    if let Some(exp) = not_after
+        && now > exp
+    {
+        return Err((
+            format!("Command expired (not_after: {exp}, now: {now})"),
+            format!("Command Expired (Expired at {exp})"),
+        ));
+    }
+
+    // Validate signed params against the declarations and render the args
+    // template. Fail-closed: any violation rejects the execution.
+    let resolved = crate::params::validate_params(cmd_config, command_json.get("params"))
+        .map_err(|e| (format!("Parameter validation failed: {e}"), "Invalid Parameters".to_string()))?;
+    crate::params::render_args(&cmd_config.args, &resolved)
+        .map_err(|e| (format!("Argument rendering failed: {e}"), "Invalid Parameters".to_string()))
+}
+
+/// Run a request. In order: who is executing (a viewer login session,
+/// always — never anonymous), the bundle, the command, every approval, the
+/// command's own constraints, revocation, policy (published requirements +
+/// executor), and replay — last, so a rejection earlier doesn't use up the
+/// request.
 async fn execute_handler(
     State(state): State<AgentState>,
     ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
-    Json(bundle): Json<crate::security::ExecutionBundle>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
 ) -> Result<Json<ExecutionResponse>, ErrorResponse> {
-    use crate::audit::AuditContext;
+    use crate::audit::{AuditContext, AuditSigner};
+    use axum::http::StatusCode;
 
     let ip = addr.ip_string();
     let hostname = state.hostname.clone();
-    let command_json = bundle.approver.command.clone();
+    let audit = |decision: &'static str, reason: String, user: &str, mut ctx: AuditContext| {
+        ctx.event_type.get_or_insert("command_execution");
+        crate::audit::log_audit(decision, reason, user.to_string(), ip.clone(), hostname.clone(), ctx)
+    };
 
-    let audit_ctx_basic = || AuditContext {
+    // 1. The executor: identified by their viewer login.
+    let Some(token) = bearer_token(&headers) else {
+        audit("deny", "No executor token".into(), "unauthenticated", AuditContext::default());
+        return Err(ErrorResponse::new(StatusCode::UNAUTHORIZED, "Log in to execute: missing bearer token"));
+    };
+    let executor_claims = verify_query_token(&token, &state).map_err(|(status, msg)| {
+        audit("deny", format!("Executor token rejected: {msg}"), "unauthenticated", AuditContext::default());
+        ErrorResponse::new(status, msg)
+    })?;
+    let executor = crate::opa::Identity {
+        username: claims_username(&executor_claims),
+        claims: executor_claims,
+    };
+    let user = executor.username.clone();
+
+    // 2. The bundle.
+    let bundle: crate::security::RequestBundle = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            let old_format = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .is_some_and(|v| v.get("approver").is_some());
+            let msg = if old_format {
+                "This bundle was made by an older version of Remonce; ask for a new request".to_string()
+            } else {
+                format!("Invalid bundle: {e}")
+            };
+            audit("deny", msg.clone(), &user, AuditContext::default());
+            return Err(ErrorResponse::bad(msg));
+        }
+    };
+    let command_json = bundle.command.clone();
+    let basic_ctx = || AuditContext {
         command: Some(command_json.clone()),
         ..Default::default()
     };
 
-    tracing::info!("Verifying execution bundle");
-
-    // 1. Resolve the command config up front so per-command validity windows
-    //    can feed into `verify_execution`.
-    let command_name = match command_json.get("command").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
-            crate::audit::log_audit(
-                "deny",
-                "Invalid command format: Missing 'command' field".into(),
-                "unauthenticated".into(),
-                ip.clone(),
-                hostname.clone(),
-                audit_ctx_basic(),
-            );
-            return Err(ErrorResponse {
-                error: "Invalid Request".into(),
-            });
-        }
+    // 3. A command this agent runs, with a UUID execution id.
+    let Some(command_name) = command_json.get("command").and_then(|v| v.as_str()).map(String::from) else {
+        audit("deny", "Missing 'command' field".into(), &user, basic_ctx());
+        return Err(ErrorResponse::bad("Invalid Request"));
+    };
+    let Some(cmd_config) = state.config.commands.iter().find(|c| c.name == command_name).cloned() else {
+        audit("deny", format!("Command '{command_name}' not configured here"), &user, basic_ctx());
+        return Err(ErrorResponse::bad(format!("This agent has no command '{command_name}'")));
+    };
+    // The id names the log file, so only a canonical UUID may reach the path.
+    let Some(execution_id) = command_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .map(|u| u.to_string())
+    else {
+        audit("deny", "Request id is not a UUID".into(), &user, basic_ctx());
+        return Err(ErrorResponse::bad("The request's id must be a UUID"));
     };
 
-    let cmd_config = match state.config.commands.iter().find(|c| c.name == command_name) {
-        Some(c) => c.clone(),
-        None => {
-            crate::audit::log_audit(
-                "deny",
-                format!("Command '{}' not found in agent configuration", command_name),
-                "unauthenticated".into(),
-                ip.clone(),
-                hostname.clone(),
-                audit_ctx_basic(),
-            );
-            return Err(ErrorResponse {
-                error: "Invalid Request".into(),
-            });
-        }
-    };
-
-    let operator_max = cmd_config.operator_max_validity_or_default();
-    let approver_max = cmd_config.approver_max_validity_or_default();
-
-    // 2. Cryptographic + freshness + claim-predicate verification.
+    // 4. Every approval: genuine, fresh, from different people.
+    let validity = cmd_config.approval_validity_or_default();
     let verifier_config = crate::security::VerifierConfig {
         client_id: state.config.oidc.client_id.clone(),
         issuer_url: state.config.oidc.issuer_url.clone(),
         jwks: state.jwks.clone(),
         trusted_roots: state.trusted_roots.clone(),
-        approver_max_validity: approver_max,
-        operator_max_validity: operator_max,
+        approval_validity: validity,
     };
-
-    let authz = match crate::security::verify_execution(&bundle, &verifier_config) {
-        Ok(a) => a,
+    let now = time::OffsetDateTime::now_utc();
+    let verified = match crate::security::verify_request(&bundle, &verifier_config, now) {
+        Ok(v) => v,
         Err(e) => {
-            crate::audit::log_audit(
-                "deny",
-                format!("Verification failed: {}", e),
-                "unauthenticated".into(),
-                ip.clone(),
-                hostname.clone(),
-                audit_ctx_basic(),
-            );
-            return Err(ErrorResponse {
-                error: "Verification Failed".into(),
-            });
+            use crate::security::ValidationError as V;
+            audit("deny", format!("Verification failed: {e}"), &user, basic_ctx());
+            let public = match &e {
+                V::NoApprovals
+                | V::TooManyApprovals { .. }
+                | V::ApprovalStale { .. }
+                | V::DuplicateApprover { .. } => e.to_string(),
+                V::InApproval { index, .. } => format!("Approval #{index} could not be verified"),
+                _ => "Verification Failed".to_string(),
+            };
+            return Err(ErrorResponse::bad(public));
         }
     };
-
-    let approver_user = authz.approver.username.clone();
-    let operator_user = authz.operator.username.clone();
-    let approver_signed_at = authz
-        .approver
-        .signed_at
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "unknown_time".to_string());
-    let operator_signed_at = authz
-        .operator
-        .signed_at
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "unknown_time".to_string());
-
+    let request_id = verified.request_id.clone();
+    let approvers = verified.approvers;
+    let audit_approvers: Vec<AuditSigner> = approvers
+        .iter()
+        .map(|a| AuditSigner {
+            username: a.username.clone(),
+            sub: a.subject().to_string(),
+            signed_at: rfc3339(a.signed_at),
+        })
+        .collect();
     let full_ctx = || AuditContext {
-        signed_at: Some(approver_signed_at.clone()),
         command: Some(command_json.clone()),
-        operator_user: Some(operator_user.clone()),
-        operator_signed_at: Some(operator_signed_at.clone()),
-        self_executed: Some(authz.self_executed),
+        request_id: Some(request_id.clone()),
+        approvers: Some(audit_approvers.clone()),
         ..Default::default()
     };
 
-    // 3. Revocation check — the approval may have been revoked after it was
-    //    issued. Keyed on the approver's key binding (not signature bytes,
-    //    which are malleable). Local cache first, then the central
-    //    revocation service (fail-closed) if one is configured.
-    if state.revocations.is_revoked(&authz.approver.key_binding) {
-        crate::audit::log_audit(
-            "deny",
-            "Approval has been revoked".into(),
-            approver_user.clone(),
-            ip.clone(),
-            hostname.clone(),
-            full_ctx(),
-        );
-        return Err(ErrorResponse {
-            error: "Approval Revoked".into(),
-        });
-    }
-
-    if let Some((client, base)) = &state.revocation_service {
-        match check_revocation_service(client, base, &authz.approver.key_binding).await {
-            Ok(false) => {}
-            Ok(true) => {
-                crate::audit::log_audit(
-                    "deny",
-                    "Approval has been revoked (revocation service)".into(),
-                    approver_user.clone(),
-                    ip.clone(),
-                    hostname.clone(),
-                    full_ctx(),
-                );
-                return Err(ErrorResponse {
-                    error: "Approval Revoked".into(),
-                });
-            }
-            Err(e) => {
-                // Fail-closed: a configured revocation service must be
-                // available, otherwise we cannot know the approval is live.
-                crate::audit::log_audit(
-                    "error",
-                    format!("Revocation service check failed: {}", e),
-                    approver_user.clone(),
-                    ip.clone(),
-                    hostname.clone(),
-                    full_ctx(),
-                );
-                return Err(ErrorResponse {
-                    error: "Revocation Check Failed".into(),
-                });
-            }
-        }
-    }
-
-    // 4. Command-level constraints (target machines, not_before/not_after,
-    //    declared parameters). The replay check comes last, just before
-    //    spawning, so a rejection here doesn't burn the signature.
-    let now = time::OffsetDateTime::now_utc();
-
-    let target_machines = command_json
-        .get("target_machines")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        });
-
-    // A time bound that is present but unparsable must deny, not vanish:
-    // the approver believes the command is time-limited.
-    let (not_before, not_after) = match (
-        parse_time_bound(&command_json, "not_before"),
-        parse_time_bound(&command_json, "not_after"),
-    ) {
-        (Ok(nbf), Ok(naf)) => (nbf, naf),
-        (Err(field), _) | (_, Err(field)) => {
-            crate::audit::log_audit(
-                "deny",
-                format!("Malformed '{}' (expected an RFC 3339 string)", field),
-                approver_user.clone(),
-                ip.clone(),
-                hostname.clone(),
-                full_ctx(),
-            );
-            return Err(ErrorResponse {
-                error: "Invalid Time Constraint".into(),
-            });
-        }
-    };
-
-    let targets = match target_machines {
-        Some(t) => t,
-        None => {
-            crate::audit::log_audit(
-                "deny",
-                "Missing mandatory 'target_machines' field".into(),
-                approver_user.clone(),
-                ip.clone(),
-                hostname.clone(),
-                full_ctx(),
-            );
-            return Err(ErrorResponse {
-                error: "Missing Target Restriction".into(),
-            });
-        }
-    };
-
-    if !targets.contains(&hostname) {
-        crate::audit::log_audit(
-            "deny",
-            format!("Hostname '{}' not in target list '{:?}'", hostname, targets),
-            approver_user.clone(),
-            ip.clone(),
-            hostname.clone(),
-            full_ctx(),
-        );
-        return Err(ErrorResponse {
-            error: format!("Target Machine Mismatch ({} not in {:?})", hostname, targets),
-        });
-    }
-
-    if let Some(nbf) = not_before {
-        if now < nbf {
-            crate::audit::log_audit(
-                "deny",
-                format!("Command not yet valid (nbf: {}, now: {})", nbf, now),
-                approver_user.clone(),
-                ip.clone(),
-                hostname.clone(),
-                full_ctx(),
-            );
-            return Err(ErrorResponse {
-                error: format!("Command Not Yet Valid (Starts at {})", nbf),
-            });
-        }
-    }
-
-    if let Some(exp) = not_after {
-        if now > exp {
-            crate::audit::log_audit(
-                "deny",
-                format!("Command expired (not_after: {}, now: {})", exp, now),
-                approver_user.clone(),
-                ip.clone(),
-                hostname.clone(),
-                full_ctx(),
-            );
-            return Err(ErrorResponse {
-                error: format!("Command Expired (Expired at {})", exp),
-            });
-        }
-    }
-
-    // Validate signed params against the command's declarations and render
-    // the args template. Fail-closed: any violation rejects the execution.
-    let resolved_params =
-        match crate::params::validate_params(&cmd_config, command_json.get("params")) {
-            Ok(r) => r,
-            Err(e) => {
-                crate::audit::log_audit(
-                    "deny",
-                    format!("Parameter validation failed: {}", e),
-                    approver_user.clone(),
-                    ip.clone(),
-                    hostname.clone(),
-                    full_ctx(),
-                );
-                return Err(ErrorResponse {
-                    error: "Invalid Parameters".into(),
-                });
-            }
-        };
-
-    let rendered_args = match crate::params::render_args(&cmd_config.args, &resolved_params) {
-        Ok(a) => a,
-        Err(e) => {
-            crate::audit::log_audit(
-                "deny",
-                format!("Argument rendering failed: {}", e),
-                approver_user.clone(),
-                ip.clone(),
-                hostname.clone(),
-                full_ctx(),
-            );
-            return Err(ErrorResponse {
-                error: "Invalid Parameters".into(),
-            });
-        }
-    };
-
-    // 5. OPA authorization with both identities.
-    let opa_input = crate::opa::OpaInput {
-        action: "execute".into(),
-        command: command_json.clone(),
-        approver: crate::opa::SignerContext {
-            username: approver_user.clone(),
-            claims: authz.approver.claims.clone(),
-            signed_at: approver_signed_at.clone(),
-        },
-        operator: crate::opa::SignerContext {
-            username: operator_user.clone(),
-            claims: authz.operator.claims.clone(),
-            signed_at: operator_signed_at.clone(),
-        },
-        self_executed: authz.self_executed,
-        host: hostname.clone(),
-    };
-
-    let decision = crate::opa::check_authorization(
-        &state.http_client,
-        &state.config.opa_url,
-        &cmd_config.opa_rule,
-        opa_input,
-    )
-    .await
-    .map_err(|e| {
-        crate::audit::log_audit(
-            "error",
-            format!("OPA evaluation failed: {}", e),
-            approver_user.clone(),
-            ip.clone(),
-            hostname.clone(),
-            full_ctx(),
-        );
-        ErrorResponse {
-            error: "Internal Error".into(),
-        }
+    // 5. The command's own constraints.
+    let rendered_args = check_command(&command_json, &cmd_config, &hostname, now).map_err(|(reason, public)| {
+        audit("deny", reason, &user, full_ctx());
+        ErrorResponse::bad(public)
     })?;
 
+    // 6. Revocation: this agent's list, then the central service (fail-closed).
+    if state.revocations.is_revoked(&request_id) {
+        audit("deny", "Request has been revoked".into(), &user, full_ctx());
+        return Err(ErrorResponse::new(StatusCode::FORBIDDEN, "Request Revoked"));
+    }
+    if let Some((client, base)) = &state.revocation_service {
+        match check_revocation_service(client, base, &request_id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                audit("deny", "Request has been revoked (revocation service)".into(), &user, full_ctx());
+                return Err(ErrorResponse::new(StatusCode::FORBIDDEN, "Request Revoked"));
+            }
+            Err(e) => {
+                audit("error", format!("Revocation service check failed: {e}"), &user, full_ctx());
+                return Err(ErrorResponse::new(StatusCode::SERVICE_UNAVAILABLE, "Revocation Check Failed"));
+            }
+        }
+    }
+
+    // 7. Policy: are these approvers enough, and may this person execute?
+    let input = crate::opa::OpaInput::Execute {
+        command: command_json.clone(),
+        request_id: request_id.clone(),
+        approvers: approvers
+            .iter()
+            .map(|a| crate::opa::Signer {
+                username: a.username.clone(),
+                claims: a.claims.clone(),
+                signed_at: rfc3339(a.signed_at),
+            })
+            .collect(),
+        executor,
+        host: hostname.clone(),
+    };
+    let decision = crate::opa::check_authorization(&state.http_client, &state.config.opa_url, &cmd_config.opa_rule, &input)
+        .await
+        .map_err(|e| {
+            audit("error", format!("OPA evaluation failed: {e}"), &user, full_ctx());
+            ErrorResponse::new(StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable")
+        })?;
     if !decision.allow {
-        crate::audit::log_audit(
-            "deny",
-            decision.reason.clone(),
-            approver_user.clone(),
-            ip.clone(),
-            hostname.clone(),
-            full_ctx(),
-        );
-        return Err(ErrorResponse {
-            error: "Authorization Denied".into(),
-        });
+        audit("deny", decision.reason.clone(), &user, full_ctx());
+        return Err(ErrorResponse::new(
+            StatusCode::FORBIDDEN,
+            format!("Authorization Denied: {}", decision.reason),
+        ));
     }
 
-    // 6. Replay check — executor key binding (operator if delegated, else
-    //    approver). The entry must outlive every way the signature could
-    //    still pass freshness, which is bounded from the token's `iat`.
-    let replay_ttl: std::time::Duration = (authz.operator.usable_until(operator_max)
-        - time::OffsetDateTime::now_utc())
-    .try_into()
-    .unwrap_or(operator_max)
-    .max(operator_max);
-    if state
-        .replay_cache
-        .check_and_insert(&authz.executor_key_binding, replay_ttl)
-        .is_err()
-    {
-        crate::audit::log_audit(
-            "deny",
-            "Replay detected: executor signature already used".into(),
-            approver_user.clone(),
-            ip.clone(),
-            hostname.clone(),
-            full_ctx(),
-        );
-        return Err(ErrorResponse {
-            error: "Replay Detected".into(),
-        });
+    // 8. Replay: one run per request. Remembered past every approval that
+    //    could exist now; released if we fail before the process starts.
+    let ttl = crate::security::replay_ttl(now, &approvers, validity);
+    if state.replay_cache.check_and_insert(&request_id, ttl).is_err() {
+        audit("deny", "Replay: request already executed".into(), &user, full_ctx());
+        return Err(ErrorResponse::new(
+            StatusCode::CONFLICT,
+            "This request has already been executed on this agent",
+        ));
     }
-    // Released again if we fail before the process actually starts.
-    let release_replay = || state.replay_cache.release(&authz.executor_key_binding);
+    let release_replay = || state.replay_cache.release(&request_id);
 
-    // Preserve legacy locals used below.
-    let authenticated_user = approver_user.clone();
-    let gen_time_str = approver_signed_at.clone();
-    let signed_at_str = Some(gen_time_str.clone());
-    let req_command = command_json.clone();
+    // 9. Run it.
+    let executable = cmd_config.executable.clone().unwrap_or_else(|| command_name.clone());
+    let started = rfc3339(time::OffsetDateTime::now_utc());
 
-    // 5. Execute Command
-    let executable = cmd_config
-        .executable
-        .clone()
-        .unwrap_or_else(|| command_name.to_string());
-
-    // execution_id forms the log filename, so we must reject anything that
-    // isn't a canonical UUID — otherwise a signed payload could path-traverse
-    // out of `logs_dir`.
-    let mut execution_id = req_command
-        .get("id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok().map(|u| u.to_string()))
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-    // Prepare Log File
     let logs_dir = PathBuf::from(&state.config.logs_dir);
     if !logs_dir.exists() {
         tokio::fs::create_dir_all(&logs_dir).await.map_err(|e| {
             release_replay();
-            crate::audit::log_audit(
-                "error",
-                format!("Failed to create logs dir: {}", e),
-                authenticated_user.clone(),
-                ip.clone(),
-                hostname.clone(),
-                full_ctx(),
-            );
-            ErrorResponse {
-                error: "Internal Error".into(),
-            }
+            audit("error", format!("Failed to create logs dir: {e}"), &user, full_ctx());
+            ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error")
         })?;
     }
 
-    // `create_new`: one approval can legitimately run several times (e.g.
-    // multiple operator cosigns), and each run must keep its own log. If the
-    // signed id is taken, fall back to a fresh one.
+    // `create_new`: a request runs once per agent, but after the replay
+    // entry lapses fresh approvals of the same request can run it again,
+    // and each run keeps its own log. If the signed id is taken, fall back
+    // to a fresh one.
     let open_new = |path: PathBuf| async move {
         tokio::fs::OpenOptions::new()
             .write(true)
@@ -649,48 +567,34 @@ async fn execute_handler(
             .open(path)
             .await
     };
-    let mut log_path = logs_dir.join(format!("{}.log", execution_id));
-    let first_try = open_new(log_path.clone()).await;
-    let log_result = match first_try {
+    let mut execution_id = execution_id;
+    let mut log_path = logs_dir.join(format!("{execution_id}.log"));
+    let log_result = match open_new(log_path.clone()).await {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             execution_id = uuid::Uuid::new_v4().to_string();
-            log_path = logs_dir.join(format!("{}.log", execution_id));
+            log_path = logs_dir.join(format!("{execution_id}.log"));
             open_new(log_path.clone()).await
         }
         other => other,
     };
     let mut log_file = log_result.map_err(|e| {
         release_replay();
-        crate::audit::log_audit(
-            "error",
-            format!("Failed to create log file: {}", e),
-            authenticated_user.clone(),
-            ip.clone(),
-            hostname.clone(),
-            full_ctx(),
-        );
-        ErrorResponse {
-            error: "Internal Error".into(),
-        }
+        audit("error", format!("Failed to create log file: {e}"), &user, full_ctx());
+        ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error")
     })?;
 
-    tracing::info!(
-        "Executing command '{}' with ID {}",
-        command_name,
-        execution_id
-    );
+    tracing::info!("Executing command '{}' with ID {}", command_name, execution_id);
 
-    // Write Audit Header
-    let header = format!(
-        "--- EXECUTION LOG ---\nID: {}\nUser: {}\nTime: {}\nCommand: {}\nExecutable: {} {}\n---------------------\n",
-        execution_id,
-        authenticated_user,
-        gen_time_str,
-        command_name,
-        executable,
-        rendered_args.join(" ")
+    let header = log_header(
+        &execution_id,
+        &request_id,
+        &approvers,
+        &user,
+        &started,
+        &command_name,
+        &executable,
+        &rendered_args,
     );
-
     if let Err(e) = log_file.write_all(header.as_bytes()).await {
         tracing::error!("Failed to write header to log file: {}", e);
         // Non-critical, continue
@@ -716,17 +620,8 @@ async fn execute_handler(
 
     let mut child = spawn_cmd.spawn().map_err(|e| {
         release_replay();
-        crate::audit::log_audit(
-            "error",
-            format!("Failed to spawn command: {}", e),
-            authenticated_user.clone(),
-            ip.clone(),
-            hostname.clone(),
-            full_ctx(),
-        );
-        ErrorResponse {
-            error: "Execution Failed".into(),
-        }
+        audit("error", format!("Failed to spawn command: {e}"), &user, full_ctx());
+        ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Execution Failed")
     })?;
 
     // Pipe Output and enforce timeout in a background task.
@@ -837,21 +732,14 @@ async fn execute_handler(
         let _ = file_out.flush().await;
     });
 
-    crate::audit::log_audit(
-        "allow",
-        "Command Started".to_string(),
-        authenticated_user.clone(),
-        ip.clone(),
-        hostname.clone(),
-        full_ctx(),
-    );
-    let _ = signed_at_str;
+    audit("allow", "Command Started".to_string(), &user, full_ctx());
 
     Ok(Json(ExecutionResponse {
         status: "authorized".to_string(),
-        // Return the UUID here so client knows what to stream
-        message: execution_id.clone(),
-        execution_time: Some(gen_time_str),
+        // The execution id, which the client streams the log by.
+        message: execution_id,
+        request_id,
+        execution_time: Some(started),
     }))
 }
 
@@ -866,16 +754,17 @@ struct RevokedStatusResponse {
     revoked: bool,
 }
 
-/// Query the central revocation service for an approval's key binding.
-/// Any transport or protocol error is surfaced to the caller, which treats
-/// it as fatal (fail-closed).
+/// Ask the central revocation service whether a request is revoked. Any
+/// transport or protocol error — including a service that doesn't know the
+/// v2 path — is surfaced to the caller, which treats it as fatal
+/// (fail-closed).
 async fn check_revocation_service(
     client: &Client,
     base: &url::Url,
-    key_binding: &str,
+    request_id: &str,
 ) -> Result<bool, String> {
     let url = base
-        .join(&format!("revoked/{}", key_binding))
+        .join(&format!("v2/revoked/{request_id}"))
         .map_err(|e| e.to_string())?;
     let resp = client
         .get(url)
@@ -889,22 +778,21 @@ async fn check_revocation_service(
     Ok(status.revoked)
 }
 
-/// Revoke an approver bundle. The revoker submits the full approver bundle
-/// plus a fresh, nonce-bound attestation signing the domain-separated
-/// revocation payload. Authorized when the revoker is the original approver
-/// (same OIDC `sub`) or when OPA allows `action = "revoke"`. Idempotent.
-/// When a central revocation service is configured, the bundle is also
-/// forwarded there so the revocation takes effect estate-wide.
+/// Revoke (cancel) a request. The revoker submits the request with its
+/// approvals plus a fresh, nonce-bound attestation over the domain-separated
+/// revocation payload. Allowed when the revoker approved the request, or
+/// when OPA allows `action = "revoke"`. Idempotent. With a central
+/// revocation service configured, it is forwarded there too so it applies
+/// estate-wide.
 async fn revoke_handler(
     State(state): State<AgentState>,
     ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
     Json(req): Json<crate::security::RevocationBundle>,
 ) -> Result<Json<RevocationResponse>, ErrorResponse> {
-    use crate::audit::AuditContext;
+    use crate::audit::{AuditContext, AuditSigner};
 
     let ip = addr.ip_string();
     let hostname = state.hostname.clone();
-    let command_json = req.approver.command.clone();
 
     let ctx = crate::revocation::RevocationCtx {
         config: &state.config,
@@ -912,42 +800,43 @@ async fn revoke_handler(
         trusted_roots: &state.trusted_roots,
         http_client: &state.http_client,
         hostname: &hostname,
-        min_approver_validity: None,
+        retention: None,
         allow_unknown_commands: false,
     };
-
     let verified = crate::revocation::verify_and_authorize(&ctx, &req, &ip)
         .await
-        .map_err(|e| ErrorResponse { error: e.into() })?;
+        .map_err(ErrorResponse::bad)?;
     let revocation = &verified.authorized;
-
     let revoker_user = revocation.revoker.username.clone();
-    let approver_user = revocation.approver.username.clone();
 
     let revoke_ctx = || AuditContext {
-        event_type: Some("approval_revocation"),
-        command: Some(command_json.clone()),
-        operator_user: Some(approver_user.clone()),
+        event_type: Some("request_revocation"),
+        command: Some(req.request.command.clone()),
+        request_id: Some(revocation.request_id.clone()),
+        approvers: Some(
+            revocation
+                .approvers
+                .iter()
+                .map(|a| AuditSigner {
+                    username: a.username.clone(),
+                    sub: a.subject().to_string(),
+                    signed_at: rfc3339(a.signed_at),
+                })
+                .collect(),
+        ),
         ..Default::default()
     };
 
-    // Pin the revocation until the approval would have expired anyway
-    // (measured from its token's `iat`).
+    // Keep it until no approval of the request could still be valid.
     let now = time::OffsetDateTime::now_utc();
-    let expiry = revocation
-        .approver
-        .usable_until(verified.approver_max_validity);
-    if expiry > now {
-        let remaining: std::time::Duration =
-            (expiry - now).try_into().unwrap_or_default();
-        state
-            .revocations
-            .revoke(&revocation.approver_key_binding, remaining);
+    if verified.keep_until > now {
+        let remaining: std::time::Duration = (verified.keep_until - now).try_into().unwrap_or_default();
+        state.revocations.revoke(&revocation.request_id, remaining);
     }
 
     // Forward to the central revocation service so a single submission
     // covers the whole estate. The local pin above stands either way.
-    let mut message = "Approval revoked on this agent".to_string();
+    let mut message = "Request revoked on this agent".to_string();
     if let Some((client, base)) = &state.revocation_service {
         let forward = async {
             let url = base.join("revoke").map_err(|e| e.to_string())?;
@@ -965,29 +854,26 @@ async fn revoke_handler(
         if let Err(e) = forward {
             crate::audit::log_audit(
                 "error",
-                format!(
-                    "Revocation pinned locally but forwarding to revocation service failed: {}",
-                    e
-                ),
+                format!("Revocation pinned locally but forwarding to revocation service failed: {e}"),
                 revoker_user.clone(),
                 ip.clone(),
                 hostname.clone(),
                 revoke_ctx(),
             );
-            return Err(ErrorResponse {
-                error: "Revocation Service Unavailable (revoked on this agent only)".into(),
-            });
+            return Err(ErrorResponse::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Revocation Service Unavailable (revoked on this agent only)",
+            ));
         }
-        message = "Approval revoked on this agent and the revocation service".to_string();
+        message = "Request revoked on this agent and the revocation service".to_string();
     }
 
     crate::audit::log_audit(
         "allow",
         format!(
-            "Approval by '{}' revoked by '{}'{}",
-            approver_user,
+            "Request revoked by '{}'{}",
             revoker_user,
-            if revocation.self_revoked { " (self)" } else { "" }
+            if revocation.self_revoked { " (an approver)" } else { "" }
         ),
         revoker_user.clone(),
         ip.clone(),
@@ -999,6 +885,42 @@ async fn revoke_handler(
         status: "revoked".to_string(),
         message,
     }))
+}
+
+/// The command catalog: what can be requested here and what each command
+/// needs (published requirements from OPA). Viewer-token auth; policy
+/// decides who may see it.
+async fn catalog_handler(State(state): State<AgentState>, headers: axum::http::HeaderMap) -> Response {
+    use axum::http::StatusCode;
+    let Some(token) = bearer_token(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
+    };
+    if let Err((status, msg)) = verify_query_token(&token, &state) {
+        return (status, msg).into_response();
+    }
+    match crate::opa::allows_viewing(
+        &state.http_client,
+        &state.config.opa_url,
+        serde_json::json!({ "action": "view_docs", "jwt": token }),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return (StatusCode::FORBIDDEN, "Policy does not allow you to view commands").into_response();
+        }
+        Err(e) => {
+            tracing::warn!("OPA view_docs check failed: {e}");
+            return (StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable").into_response();
+        }
+    }
+    match crate::opa::fetch_requirements(&state.http_client, &state.config.opa_url).await {
+        Ok(published) => Json(crate::catalog::build(&state.config, &state.hostname, &published)).into_response(),
+        Err(e) => {
+            tracing::warn!("Fetching published requirements failed: {e}");
+            (StatusCode::SERVICE_UNAVAILABLE, "Could not load published requirements").into_response()
+        }
+    }
 }
 
 async fn stream_logs_handler(

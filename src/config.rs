@@ -112,9 +112,10 @@ pub struct RevocationServiceConfig {
     #[serde(default = "default_revocation_persist_path")]
     pub persist_path: String,
 
-    /// Minimum time a revocation is kept (counted from the revoked
-    /// approval's ID-token `iat`), whatever this service's own `[[commands]]` say. Must
-    /// be at least the longest `approver_max_validity` any agent allows.
+    /// Minimum time a revocation is kept (counted from the revocation, or the
+    /// request's latest approval if later), whatever this service's own
+    /// `[[commands]]` say. Must be at least the longest `approval_validity`
+    /// any agent allows.
     /// Default: 30 days.
     #[serde(default, with = "humantime_serde")]
     pub retention: Option<std::time::Duration>,
@@ -204,7 +205,7 @@ pub struct OidcConfig {
     /// Used for OIDC discovery (.well-known/openid-configuration).
     pub issuer_url: String,
 
-    /// The *signing* OIDC client. Every approval, cosign and revocation is
+    /// The *signing* OIDC client. Every approval and revocation is
     /// made with a fresh login to this client; agents only accept its tokens
     /// on the signing path, never as bearer credentials.
     pub client_id: String,
@@ -285,17 +286,11 @@ pub struct CommandConfig {
     /// Defaults to the agent's current working directory if not specified.
     pub cwd: Option<String>,
 
-    /// Maximum age of an approver's signature, measured from their TSA timestamp.
-    /// Controls how long a pre-signed command remains usable after the approver signs.
-    /// Defaults to 3 days if not specified.
+    /// How long each approval of a request stays usable, measured from the
+    /// approver's login. A request runs only while all of its approvals are
+    /// within this window. Defaults to 1 hour.
     #[serde(default, with = "humantime_serde")]
-    pub approver_max_validity: Option<std::time::Duration>,
-
-    /// Maximum age of the executing-signer's TSA timestamp. In delegated flows this
-    /// is the operator's co-sign; in self-execute flows this is the approver's own
-    /// signature (acting as both roles). Defaults to 10 minutes if not specified.
-    #[serde(default, with = "humantime_serde")]
-    pub operator_max_validity: Option<std::time::Duration>,
+    pub approval_validity: Option<std::time::Duration>,
 
     /// Wall-clock timeout for the spawned process. Once exceeded, the agent
     /// SIGKILLs the child and writes a "TIMEOUT" trailer into the execution
@@ -348,20 +343,11 @@ pub struct ParamConfig {
     pub max: Option<i64>,
 }
 
-pub const DEFAULT_APPROVER_MAX_VALIDITY: std::time::Duration =
-    std::time::Duration::from_secs(3 * 24 * 60 * 60);
-pub const DEFAULT_OPERATOR_MAX_VALIDITY: std::time::Duration =
-    std::time::Duration::from_secs(10 * 60);
+pub const DEFAULT_APPROVAL_VALIDITY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 impl CommandConfig {
-    pub fn approver_max_validity_or_default(&self) -> std::time::Duration {
-        self.approver_max_validity
-            .unwrap_or(DEFAULT_APPROVER_MAX_VALIDITY)
-    }
-
-    pub fn operator_max_validity_or_default(&self) -> std::time::Duration {
-        self.operator_max_validity
-            .unwrap_or(DEFAULT_OPERATOR_MAX_VALIDITY)
+    pub fn approval_validity_or_default(&self) -> std::time::Duration {
+        self.approval_validity.unwrap_or(DEFAULT_APPROVAL_VALIDITY)
     }
 
     pub fn command_timeout_or_default(&self) -> std::time::Duration {
@@ -390,6 +376,43 @@ pub enum TlsConfig {
     },
 }
 
+/// Command keys removed in the move to independent approvals, with what to
+/// use instead. `deny_unknown_fields` would reject them anyway; this names
+/// the replacement.
+const REMOVED_COMMAND_KEYS: &[(&str, &str)] = &[
+    (
+        "approver_max_validity",
+        "replaced by approval_validity (how long each approval stays usable)",
+    ),
+    (
+        "operator_max_validity",
+        "the operator role is gone; use approval_validity",
+    ),
+];
+
+/// Parse configuration text.
+pub fn parse(text: &str) -> Result<Config, String> {
+    if let Ok(table) = text.parse::<toml::Table>()
+        && let Some(commands) = table.get("commands").and_then(|c| c.as_array())
+    {
+        for cmd in commands {
+            let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+            for (key, hint) in REMOVED_COMMAND_KEYS {
+                if cmd.get(*key).is_some() {
+                    return Err(format!("command '{name}': `{key}` is no longer supported: {hint}"));
+                }
+            }
+        }
+    }
+    toml::from_str(text).map_err(|e| e.to_string())
+}
+
+/// Read and parse a configuration file.
+pub fn load(path: &str) -> Result<Config, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("Failed to read {path}: {e}"))?;
+    parse(&text).map_err(|e| format!("Failed to parse {path}: {e}"))
+}
+
 impl Config {
     pub fn get_redirect_uri(&self) -> String {
         match &self.oidc.redirect_uri {
@@ -405,13 +428,24 @@ mod tests {
 
     #[test]
     fn shipped_config_parses() {
-        let cfg: Config = toml::from_str(include_str!("../config.toml"))
+        let cfg = parse(include_str!("../config.toml"))
             .expect("config.toml must parse with deny_unknown_fields");
         let test = cfg.commands.iter().find(|c| c.name == "test").unwrap();
         assert_eq!(
-            test.approver_max_validity_or_default(),
+            test.approval_validity_or_default(),
             std::time::Duration::from_secs(24 * 60 * 60)
         );
+        let other = cfg.commands.iter().find(|c| c.name == "fail").unwrap();
+        assert_eq!(other.approval_validity_or_default(), DEFAULT_APPROVAL_VALIDITY);
+    }
+
+    #[test]
+    fn removed_keys_explain_their_replacement() {
+        for key in ["approver_max_validity", "operator_max_validity"] {
+            let text = format!("[[commands]]\nname = \"x\"\nopa_rule = \"data.x\"\n{key} = \"1d\"\n");
+            let err = parse(&text).unwrap_err();
+            assert!(err.contains(key) && err.contains("approval_validity"), "{err}");
+        }
     }
 
     #[test]

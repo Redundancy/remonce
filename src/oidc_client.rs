@@ -1,5 +1,5 @@
 //! OIDC authorization-code + PKCE plumbing shared by the local signer
-//! (`remonce web`) and the CLI (`remonce cosign` / `remonce revoke`).
+//! (`remonce web`) and the CLI (`remonce approve` / `submit` / `revoke`).
 //!
 //! Two kinds of login go through here:
 //!

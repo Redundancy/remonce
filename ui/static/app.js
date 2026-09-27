@@ -1,9 +1,10 @@
 // Remonce local signer UI.
 //
-// Every value shown comes from this signer's config (/api/commands), from a
-// token the user pasted, from a signing result, or from the agent's stream.
-// Values decoded client-side from a bundle are what the bundle *claims*; the
-// agent is the one that verifies them.
+// Every value shown comes from the selected agent (its command catalog via
+// /api/agent/commands, or its log stream), from a request file the user
+// opened, or from a signing result. Values decoded client-side from a
+// request are what it *claims*, and requirement matching here is for display;
+// the agent verifies every approval and its policy decides.
 //
 // Signing never happens in the page: /api/sign/begin parks the action on the
 // server and returns an identity-provider URL. The user re-authenticates, the
@@ -109,14 +110,12 @@ async function copyText(text, label) {
 }
 
 // Handoff files: remonce-<command>-<id prefix>.<kind>.json, where kind is
-// request (unsigned), approval (signed) or cosigned (ready to run). The
-// content is the same JSON the CLI reads (`remonce cosign --bundle FILE`).
-function tokenFileName(obj) {
-    const t = classifyToken(obj);
-    const command = t.kind === 'draft' ? t.command : t.bundle.approver.command;
-    const name = String(command.command || 'command').replace(/[^A-Za-z0-9._-]+/g, '_');
-    const id = String(command.id || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 8);
-    const kind = t.kind === 'draft' ? 'request' : (t.bundle.operator ? 'cosigned' : 'approval');
+// request (no approvals yet) or approval (one or more). The content is the
+// same JSON the CLI reads (`remonce approve|submit|revoke --bundle FILE`).
+function tokenFileName(req) {
+    const name = String(req.command.command || 'command').replace(/[^A-Za-z0-9._-]+/g, '_');
+    const id = String(req.command.id || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 8);
+    const kind = req.approvals.length ? 'approval' : 'request';
     return `remonce-${name}${id ? '-' + id : ''}.${kind}.json`;
 }
 
@@ -180,7 +179,7 @@ function fmtPredicate(p) {
 }
 
 // ---------------------------------------------------------------------------
-// Tokens: base64(JSON) or raw JSON; drafts and signed bundles
+// Request files: JSON (base64 accepted for pages handing over)
 // ---------------------------------------------------------------------------
 
 function encodeToken(obj) {
@@ -203,21 +202,24 @@ function decodeToken(raw) {
     return JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))));
 }
 
-// { kind: 'draft', command, operator_requires } | { kind: 'bundle', bundle }
-function classifyToken(obj) {
-    if (obj && obj.approver && obj.approver.signature) {
-        return { kind: 'bundle', bundle: { approver: obj.approver, operator: obj.operator || null } };
+// A request file: { command: {…}, approvals: […] }, or a bare command
+// ({ command: "name", id, … }) as a request with no approvals yet.
+function parseRequest(obj) {
+    if (obj && typeof obj === 'object' && (obj.approver || obj.signature || 'operator_requires' in obj)) {
+        throw new Error('This file was made by an older version of Remonce (approver/operator bundles). ' +
+            'Ask for the request to be prepared again.');
     }
-    if (obj && obj.signature && obj.command) {
-        return { kind: 'bundle', bundle: { approver: obj, operator: null } };
+    if (obj && typeof obj.command === 'string') return { command: obj, approvals: [] };
+    if (obj && obj.command && typeof obj.command === 'object' && !Array.isArray(obj.command)) {
+        const approvals = obj.approvals === undefined ? [] : obj.approvals;
+        if (!Array.isArray(approvals)) throw new Error('Not a Remonce request: approvals must be a list');
+        return { command: obj.command, approvals };
     }
-    if (obj && obj.command && typeof obj.command === 'object') {
-        return { kind: 'draft', command: obj.command, operator_requires: obj.operator_requires || null };
-    }
-    if (obj && typeof obj.command === 'string') {
-        return { kind: 'draft', command: obj, operator_requires: null };
-    }
-    throw new Error('Not a Remonce request or approval');
+    throw new Error('Not a Remonce request');
+}
+
+function requestJson(req) {
+    return JSON.stringify({ command: req.command, approvals: req.approvals }, null, 2);
 }
 
 function jwtClaims(jwt) {
@@ -244,10 +246,10 @@ function sortKeys(v) {
     return v;
 }
 
-// The payload an approver signs: {command, operator_requires} with sorted
+// What every approval signs: {command, remonce: "request/v2"} with sorted
 // keys (sent compact; shown indented).
-function signedPayloadText(command, operatorRequires) {
-    return JSON.stringify(sortKeys({ command, operator_requires: operatorRequires }), null, 2);
+function signedPayloadText(command) {
+    return JSON.stringify(sortKeys({ command, remonce: 'request/v2' }), null, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,15 +263,41 @@ function agentUrl() {
     return input ? input.value.trim() : '';
 }
 
+// The signer reaches agents from its own process, so a loopback agent URL
+// means the machine running the signer — not the one running this browser.
+function isLoopbackAgent(raw) {
+    let host;
+    try { host = new URL(raw).hostname.toLowerCase(); } catch (_) { return false; }
+    return host === 'localhost' || host.endsWith('.localhost') || host === '[::1]' ||
+        /^127(\.\d{1,3}){3}$/.test(host);
+}
+
+function agentDisplay() {
+    const url = agentUrl() || document.body.dataset.agentUrl || 'the default agent';
+    const signer = document.body.dataset.signerHost;
+    return isLoopbackAgent(url) && signer ? `${url} (on ${signer})` : url;
+}
+
 function initAgentField() {
     const input = $('agent-url');
     if (!input) return;
     let stored = null;
     try { stored = localStorage.getItem(AGENT_KEY); } catch (_) { /* storage blocked */ }
     input.value = stored || document.body.dataset.agentUrl || '';
+    const where = $('agent-where');
+    const signer = document.body.dataset.signerHost;
+    const showWhere = () => {
+        const local = isLoopbackAgent(input.value.trim()) && Boolean(signer);
+        where.hidden = !local;
+        where.textContent = local ? 'on ' + signer : '';
+        where.title = local ? `The signer contacts agents itself, so this is the agent on ${signer}, where the signer runs` : '';
+    };
+    input.addEventListener('input', showWhere);
     input.addEventListener('change', () => {
+        showWhere();
         try { localStorage.setItem(AGENT_KEY, input.value.trim()); } catch (_) { /* ignore */ }
     });
+    showWhere();
 }
 
 async function errorText(res) {
@@ -299,18 +327,23 @@ function postJson(path, body) {
     });
 }
 
-let commandsCache = null;
-async function loadCommands() {
-    if (!commandsCache) commandsCache = await api('/api/commands');
-    return commandsCache;
-}
-
-async function commandInfo(name) {
-    try {
-        return (await loadCommands()).find(c => c.name === name) || null;
-    } catch (_) {
-        return null;
+// The selected agent's catalog: what can be requested there and what each
+// command needs. Cached per agent for the life of the page.
+const catalogs = new Map();
+function loadCatalog() {
+    const key = agentUrl();
+    if (!catalogs.has(key)) {
+        const p = new URLSearchParams();
+        if (key) p.set('agent_url', key);
+        const promise = fetch('/api/agent/commands?' + p.toString()).then(async (res) => {
+            if (res.status === 401) throw new Error('The agent rejected your session — log in again (/auth/login).');
+            if (!res.ok) throw new Error(await errorText(res));
+            return res.json();
+        });
+        promise.catch(() => catalogs.delete(key));
+        catalogs.set(key, promise);
     }
+    return catalogs.get(key);
 }
 
 // Park a signing action and go re-authenticate. Only returns on failure.
@@ -419,13 +452,131 @@ function takeHandOff() {
 }
 
 // ---------------------------------------------------------------------------
-// Shared rendering: what a request / approval says
+// Requirements, as the agent publishes them from policy. Matching here is
+// for display only: the agent verifies every approval and policy decides.
 // ---------------------------------------------------------------------------
 
-function modeText(req) {
-    if (!req) return 'Self-execute only — the approver runs it; it cannot be co-signed';
-    if (!req.any_of || req.any_of.length === 0) return 'Delegated — any operator may co-sign and run it (policy still applies)';
-    return 'Delegated — the operator must match one of: ' + req.any_of.map(fmtPredicate).join(' · ');
+function sameJson(a, b) {
+    return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function claimMatches(p, claims) {
+    const v = claims ? claims[p.claim] : undefined;
+    if (p.op === 'equals') return v !== undefined && sameJson(v, p.value);
+    if (p.op === 'contains') return Array.isArray(v) && v.some(x => sameJson(x, p.value));
+    return false;
+}
+
+// "any_of": [] means anyone; a slot without it accepts no one.
+function slotAccepts(slot, claims) {
+    if (!slot || !Array.isArray(slot.any_of)) return false;
+    return slot.any_of.length === 0 || slot.any_of.some(p => claimMatches(p, claims));
+}
+
+function slotText(slot) {
+    if (!slot || !Array.isArray(slot.any_of)) return 'no one';
+    if (slot.description) return slot.description;
+    return slot.any_of.length === 0 ? 'anyone' : slot.any_of.map(fmtPredicate).join(' or ');
+}
+
+// An agent never runs a request without at least one approval.
+function effectiveSlots(r) {
+    return r.approvals.length ? r.approvals : [{ description: 'anyone', any_of: [] }];
+}
+
+// Give each slot its own approver where possible (augmenting paths, so a
+// fit is found whenever one exists). Free approvers are tried before
+// reassigning a taken one, so slots fill in approval order where they can.
+// Returns, per slot, an approver index or -1.
+function matchSlots(slots, approvers) {
+    const slotOf = approvers.map(() => -1);
+    const assign = (s, seen) => {
+        const order = approvers.map((_, i) => i).sort((a, b) => (slotOf[a] !== -1) - (slotOf[b] !== -1));
+        for (const i of order) {
+            if (seen.has(i) || !slotAccepts(slots[s], approvers[i].claims)) continue;
+            seen.add(i);
+            if (slotOf[i] === -1 || assign(slotOf[i], seen)) {
+                slotOf[i] = s;
+                return true;
+            }
+        }
+        return false;
+    };
+    slots.forEach((_, s) => assign(s, new Set()));
+    const bySlot = slots.map(() => -1);
+    slotOf.forEach((s, i) => { if (s !== -1) bySlot[s] = i; });
+    return bySlot;
+}
+
+function requirementSummary(info) {
+    if (info.requirements_error) return 'Published requirements are unreadable';
+    const r = info.requirements;
+    if (!r) return 'No published requirements';
+    const needs = effectiveSlots(r).map(slotText).join(' + ');
+    return `Needs ${needs} · run by ${slotText(r.executors)}` + (r.additional_policy ? ' · plus further policy' : '');
+}
+
+// What a request's approvals claim, checked against the catalog entry
+// (`info`, may be null): which have expired, repeat a person, and which
+// requirement slots they fill.
+function requestStatus(req, info) {
+    const now = Date.now() / 1000;
+    const seen = new Set();
+    const approvers = req.approvals.map((a) => {
+        const claims = jwtClaims(a.id_token) || {};
+        const x = { name: claimName(claims), claims, iat: claims.iat };
+        x.expired = Boolean(info && claims.iat && now - claims.iat > info.approval_validity_secs);
+        x.duplicate = Boolean(claims.sub && seen.has(claims.sub));
+        if (claims.sub) seen.add(claims.sub);
+        return x;
+    });
+    const live = approvers.filter(a => !a.expired && !a.duplicate);
+    const r = info && info.requirements;
+    if (!r) return { approvers, live, slots: null, bySlot: null, complete: null };
+    const slots = effectiveSlots(r);
+    const bySlot = matchSlots(slots, live);
+    return { approvers, live, slots, bySlot, complete: bySlot.every(i => i !== -1) };
+}
+
+function tag(kind, ...content) {
+    return h('span', { class: 'tag' + (kind ? ' ' + kind : '') }, ...content);
+}
+
+function approvalFacts(st) {
+    if (st.approvers.length === 0) return [['Approvals', null]];
+    return st.approvers.map((a, i) => {
+        const notes = [];
+        if (a.iat) notes.push('logged in ' + fmtTime(a.iat * 1000));
+        if (Array.isArray(a.claims.groups)) notes.push('groups: ' + a.claims.groups.join(', '));
+        return ['Approval ' + (i + 1), h('span', {},
+            a.name,
+            notes.length ? h('span', { class: 'muted' }, '  ·  ' + notes.join('  ·  ')) : null,
+            a.expired ? tag('bad', 'expired') : null,
+            a.duplicate ? tag('bad', 'same person again') : null)];
+    });
+}
+
+// The command's published requirements; with a status, which are met.
+function requirementFacts(info, st) {
+    if (!info) return [];
+    if (info.requirements_error) return [['Requirements', 'Published, but unreadable: ' + info.requirements_error]];
+    const r = info.requirements;
+    if (!r) return [['Requirements', 'None published for this command; the agent\'s policy decides']];
+    const rows = [];
+    if (r.description) rows.push(['Requirements', r.description]);
+    effectiveSlots(r).forEach((slot, j) => {
+        const i = st ? st.bySlot[j] : -1;
+        rows.push(['Approver ' + (j + 1), h('span', {}, slotText(slot),
+            st ? (i >= 0 ? tag('ok', icon('check'), st.live[i].name) : tag('', 'waiting')) : null)]);
+    });
+    rows.push(['Run by', slotText(r.executors)]);
+    if (r.additional_policy) rows.push(['Further policy', r.additional_policy]);
+    rows.push(['Approvals valid', fmtDuration(info.approval_validity_secs) + ' after each approver logs in']);
+    return rows;
+}
+
+function missingText(st) {
+    return st.slots.filter((_, j) => st.bySlot[j] === -1).map(slotText).join(' + ');
 }
 
 function factRows(rows) {
@@ -440,7 +591,7 @@ function factRows(rows) {
     return dl;
 }
 
-function commandFacts(command, operatorRequires) {
+function commandFacts(command) {
     const params = command.params && Object.keys(command.params).length
         ? Object.entries(command.params).map(([k, v]) => `${k}=${v}`).join('  ')
         : null;
@@ -454,22 +605,7 @@ function commandFacts(command, operatorRequires) {
         ['Parameters', params, true],
         command.not_before ? ['Not before', fmtTime(command.not_before)] : null,
         command.not_after ? ['Not after', fmtTime(command.not_after)] : null,
-        ['Who runs it', modeText(operatorRequires)],
     ];
-}
-
-function bundleSignerRows(bundle) {
-    const a = jwtClaims(bundle.approver.id_token);
-    const rows = [
-        ['Approved by', claimName(a) + (a && a.groups ? '  ·  groups: ' + a.groups.join(', ') : '')],
-        a && a.iat ? ['Approver logged in', fmtTime(a.iat * 1000)] : null,
-    ];
-    if (bundle.operator) {
-        const o = jwtClaims(bundle.operator.id_token);
-        rows.push(['Co-signed by', claimName(o)]);
-        if (o && o.iat) rows.push(['Operator logged in', fmtTime(o.iat * 1000)]);
-    }
-    return rows;
 }
 
 function panelTitle(name, description) {
@@ -480,18 +616,42 @@ function panelTitle(name, description) {
             description ? h('div', { class: 'd' }, description) : null));
 }
 
-// Problems an agent will certainly reject, found without contacting it.
-async function requestProblems(command) {
+// What the page can tell without asking the agent to run anything:
+// problems it will certainly reject, and warnings worth a look.
+async function requestContext(command) {
     const problems = [];
-    if (!Array.isArray(command.target_machines) || command.target_machines.length === 0) {
-        problems.push('No target machines. Agents refuse approvals without target_machines.');
+    const warnings = [];
+    const targets = Array.isArray(command.target_machines) ? command.target_machines : [];
+    if (targets.length === 0) {
+        problems.push('No target machines. Agents refuse requests without target_machines.');
     }
-    const info = await commandInfo(command.command);
-    if (!info) {
-        problems.push(`This signer's configuration doesn't list '${command.command}'. ` +
-            'Agents only run commands they are configured with.');
+    let info = null;
+    try {
+        const catalog = await loadCatalog();
+        info = catalog.commands.find(c => c.name === command.command) || null;
+        if (!info) {
+            warnings.push(`The selected agent (${catalog.host}) doesn't offer '${command.command}'. ` +
+                'Select the agent this request is for at the top.');
+        } else if (targets.length && !targets.includes(catalog.host)) {
+            warnings.push(`The selected agent (${catalog.host}) isn't one of the target machines, so it will refuse this request.`);
+        }
+    } catch (e) {
+        warnings.push('Could not load the selected agent\'s commands: ' + e.message);
     }
-    return { problems, info };
+    return { problems, warnings, info };
+}
+
+// Expired or repeated approvals make the agent refuse the whole request;
+// offer to drop them.
+function staleApprovalsNotice(req, st, rerender) {
+    const bad = st.approvers.filter(a => a.expired || a.duplicate).length;
+    if (!bad) return null;
+    const keep = req.approvals.filter((_, i) => !st.approvers[i].expired && !st.approvers[i].duplicate);
+    return notice('warn',
+        `${bad === 1 ? 'One approval has' : bad + ' approvals have'} expired or repeat a person, ` +
+        'so the agent will refuse this request as it is. ',
+        h('button', { class: 'btn btn-sm', type: 'button', onclick: () => rerender({ command: req.command, approvals: keep }) },
+            'Remove ' + (bad === 1 ? 'it' : 'them')));
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +690,7 @@ function sealedSignet() {
     return h('div', { class: 'signet' }, svg);
 }
 
-function renderSignedResult(target, result) {
+async function renderSignedResult(target, result) {
     clear(target);
     if (result.outcome === 'error') {
         target.append(notice('error', 'Signing failed: ' + result.message));
@@ -538,53 +698,50 @@ function renderSignedResult(target, result) {
     }
     if (result.outcome !== 'bundle') return;
 
-    const bundle = result.bundle;
-    const approver = bundle.approver;
-    const isCosign = result.action === 'cosign';
-    const delegatedApproval = !isCosign && approver.operator_requires;
-    const token = encodeToken(bundle);
-    const name = approver.command.command || 'command';
+    const req = result.bundle;
+    const { info } = await requestContext(req.command);
+    const st = requestStatus(req, info);
+    const counted = st.slots
+        ? `${st.bySlot.filter(i => i >= 0).length} of ${st.slots.length} needed`
+        : `${req.approvals.length}; the agent's policy decides whether that is enough`;
 
     const facts = factRows([
-        ['Signed by', result.signer],
+        ['Approved by', result.signer],
         ['Timestamped', fmtTime(result.signed_at)],
-        ['Command', name, true],
-        ['Execution ID', approver.command.id, true],
-        ['Target machines', (approver.command.target_machines || []).join(', '), true],
-        isCosign ? ['Approved by', claimName(jwtClaims(approver.id_token))] : null,
-        ['Who runs it', isCosign ? 'You, now — the co-signature is only valid briefly' : modeText(approver.operator_requires)],
+        ['Command', req.command.command, true],
+        ['Execution ID', req.command.id, true],
+        ['Request', result.request_id, true],
+        ['Approvals', counted],
     ]);
 
-    const actions = h('div', { class: 'actions' },
-        h('button', { class: 'btn', onclick: () => copyText(token, 'Signed token copied') }, icon('copy'), 'Copy token'),
-        h('button', { class: 'btn', onclick: () => saveTokenFile(bundle) }, icon('download'), 'Save file'),
-        h('span', { class: 'spacer' }),
-        delegatedApproval ? null : h('button', {
-            class: 'btn btn-primary',
-            onclick: async (e) => {
-                e.currentTarget.disabled = true;
-                try {
-                    await executeBundle(bundle);
-                } catch (err) {
-                    toast('Execution failed: ' + err.message, true);
-                    e.currentTarget.disabled = false;
-                }
-            },
-        }, icon('play'), 'Execute now'));
+    const execBtn = h('button', {
+        class: 'btn btn-primary',
+        onclick: async (e) => {
+            e.currentTarget.disabled = true;
+            try {
+                await executeBundle(req);
+            } catch (err) {
+                toast('Execution failed: ' + err.message, true);
+                e.currentTarget.disabled = false;
+            }
+        },
+    }, icon('play'), 'Execute now');
 
     target.append(h('section', { class: 'panel accent' },
         h('div', { class: 'sealed' },
             sealedSignet(),
             h('div', {},
-                h('div', { class: 'sign-headline' }, isCosign ? 'Co-signed.' : 'Signed.'),
+                h('div', { class: 'sign-headline' }, 'Approved.'),
                 facts)),
-        delegatedApproval
-            ? notice('', 'Send this token to the operator who will run it. They open it under "Sign a request" and co-sign it.')
+        st.complete === false
+            ? notice('', `Still needs ${missingText(st)}. Save the file and send it to the next approver; ` +
+                'they open it under "Sign a request".')
             : null,
-        h('div', { class: 'token-strip' },
-            h('span', { class: 'lbl' }, 'token'),
-            h('span', { class: 'val' }, token)),
-        actions));
+        h('div', { class: 'actions' },
+            h('button', { class: 'btn', onclick: () => copyText(requestJson(req), 'Request copied') }, icon('copy'), 'Copy'),
+            h('button', { class: 'btn', onclick: () => saveTokenFile(req) }, icon('download'), 'Save file'),
+            h('span', { class: 'spacer' }),
+            st.complete === false ? null : execBtn)));
 }
 
 // ---------------------------------------------------------------------------
@@ -595,42 +752,49 @@ async function initCommandsPage() {
     const grid = $('cmd-grid');
     const filter = $('cmd-filter');
     const count = $('cmd-count');
-    let commands;
-    try {
-        commands = await loadCommands();
-    } catch (e) {
-        grid.replaceWith(notice('error', 'Could not load commands: ' + e.message));
-        return;
-    }
+    let catalog = null;
 
     const render = () => {
+        const commands = catalog.commands;
         const q = filter.value.trim().toLowerCase();
         const shown = commands.filter(c =>
             !q || c.name.toLowerCase().includes(q) || (c.description || '').toLowerCase().includes(q));
         clear(grid);
-        count.textContent = `${shown.length} of ${commands.length}`;
+        count.textContent = `${shown.length} of ${commands.length} on ${catalog.host}`;
         if (commands.length === 0) {
-            grid.append(h('div', { class: 'empty' }, 'No commands are configured in this signer\'s config.toml.'));
+            grid.append(h('div', { class: 'empty' }, `The agent on ${catalog.host} offers no commands.`));
             return;
         }
-        shown.forEach(cmd => grid.append(commandCard(cmd)));
+        shown.forEach(cmd => grid.append(commandCard(cmd, catalog.host)));
     };
-    filter.addEventListener('input', render);
-    render();
+    const load = async () => {
+        count.textContent = '';
+        clear(grid).append(h('div', { class: 'empty' }, 'Loading…'));
+        try {
+            catalog = await loadCatalog();
+        } catch (e) {
+            catalog = null;
+            clear(grid).append(notice('error', 'Could not load the agent\'s commands: ' + e.message));
+            return;
+        }
+        render();
+    };
+    filter.addEventListener('input', () => { if (catalog) render(); });
+    $('agent-url').addEventListener('change', load);
+    load();
 }
 
-function commandCard(cmd) {
-    return h('button', { class: 'cmd-card', type: 'button', onclick: () => openSignModal(cmd) },
+function commandCard(cmd, host) {
+    return h('button', { class: 'cmd-card', type: 'button', onclick: () => openSignModal(cmd, host) },
         h('div', { class: 'cmd-head' },
             h('div', { class: 'cmd-glyph' }, glyph(cmd.name)),
             h('div', {},
                 h('div', { class: 'cmd-name' }, cmd.name),
                 h('div', { class: 'cmd-desc' }, cmd.description || ''))),
+        h('div', { class: 'cmd-req' }, requirementSummary(cmd)),
         h('div', { class: 'cmd-meta' },
-            h('span', { class: 'meta-pill', title: 'Self-execute: run within this long of signing' },
-                icon('clock'), 'run within ' + fmtDuration(cmd.operator_max_validity_secs)),
-            h('span', { class: 'meta-pill', title: 'Delegated: an approval stays usable this long' },
-                icon('fingerprint'), 'delegate ' + fmtDuration(cmd.approver_max_validity_secs)),
+            h('span', { class: 'meta-pill', title: 'Each approval stays usable this long after the approver logs in' },
+                icon('clock'), 'approvals valid ' + fmtDuration(cmd.approval_validity_secs)),
             cmd.params.length
                 ? h('span', { class: 'meta-pill' }, icon('params'),
                     cmd.params.length + (cmd.params.length === 1 ? ' parameter' : ' parameters'))
@@ -639,15 +803,10 @@ function commandCard(cmd) {
             h('span', { class: 'cmd-sign' }, icon('sign'), 'Prepare')));
 }
 
-const TARGETS_KEY = 'remonce.lastTargets';
-
-function openSignModal(cmd) {
+function openSignModal(cmd, host) {
     const id = crypto.randomUUID();
-    let delegated = false;
-    let lastTargets = '';
-    try { lastTargets = localStorage.getItem(TARGETS_KEY) || ''; } catch (_) { /* ignore */ }
 
-    const targets = h('input', { id: 'f-targets', value: lastTargets, placeholder: 'agent hostnames, comma separated', spellcheck: 'false' });
+    const targets = h('input', { id: 'f-targets', value: host || '', placeholder: 'agent hostnames, comma separated', spellcheck: 'false' });
     const notBefore = h('input', { id: 'f-nbf', type: 'datetime-local' });
     const notAfter = h('input', { id: 'f-naf', type: 'datetime-local' });
     const paramInputs = cmd.params.map(p => {
@@ -664,39 +823,6 @@ function openSignModal(cmd) {
         return { p, input };
     });
 
-    const reqRows = h('div', {});
-    const addReqRow = () => {
-        const row = h('div', { class: 'req-row' },
-            h('input', { class: 'input req-claim', placeholder: 'claim, e.g. groups' }),
-            h('select', { class: 'input req-op' },
-                h('option', { value: 'contains' }, 'contains'),
-                h('option', { value: 'equals' }, 'equals')),
-            h('input', { class: 'input req-value', placeholder: 'value, e.g. noc-l2' }),
-            h('button', { class: 'btn btn-ghost', type: 'button', title: 'Remove', onclick: () => { row.remove(); update(); } }, icon('close')));
-        row.querySelectorAll('input, select').forEach(el => el.addEventListener('input', update));
-        reqRows.append(row);
-    };
-
-    const modeHelp = h('p', { class: 'hint' });
-    const delegateBox = h('div', { hidden: true },
-        reqRows,
-        h('button', { class: 'btn btn-sm', type: 'button', onclick: () => { addReqRow(); update(); } }, icon('plus'), 'Add requirement'));
-    const selfBtn = h('button', { type: 'button', class: 'on' }, 'I\'ll run it');
-    const delBtn = h('button', { type: 'button' }, 'Delegate');
-    const setMode = (d) => {
-        delegated = d;
-        selfBtn.classList.toggle('on', !d);
-        delBtn.classList.toggle('on', d);
-        delegateBox.hidden = !d;
-        modeHelp.textContent = d
-            ? `Someone else co-signs and runs it, within ${fmtDuration(cmd.approver_max_validity_secs)} of your signature. ` +
-              'Requirements restrict who may co-sign; with none, any operator may (policy still applies).'
-            : `You run it yourself, within ${fmtDuration(cmd.operator_max_validity_secs)} of signing. It cannot be co-signed.`;
-        update();
-    };
-    selfBtn.addEventListener('click', () => setMode(false));
-    delBtn.addEventListener('click', () => setMode(true));
-
     const preview = h('pre', { class: 'code-block' });
     const error = h('div', { class: 'hint-line' });
 
@@ -712,20 +838,7 @@ function openSignModal(cmd) {
         if (Object.keys(params).length) command.params = params;
         if (notBefore.value) command.not_before = new Date(notBefore.value).toISOString();
         if (notAfter.value) command.not_after = new Date(notAfter.value).toISOString();
-        let operator_requires = null;
-        if (delegated) {
-            const any_of = [];
-            reqRows.querySelectorAll('.req-row').forEach(row => {
-                const claim = row.querySelector('.req-claim').value.trim();
-                const raw = row.querySelector('.req-value').value.trim();
-                if (!claim || !raw) return;
-                let value;
-                try { value = JSON.parse(raw); } catch (_) { value = raw; }
-                any_of.push({ op: row.querySelector('.req-op').value, claim, value });
-            });
-            operator_requires = { any_of };
-        }
-        return { command, operator_requires };
+        return { command, approvals: [] };
     };
 
     const problemsOf = ({ command }) => {
@@ -737,17 +850,17 @@ function openSignModal(cmd) {
         return out;
     };
 
-    const signBtn = h('button', { class: 'btn btn-primary', type: 'button' }, icon('sign'), 'Sign');
-    const copyBtn = h('button', { class: 'btn', type: 'button', title: 'Copy an unsigned request for someone else to review and sign' },
+    const signBtn = h('button', { class: 'btn btn-primary', type: 'button' }, icon('sign'), 'Approve');
+    const copyBtn = h('button', { class: 'btn', type: 'button', title: 'Copy the request for someone else to approve' },
         icon('copy'), 'Copy request');
-    const saveBtn = h('button', { class: 'btn', type: 'button', title: 'Save an unsigned request as a file for someone else to review and sign' },
+    const saveBtn = h('button', { class: 'btn', type: 'button', title: 'Save the request as a file for someone else to approve' },
         icon('download'), 'Save request');
 
     function update() {
-        const draft = build();
-        preview.textContent = signedPayloadText(draft.command, draft.operator_requires);
-        const problems = problemsOf(draft);
-        error.textContent = problems[0] || 'Signing asks you to log in again.';
+        const req = build();
+        preview.textContent = signedPayloadText(req.command);
+        const problems = problemsOf(req);
+        error.textContent = problems[0] || 'Approving asks you to log in again.';
         signBtn.disabled = problems.length > 0;
         copyBtn.disabled = problems.length > 0;
         saveBtn.disabled = problems.length > 0;
@@ -759,16 +872,15 @@ function openSignModal(cmd) {
     });
 
     copyBtn.addEventListener('click', () => {
-        copyText(encodeToken(build()), 'Request copied — send it to whoever should sign it');
+        copyText(requestJson(build()), 'Request copied — send it to whoever should approve it');
     });
     saveBtn.addEventListener('click', () => saveTokenFile(build()));
     signBtn.addEventListener('click', async () => {
-        const draft = build();
-        try { localStorage.setItem(TARGETS_KEY, targets.value.trim()); } catch (_) { /* ignore */ }
+        const req = build();
         signBtn.disabled = true;
         error.textContent = 'Redirecting to your identity provider…';
         try {
-            await beginSigning({ action: 'approve', command: draft.command, operator_requires: draft.operator_requires });
+            await beginSigning({ action: 'approve', command: req.command, approvals: [] });
         } catch (e) {
             error.textContent = 'Could not start signing: ' + e.message;
             signBtn.disabled = false;
@@ -784,7 +896,7 @@ function openSignModal(cmd) {
             h('div', { class: 'modal-head' },
                 h('div', {},
                     h('div', { class: 'modal-eyebrow' }, 'Prepare'),
-                    h('div', { class: 'modal-title' }, 'Configure the signature')),
+                    h('div', { class: 'modal-title' }, 'Configure the request')),
                 h('button', { class: 'modal-close', type: 'button', title: 'Close', onclick: close }, icon('close'))),
             h('div', { class: 'modal-body' },
                 h('div', { class: 'cmd-summary' },
@@ -812,13 +924,14 @@ function openSignModal(cmd) {
                         h('label', { for: 'f-naf' }, 'Not after', h('span', { class: 'hint' }, '· optional')),
                         notAfter)),
                 h('div', { class: 'section' },
-                    h('div', { class: 'label' }, 'Who runs it'),
-                    h('div', { class: 'seg' }, selfBtn, delBtn),
-                    modeHelp,
-                    delegateBox),
+                    h('div', { class: 'label' }, 'What it needs'),
+                    factRows(requirementFacts(cmd, null)),
+                    h('p', { class: 'hint' },
+                        'Approve adds your approval. If more are needed, save the result and send it on; ' +
+                        'whoever runs it is logged in and checked by policy too.')),
                 h('div', { class: 'code-head' },
                     h('span', { class: 'label' }, 'Signed payload'),
-                    h('span', { class: 'hint' }, 'exactly what your signature covers')),
+                    h('span', { class: 'hint' }, 'exactly what every approval covers')),
                 preview),
             h('div', { class: 'modal-foot' },
                 error,
@@ -829,114 +942,94 @@ function openSignModal(cmd) {
                 signBtn)));
 
     document.body.append(scrim);
-    setMode(false);
+    update();
     targets.focus();
 }
 
 // ---------------------------------------------------------------------------
-// Page: Sign a request (review drafts, co-sign delegated approvals)
+// Page: Sign a request (review a request and add an approval)
 // ---------------------------------------------------------------------------
 
 async function initReviewPage() {
     const input = $('review-token');
     const detail = $('review-detail');
     const result = await takeSignResult();
-    if (result) renderSignedResult($('review-result'), result);
+    if (result) await renderSignedResult($('review-result'), result);
 
-    const show = async () => {
+    const render = async (req) => {
         clear(detail);
         detail.hidden = false;
-        let parsed;
+        await renderRequestReview(detail, req, (next) => {
+            input.value = requestJson(next);
+            render(next);
+        });
+    };
+    const show = async () => {
+        let req;
         try {
-            parsed = classifyToken(decodeToken(input.value));
+            req = parseRequest(decodeToken(input.value));
         } catch (e) {
+            clear(detail);
+            detail.hidden = false;
             detail.append(notice('error', e.message));
             return;
         }
-        if (parsed.kind === 'draft') await renderDraftReview(detail, parsed);
-        else await renderApprovalReview(detail, parsed.bundle);
+        await render(req);
     };
     $('review-btn').addEventListener('click', show);
     acceptTokens(input, $('review-file'), $('review-file-input'), $('review-input'), show);
+    $('agent-url').addEventListener('change', () => { if (!detail.hidden) show(); });
 
-    // A link or another page may prefill a request; nothing is signed
-    // without a click.
-    const prefill = takeHandOff() || new URLSearchParams(window.location.search).get('token');
+    // Another page may hand a request over; nothing is signed without a click.
+    const prefill = takeHandOff();
     if (prefill) {
         input.value = prefill;
         show();
     }
 }
 
-async function renderDraftReview(target, draft) {
-    const { problems, info } = await requestProblems(draft.command);
-    const signBtn = h('button', { class: 'btn btn-primary', disabled: problems.length > 0 }, icon('sign'), 'Sign');
-    const status = h('span', { class: 'hint-line' }, 'Signing asks you to log in again, and uses a one-time key.');
-    signBtn.addEventListener('click', async () => {
-        signBtn.disabled = true;
-        status.textContent = 'Redirecting to your identity provider…';
-        try {
-            await beginSigning({ action: 'approve', command: draft.command, operator_requires: draft.operator_requires });
-        } catch (e) {
-            status.textContent = 'Could not start signing: ' + e.message;
-            signBtn.disabled = false;
-        }
-    });
+async function renderRequestReview(target, req, rerender) {
+    const { problems, warnings, info } = await requestContext(req.command);
+    const st = requestStatus(req, info);
+    const panel = h('section', { class: 'panel accent' },
+        panelTitle(req.command.command, info && info.description));
+    problems.forEach(p => panel.append(notice('error', p)));
+    warnings.forEach(w => panel.append(notice('warn', w)));
+    const stale = staleApprovalsNotice(req, st, rerender);
+    if (stale) panel.append(stale);
+    if (st.complete) {
+        panel.append(notice('ok', 'This request already has the approvals it needs. Run it from Execute.'));
+    }
 
-    target.append(h('section', { class: 'panel accent' },
-        panelTitle(draft.command.command, info && info.description),
-        problems.map(p => notice('error', p)),
-        factRows(commandFacts(draft.command, draft.operator_requires)),
+    panel.append(factRows([...commandFacts(req.command), ...approvalFacts(st), ...requirementFacts(info, st)]));
+    if (req.approvals.length) {
+        panel.append(h('p', { class: 'hint' },
+            'Approvers are read from the tokens in the file; the agent verifies them before running anything.'));
+    }
+    panel.append(
         h('div', { class: 'code-head' },
             h('span', { class: 'label' }, 'Signed payload'),
-            h('span', { class: 'hint' }, 'exactly what your signature covers')),
-        h('pre', { class: 'code-block' }, signedPayloadText(draft.command, draft.operator_requires)),
-        h('div', { class: 'actions' }, status, h('span', { class: 'spacer' }), signBtn)));
-}
+            h('span', { class: 'hint' }, 'exactly what your approval covers')),
+        h('pre', { class: 'code-block' }, signedPayloadText(req.command)));
 
-async function renderApprovalReview(target, bundle) {
-    const approver = bundle.approver;
-    const info = await commandInfo(approver.command.command);
-    const panel = h('section', { class: 'panel accent' },
-        panelTitle(approver.command.command, info && info.description));
-
-    if (bundle.operator) {
-        panel.append(notice('', 'This approval is already co-signed. Run it from Execute.'));
-    } else if (!approver.operator_requires) {
-        panel.append(notice('', 'This approval is self-execute only, so it can\'t be co-signed. ' +
-            'The approver runs it from Execute.'));
-    } else {
-        panel.append(notice('warn', 'Co-signing runs this command with your identity as the operator. ' +
-            'Check what was approved and who approved it.'));
-    }
-
-    panel.append(factRows([
-        ...commandFacts(approver.command, approver.operator_requires),
-        ...bundleSignerRows(bundle),
-    ]));
-    panel.append(h('p', { class: 'hint' },
-        'Identities are read from the tokens in the bundle; the agent verifies them before running anything.'));
-
-    const actions = h('div', { class: 'actions' });
-    if (bundle.operator || !approver.operator_requires) {
-        actions.append(h('span', { class: 'spacer' }),
-            h('button', { class: 'btn', onclick: () => handOff('/ui/execute', bundle) }, icon('play'), 'Open in Execute'));
-    } else {
-        const status = h('span', { class: 'hint-line' }, 'Co-signing asks you to log in again. Execute promptly afterwards.');
-        const btn = h('button', { class: 'btn btn-primary' }, icon('fingerprint'), 'Co-sign');
-        btn.addEventListener('click', async () => {
-            btn.disabled = true;
-            status.textContent = 'Redirecting to your identity provider…';
-            try {
-                await beginSigning({ action: 'cosign', approver });
-            } catch (e) {
-                status.textContent = 'Could not start co-signing: ' + e.message;
-                btn.disabled = false;
-            }
-        });
-        actions.append(status, h('span', { class: 'spacer' }), btn);
-    }
-    panel.append(actions);
+    const status = h('span', { class: 'hint-line' }, 'Approving asks you to log in again, and uses a one-time key.');
+    const approveBtn = h('button', { class: st.complete ? 'btn' : 'btn btn-primary', disabled: problems.length > 0 },
+        icon('sign'), 'Approve');
+    approveBtn.addEventListener('click', async () => {
+        approveBtn.disabled = true;
+        status.textContent = 'Redirecting to your identity provider…';
+        try {
+            await beginSigning({ action: 'approve', command: req.command, approvals: req.approvals });
+        } catch (e) {
+            status.textContent = 'Could not start signing: ' + e.message;
+            approveBtn.disabled = false;
+        }
+    });
+    const execBtn = req.approvals.length
+        ? h('button', { class: st.complete ? 'btn btn-primary' : 'btn', onclick: () => handOff('/ui/execute', req) },
+            icon('play'), 'Open in Execute')
+        : null;
+    panel.append(h('div', { class: 'actions' }, status, h('span', { class: 'spacer' }), approveBtn, execBtn));
     target.append(panel);
 }
 
@@ -953,83 +1046,92 @@ async function initExecutePage() {
     if (result && result.outcome === 'revoked') {
         const ok = result.status >= 200 && result.status < 300;
         resultBox.append(ok
-            ? notice('ok', (result.body && result.body.message) || 'Approval revoked.')
+            ? notice('ok', (result.body && result.body.message) || 'Request revoked.')
             : notice('error', `Revocation refused (${result.status}): ` +
                 ((result.body && result.body.error) || JSON.stringify(result.body))));
     } else if (result && result.outcome === 'error') {
         resultBox.append(notice('error', 'Revocation failed: ' + result.message));
     }
 
-    const show = async () => {
+    const render = async (req) => {
         clear(detail);
         detail.hidden = false;
-        let parsed;
-        try {
-            parsed = classifyToken(decodeToken(input.value));
-        } catch (e) {
-            detail.append(notice('error', e.message));
-            return;
-        }
-        if (parsed.kind === 'draft') {
-            const draft = { command: parsed.command, operator_requires: parsed.operator_requires };
+        if (req.approvals.length === 0) {
             detail.append(h('section', { class: 'panel' },
-                notice('warn', 'This is an unsigned request, so there is nothing to run yet. Review and sign it first.'),
+                notice('warn', 'This request has no approvals yet, so there is nothing to run. Approve it first.'),
                 h('div', { class: 'actions' },
                     h('span', { class: 'spacer' }),
-                    h('button', { class: 'btn btn-primary', onclick: () => handOff('/ui/review', draft) },
+                    h('button', { class: 'btn btn-primary', onclick: () => handOff('/ui/review', req) },
                         icon('fingerprint'), 'Open in Sign a request'))));
             return;
         }
-        await renderExecuteDetail(detail, parsed.bundle);
+        await renderExecuteDetail(detail, req, (next) => {
+            input.value = requestJson(next);
+            render(next);
+        });
+    };
+    const show = async () => {
+        let req;
+        try {
+            req = parseRequest(decodeToken(input.value));
+        } catch (e) {
+            clear(detail);
+            detail.hidden = false;
+            detail.append(notice('error', e.message));
+            return;
+        }
+        await render(req);
     };
     $('exec-btn').addEventListener('click', show);
     acceptTokens(input, $('exec-file'), $('exec-file-input'), $('exec-input'), show);
+    $('agent-url').addEventListener('change', () => { if (!detail.hidden) show(); });
 
     const handed = takeHandOff();
-    const legacy = new URLSearchParams(window.location.search).get('signed_token');
-    if (handed || legacy) {
-        input.value = handed || legacy;
+    if (handed) {
+        input.value = handed;
         show();
     }
 }
 
-async function renderExecuteDetail(target, bundle) {
-    const approver = bundle.approver;
-    const info = await commandInfo(approver.command.command);
-    const needsCosign = approver.operator_requires && !bundle.operator;
+async function renderExecuteDetail(target, req, rerender) {
+    const { problems, warnings, info } = await requestContext(req.command);
+    const st = requestStatus(req, info);
     const panel = h('section', { class: 'panel accent' },
-        panelTitle(approver.command.command, info && info.description));
-    if (needsCosign) {
-        panel.append(notice('warn', 'This approval is delegated and needs a co-signature before it can run. ' +
-            'Open it under "Sign a request".'));
+        panelTitle(req.command.command, info && info.description));
+    problems.forEach(p => panel.append(notice('error', p)));
+    warnings.forEach(w => panel.append(notice('warn', w)));
+    const stale = staleApprovalsNotice(req, st, rerender);
+    if (stale) panel.append(stale);
+    if (st.complete === false) {
+        panel.append(notice('warn', `Not enough approvals yet: still needs ${missingText(st)}. ` +
+            'The agent will refuse it until they are added under "Sign a request".'));
     }
-    panel.append(factRows([
-        ...commandFacts(approver.command, approver.operator_requires),
-        ...bundleSignerRows(bundle),
-    ]));
+    panel.append(factRows([...commandFacts(req.command), ...approvalFacts(st), ...requirementFacts(info, st)]));
 
-    const status = h('span', { class: 'hint-line' }, 'Runs on the agent selected at the top.');
-    const execBtn = h('button', { class: 'btn btn-primary', disabled: needsCosign }, icon('play'), 'Execute');
+    const status = h('span', { class: 'hint-line' },
+        'Runs on the agent selected at the top, as you: policy checks who may run it.');
+    const execBtn = h('button', { class: 'btn btn-primary' }, icon('play'), 'Execute');
     execBtn.addEventListener('click', async () => {
         execBtn.disabled = true;
-        status.textContent = 'Submitting to ' + (agentUrl() || 'the default agent') + '…';
+        status.textContent = 'Submitting to ' + agentDisplay() + '…';
         try {
-            await executeBundle(bundle);
+            await executeBundle(req);
         } catch (e) {
             status.textContent = 'The agent refused: ' + e.message;
             execBtn.disabled = false;
         }
     });
-    const revokeBtn = h('button', { class: 'btn btn-danger', title: 'Anyone may revoke their own approval; revoking someone else\'s needs policy approval' },
-        icon('revoke'), 'Revoke approval');
+    const revokeBtn = h('button', { class: 'btn btn-danger', title: 'Approvers may always revoke; anyone else needs policy\'s permission' },
+        icon('revoke'), 'Revoke request');
     revokeBtn.addEventListener('click', async () => {
-        const agent = agentUrl() || 'the default agent';
-        if (!confirm(`Revoke this approval of '${approver.command.command}' on ${agent}? ` +
+        const agent = agentDisplay();
+        if (!confirm(`Revoke this '${req.command.command}' request on ${agent}? ` +
+            'It will not run there (or on any agent sharing a revocation service), whoever approves it. ' +
             'You will be asked to log in again. This cannot be undone.')) return;
         revokeBtn.disabled = true;
         status.textContent = 'Redirecting to your identity provider…';
         try {
-            await beginSigning({ action: 'revoke', approver, agent_url: agentUrl() });
+            await beginSigning({ action: 'revoke', request: { command: req.command, approvals: req.approvals }, agent_url: agentUrl() });
         } catch (e) {
             status.textContent = 'Could not start revocation: ' + e.message;
             revokeBtn.disabled = false;
@@ -1085,6 +1187,7 @@ function initMonitorPage() {
     };
 
     const factMap = new Map();
+    const approvedBy = [];
     const setFact = (k, v) => {
         let el = factMap.get(k);
         if (!el) {
@@ -1099,7 +1202,7 @@ function initMonitorPage() {
     $('run-title').textContent = isRun ? 'Run ' + id.slice(0, 8) : (name || displayPath(path).split(/[\\/]/).pop());
     $('term-title').textContent = isRun ? 'execution log · ' + id : (name || displayPath(path));
     setFact(isRun ? 'Execution ID' : 'File', isRun ? id : (name || displayPath(path)));
-    setFact('Agent', agentUrl() || 'default');
+    setFact('Agent', agentDisplay());
     if (!isRun) setFact('Showing', tail === '-1' ? 'whole file' : `last ${tail} lines, then new lines`);
 
     const matches = (text) => {
@@ -1131,9 +1234,14 @@ function initMonitorPage() {
         if (inHeader) {
             row.classList.add('meta');
             if (/^-+$/.test(text)) { inHeader = false; return; }
-            const m = text.match(/^(ID|User|Time|Command|Executable): (.*)$/);
-            if (m) {
-                const label = { ID: null, User: 'Approved by', Time: 'Approved at', Command: 'Command', Executable: 'Executable' }[m[1]];
+            const m = text.match(/^(ID|Request|Approver|Executor|Time|Command|Executable): (.*)$/);
+            if (m && m[1] === 'Approver') {
+                // "name (RFC 3339 signing time)", one line per approver.
+                const a = m[2].match(/^(.*) \(([^()]*)\)$/);
+                approvedBy.push(a ? `${a[1]} (${fmtTime(a[2])})` : m[2]);
+                setFact('Approved by', approvedBy.join(', '));
+            } else if (m) {
+                const label = { ID: null, Request: 'Request', Executor: 'Run by', Time: 'Started', Command: 'Command', Executable: 'Executable' }[m[1]];
                 if (label) setFact(label, m[1] === 'Time' ? fmtTime(m[2]) : m[2]);
             }
             return;

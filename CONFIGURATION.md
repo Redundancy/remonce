@@ -6,14 +6,14 @@ This document identifies the configuration options available for Remonce, includ
 
 Both `remonce web` (the signer) and `remonce agent` (the executor) read the same `config.toml` from the current working directory. Each binary only uses the sections relevant to it.
 
-Unknown keys are rejected at startup: a misspelled setting (say `max_validity` instead of `approver_max_validity`) fails loudly instead of silently falling back to a default.
+Unknown keys are rejected at startup: a misspelled setting (say `approval_valid` instead of `approval_validity`) fails loudly instead of silently falling back to a default.
 
 ### Deployment model
 
 Remonce is designed around a split:
 
-- **`remonce web`** — the **signer** runs on the operator's own workstation, always on loopback. It hosts the OIDC login + command-signing UI. Because nothing crosses the network, TLS on this tier is unnecessary and the server **refuses to bind anything other than `127.0.0.1` / `::1`**.
-- **`remonce agent`** — the **executor** runs on the remote target server and accepts signed commands over the network. It is the one network-facing component, so **TLS is mandatory**. There is no plaintext mode.
+- **`remonce web`** — the **signer** runs on the user's own workstation, always on loopback. It hosts the OIDC login, the approval UI, and the proxy through which the browser reaches agents. Because nothing crosses the network, TLS on this tier is unnecessary and the server **refuses to bind anything other than `127.0.0.1` / `::1`**.
+- **`remonce agent`** — runs on the remote target server, publishes its command catalog, and runs approved requests submitted over the network. It is the one network-facing component, so **TLS is mandatory**. There is no plaintext mode.
 
 ### The `--insecure` flag
 
@@ -31,7 +31,7 @@ Currently gated settings:
 |---------|----------------|
 | `oidc.issuer_url` is `http://` and non-loopback | JWKS fetch at startup is MITM-able; compromises the entire identity trust chain |
 | `timestamp_authority.trust_system_store = true` | Trusts every CA in the OS store as a TSA signer (hundreds of CAs) |
-| `commands[].operator_max_validity > 1h` | Effectively turns off the at-execution-time freshness bound |
+| `commands[].approval_validity > 7d` | Approvals that stay usable for weeks are standing credentials, and the replay cache must remember them as long |
 | `opa_url` is `http://` and non-loopback | OPA's answer *is* the authorization decision; a MITM could return `allow` |
 | `agent.cors_allowed_origins` contains `"*"` | Allows any browser origin to call the agent |
 
@@ -42,8 +42,9 @@ A few settings are refused outright, even with `--insecure`, because they are wr
 | Setting | Why it's refused |
 |---------|------------------|
 | `oidc.client_id` empty | There is no signing client |
-| `oidc.viewer_client_id` equal to `oidc.client_id` (or empty) | Every signing token would also be a file/log viewing bearer token |
+| `oidc.viewer_client_id` equal to `oidc.client_id` (or empty) | Every signing token would also be a viewing and executing bearer token |
 | `oidc.signing_max_age` above 5 minutes | Agents reject logins older than that, so no signature could verify |
+| `commands[].approval_validity = "0s"` | No approval could ever be used |
 
 ### Web tier settings (`remonce web`)
 
@@ -60,14 +61,16 @@ listen_address = "127.0.0.1:8080"
 logs_dir = "logs"
 
 # Agent the web UI talks to. The browser never contacts the agent directly:
-# the signer proxies /api/agent/* and the /ws/* log streams to this URL over
-# TLS, and submits revocations there. Must be https://.
+# the signer proxies the catalog, executions, /ws/* log streams and
+# revocations to this URL over TLS. Must be https://. Because the signer
+# makes the calls, "localhost" here means the machine running the signer;
+# the UI labels such URLs with the signer's hostname.
 # Default: "https://localhost:10022"
 agent_url = "https://agent.example.com:10022"
 
 # Other agents the UI may be pointed at. The agent box in the UI can only
 # select agent_url or one of these; any other URL is refused, because the
-# signer sends the user's viewer token and signatures to whichever agent is used.
+# signer sends the user's viewer token and approvals to whichever agent is used.
 allowed_agent_urls = ["https://db01.example.com:10022", "https://web01.example.com:10022"]
 
 # Optional: PEM file with extra CA roots trusted when the signer connects to
@@ -144,8 +147,8 @@ cache_dir = "./certs/acme-cache"
 
 These settings connect the signer, agent and revocation service to your OIDC provider (Vault, Keycloak, etc.). Remonce uses **two clients**:
 
-- the **signing** client (`client_id`): every approval, cosign and revocation is a fresh login to it, with a new ephemeral key bound through the `nonce` and forced re-authentication. Agents accept its tokens only on the signing path.
-- the **viewer** client (`viewer_client_id`): the ordinary login for browsing. Its tokens are bearer credentials that agents accept only on the read-only file and log endpoints.
+- the **signing** client (`client_id`): every approval and revocation is a fresh login to it, with a new ephemeral key bound through the `nonce` and forced re-authentication. Agents accept its tokens only inside approvals and revocations.
+- the **viewer** client (`viewer_client_id`): the ordinary login. Its tokens are bearer credentials that agents accept on the read-only endpoints (catalog, files, logs) and as the **executor's identity** when a request is submitted.
 
 ```toml
 [oidc]
@@ -156,8 +159,8 @@ issuer_url = "http://127.0.0.1:8200/v1/identity/oidc/provider/vaultprovider"
 # The signing client.
 client_id = "your_signing_client_id"
 
-# The viewer client. Must differ from client_id. Required by `remonce web`;
-# an agent without it disables file and log viewing.
+# The viewer client. Must differ from client_id. Required by `remonce web`
+# and `remonce agent` (it identifies whoever submits a request).
 viewer_client_id = "your_viewer_client_id"
 
 # max_age sent on signing logins. Default "1s": always re-authenticate
@@ -193,13 +196,15 @@ Policy decisions requested by the agent (`input.action`):
 
 | Action | When | Input |
 |--------|------|-------|
-| `execute` | Running a signed command | approver/operator identities, `command`, `self_executed`, `host` |
-| `revoke` | Someone other than the approver revokes an approval | approver identity, revoker as `operator` |
+| `execute` | Running an approved request | `command`, `request_id`, `approvers` (each `username`, `claims`, `signed_at`), `executor` (`username`, `claims`), `host` |
+| `revoke` | Someone who didn't approve a request revokes it | `command`, `request_id`, `approvers`, `revoker`, `host` |
 | `read_file` | Streaming an allowed file | `jwt`, `file` |
 | `view_execution` | Streaming an execution's output log | `jwt`, `execution_id` |
-| `view_docs` | Listing commands in the signer UI | `jwt` |
+| `view_docs` | Reading the agent's command catalog | `jwt` |
 
-The agent's file and log-stream endpoints take the caller's **viewer** ID token as an `Authorization: Bearer` header (never a query parameter), and reject tokens for any other audience. The signer attaches it when proxying.
+The agent also reads `data.remonce.requirements` (see [Requirement documents](#requirement-documents)) to publish in its catalog.
+
+The agent's catalog, file and log-stream endpoints, and `/execute`, take the caller's **viewer** ID token as an `Authorization: Bearer` header (never a query parameter), and reject tokens for any other audience. The signer attaches it when proxying.
 
 ### Security & TSA (RFC 3161)
 
@@ -250,22 +255,18 @@ command_timeout = "5m"
 # through. If your executable needs PATH, add it explicitly.
 env = { PATH = "/usr/bin:/bin" }
 
-# Optional: delegation validity windows.
-# approver_max_validity   — how long a pre-signed command remains usable
-#                           after the approver signs. Default: 3d.
-# operator_max_validity   — how fresh the *executing* signature (operator
-#                           cosign, or approver sig when self-executing) must
-#                           be at the moment of execution. Default: 10m.
-approver_max_validity = "3d"
-operator_max_validity = "10m"
+# Optional: how long each approval stays usable after the approver's login.
+# Every approval in a request must still be valid when it runs. Default: 1h;
+# above 7d needs --insecure.
+approval_validity = "1h"
 ```
 
 ### Command parameters (`[[commands.params]]`)
 
 Args templates may contain `{{name}}` placeholders, filled from a `params`
 object in the signed command payload. Because `params` sits inside the
-command object, it is covered by the approver's signature — the operator
-cannot alter values after approval.
+command object, it is covered by every approval — nobody can alter values
+after approval.
 
 ```toml
 [[commands]]
@@ -309,100 +310,100 @@ Validation is **fail-closed** and runs on the agent at execution time:
 OPA sees the validated `params` via `input.command.params`, so policies can
 authorize per-value (e.g. only `oncall-managers` may restart `postgres`).
 
-### Delegation & signing validity
+### Approval validity
 
-Remonce separates **authorization freshness** (approver) from **execution freshness** (operator):
+Each approval is usable for the command's `approval_validity` (default 1 hour), measured from the signing login — the ID token's IdP-signed `iat` — as well as the TSA time. A TSA will timestamp any bytes, so a holder can always get a fresh timestamp over an old signature; the agent therefore also requires the TSA time to be within 5 minutes of `iat`, which a re-timestamp can't satisfy. An approval is usable until `iat + approval_validity`, whatever lifetime the IdP gives its tokens.
 
-| Setting | Default | Controls |
-|---------|---------|----------|
-| `approver_max_validity` | 3 days | How long a signed approval stays usable. A pre-authorized command can sit until the NOC picks it up, up to this limit. |
-| `operator_max_validity` | 10 minutes | How recent the executor's signature must be. In a delegated flow this is the operator's cosign; in self-execute it's the approver's own. |
+When a request needs several approvals, **all** of them must be valid when it runs, so the first approver's clock is the one that matters: collect approvals within the window, or set a longer one for commands whose approvals take time to gather. The replay cache remembers a run for the same window, so a longer validity also means more memory held per run.
 
-Both windows are measured from the signing login — the ID token's IdP-signed `iat` — as well as the TSA time. A TSA will timestamp any bytes, so a holder can always get a fresh timestamp over an old signature; the agent therefore also requires the TSA time to be within 5 minutes of `iat`, which a re-timestamp can't satisfy. A signature is usable until `iat + max_validity`, whatever lifetime the IdP gives its tokens, and the replay cache and revocation list keep their entries exactly that long.
+### Requirement documents
 
-**Self-execute vs delegated**: when the approver submits their own bundle immediately (no operator cosign), they must be within `operator_max_validity`. If you want longer self-execute windows, raise `operator_max_validity` — but remember this also lengthens the replay-cache window and the operator-side freshness bound.
-
-### Operator constraints (`operator_requires`)
-
-`operator_requires` is covered by the approver's signature and also decides the **delegation mode**:
-
-| `operator_requires` | Meaning |
-|---|---|
-| absent / `null` | **Self-execute only.** The approver runs it within `operator_max_validity`; a co-sign is rejected. |
-| `{ "any_of": [] }` | **Delegated to any operator** (subject to OPA). Self-execution is rejected. |
-| `{ "any_of": [ ... ] }` | **Delegated with constraints.** The operator must match at least one predicate. |
-
-In the web UI, choose **Delegate** when preparing a command (optionally adding requirements); `remonce cosign` refuses self-execute-only approvals up front.
-
-The predicates are enforced by the agent *before* OPA:
+What a command needs before it runs — how many approvals, from whom, and who may submit it — is published by policy, as OPA data at `data.remonce.requirements[<command>]`. The shipped policy loads it from [policy/requirements.json](policy/requirements.json) (OPA mounts JSON files in the policy directory under their `data` path):
 
 ```json
 {
-  "operator_requires": {
-    "any_of": [
-      { "op": "contains", "claim": "groups", "value": "noc-l2" },
-      { "op": "equals",   "claim": "team",   "value": "webapp-oncall" }
-    ]
+  "remonce": {
+    "requirements": {
+      "restart-db": {
+        "description": "A DBA and security must both agree",
+        "approvals": [
+          { "description": "a DBA", "any_of": [ { "op": "contains", "claim": "groups", "value": "dba" } ] },
+          { "description": "security", "any_of": [ { "op": "contains", "claim": "groups", "value": "security" } ] }
+        ],
+        "executors": { "description": "on-call SRE", "any_of": [ { "op": "contains", "claim": "groups", "value": "sre-oncall" } ] },
+        "additional_policy": "Only on db-* hosts"
+      }
+    }
   }
 }
 ```
 
-Semantics: if `any_of` is non-empty, at least one predicate must match the operator's OIDC token claims; an empty list means any authenticated operator in OPA's allow-set. Claims are evaluated at **execution time** against the operator's fresh token, so group changes propagate immediately. An approver co-signing their own delegation is reported to OPA as `self_executed: true`, so four-eyes rules still hold.
+| Field | Meaning |
+|---|---|
+| `approvals` | Up to 8 **slots**. Each needs its own approver, a different person per slot, whose claims match one of its predicates. `[]` means one approval from anyone. |
+| `executors` | Who may submit the request (their viewer login's claims). |
+| `any_of` | Predicates: `{"op": "contains", "claim", "value"}` (claim is an array containing `value`) or `{"op": "equals", "claim", "value"}`. `[]` means anyone; a missing `any_of` means no one. |
+| `description` | Shown to people instead of the raw predicates (optional, on the document and on each slot). |
+| `additional_policy` | A description of rules the policy adds beyond the document (optional). Set it whenever `authz.rego` denies more than the document says. |
+
+The agent serves each command's document in its catalog (`GET /api/commands`), so the UI can show what a command needs and which slots a request's approvals already fill. The shipped [policy/authz.rego](policy/authz.rego) allows an execution exactly when `lib.satisfied(requirement, input)` holds and no `extra_denials` rule fires, and denies a command with no document. The agent verifies every approval before asking, and rejects two approvals from the same person outright.
+
+Run the policy tests with `bin/opa test policy policy_test`. One of them checks that meeting each published document is enough to be allowed (unless it declares `additional_policy`), so the documents can't silently drift from the rules.
 
 ## Handing requests and approvals to someone
 
-Requests, approvals and co-signed bundles travel as files (or as the same content pasted as base64), so they work across any path you already use: chat and ticket attachments, email, SCP, remote-desktop clipboard or file transfer. The web UI saves them as:
+Requests travel as files (or as the same JSON pasted), so they work across any path you already use: chat and ticket attachments, email, SCP, remote-desktop clipboard or file transfer. The web UI saves them as:
 
 | File | Contains | Open it in |
 |---|---|---|
-| `remonce-<command>-<id>.request.json` | An unsigned request (`command` + `operator_requires`) | **Sign a request** |
-| `remonce-<command>-<id>.approval.json` | A signed approval | **Execute** (self-execute) or **Sign a request** (delegated, to co-sign) |
-| `remonce-<command>-<id>.cosigned.json` | An approval plus operator co-signature | **Execute** |
+| `remonce-<command>-<id>.request.json` | A request with no approvals yet | **Sign a request** |
+| `remonce-<command>-<id>.approval.json` | A request with one or more approvals | **Sign a request** (to add yours) or **Execute** (once it has enough) |
 
-On those pages, drop the file onto the input panel, use **Open file…**, or paste anywhere on the page. Files are read in the browser and never uploaded. Approval files are the same JSON `remonce cosign` and `remonce revoke` read.
+On those pages, drop the file onto the input panel, use **Open file…**, or paste anywhere on the page. Files are read in the browser and never uploaded. Both pages show the approvals so far and, from the selected agent's catalog, which requirement slots they fill. They are the same JSON the CLI reads.
 
-## CLI cosigning (`remonce cosign`)
+## CLI (`remonce approve`, `remonce submit`)
 
-Operators who receive a delegated approval can co-sign it without running the web UI:
+Approve and run requests without the web UI:
 
 ```bash
-# Co-sign a bundle (JSON file or base64 token; '-' reads stdin) and submit it
-remonce cosign --bundle remonce-backup-db-1a2b3c4d.approval.json --submit
+# Add your approval ('-' reads stdin; -o writes the result instead of stdout)
+remonce approve --bundle remonce-backup-db-1a2b3c4d.request.json -o remonce-backup-db-1a2b3c4d.approval.json
 
-# Or just emit the cosigned ExecutionBundle for later submission
-remonce cosign -b remonce-backup-db-1a2b3c4d.approval.json -o remonce-backup-db-1a2b3c4d.cosigned.json
+# Submit an approved request to an agent; you log in (viewer client) as the executor
+remonce submit --bundle remonce-backup-db-1a2b3c4d.approval.json --agent https://db01.example.com:10022
 ```
 
-The command reads `[oidc]` and `agent_url` / `agent_ca_path` from `config.toml`. It generates a fresh ephemeral keypair, runs a browser-based OIDC authorization-code flow against the signing client (PKCE, the nonce bound to the ephemeral key, and forced re-authentication — same pattern as the web UI), obtains an RFC 3161 timestamp on the cosignature, and produces an ExecutionBundle.
+The commands read `[oidc]` and `agent_url` / `agent_ca_path` from `config.toml`. `approve` generates a fresh ephemeral keypair, runs a browser-based OIDC authorization-code flow against the signing client (PKCE, the nonce bound to the ephemeral key, and forced re-authentication — the same as the web UI), obtains an RFC 3161 timestamp on the signature, and appends the approval. It refuses to add a second approval from someone who already approved. `submit` runs an ordinary login to the viewer client and sends the request with that token.
 
-- `--agent <url>` overrides `agent_url` for `--submit`. Must be `https://`.
-- The OIDC redirect listener binds the host/port from `oidc.redirect_uri`. If `remonce web` is already running on that port, co-sign from its "Sign a request" page instead.
-- Note for CI: tokens minted by platform OIDC issuers (e.g. GitHub Actions) cannot carry a custom nonce, so they cannot bind an ephemeral key. CLI cosigning is for humans; machine flows need an issuer that honors the `nonce` parameter.
+- `--agent <url>` overrides `agent_url`. Must be `https://`.
+- The OIDC redirect listener binds the host/port from `oidc.redirect_uri`. If `remonce web` is already running on that port, use its pages instead.
+- A bare command object (`{"command": "name", "id": …}`) is accepted as a request with no approvals.
+- Note for CI: tokens minted by platform OIDC issuers (e.g. GitHub Actions) cannot carry a custom nonce, so they cannot bind an ephemeral key. Approving is for humans; machine flows need an issuer that honors the `nonce` parameter.
 
-## Revoking an approval (`remonce revoke`)
+## Revoking a request (`remonce revoke`)
 
-An issued approval can be invalidated before it expires by submitting it to the agent's `POST /revoke` endpoint, together with a fresh, nonce-bound attestation from the revoker:
+A request can be cancelled before it runs by submitting it, with at least one of its approvals, to the agent's `POST /revoke` endpoint together with a fresh, nonce-bound attestation from the revoker:
 
 ```bash
-# Revoke a bundle (JSON file or base64 token; '-' reads stdin)
-remonce revoke --bundle approval.json
+# '-' reads stdin
+remonce revoke --bundle remonce-backup-db-1a2b3c4d.approval.json
 
 # Target a specific agent
-remonce revoke -b approval.json --agent https://agent.example.com:10022
+remonce revoke -b remonce-backup-db-1a2b3c4d.approval.json --agent https://agent.example.com:10022
 ```
 
-The same flow is available from the web UI's Execute page ("Revoke Approval" button), which runs its own re-authenticating login and submits the revocation to the agent.
+The same flow is on the web UI's Execute page (**Revoke request**), which runs its own re-authenticating login and submits the revocation to the selected agent.
 
 How it works:
 
-- The revoker generates a fresh ephemeral keypair and runs the same nonce-bound, re-authenticating OIDC login as cosigning, then signs a domain-separated payload (`REMONCE-REVOKE:` prefix) over the approver's signature — so a cosignature can never be replayed as a revocation, or vice versa.
-- The revocation is recorded against the approval's **key binding** (`SHA256` of the approver's public key, as attested in the token's `nonce`), not its signature bytes — so a malleated copy of the signature can't slip past it.
-- The agent first re-verifies the approver bundle itself; only genuine approvals can be pinned to the revocation list (prevents cache poisoning).
-- **Self-revocation** (revoker has the same OIDC `sub` as the approver) is always allowed. **Third-party revocation** requires an OPA decision with `input.action == "revoke"` (see `policy/authz.rego`).
-- The revoker attestation must be fresh within `operator_max_validity`.
-- A revoked approval is rejected by `/execute` until its natural expiry (`approver_max_validity`).
+- A revocation cancels the **whole request**, by request id (the hash of the signed request). Neither its current approvals nor any later ones can run it.
+- The revoker signs a domain-separated payload, `REMONCE-REVOKE/v2:` || request id || their public key, which is never valid as an approval (and an approval is never valid as a revocation).
+- The agent re-verifies the request's approvals first (they needn't still be fresh). Only requests with a genuine approval can be pinned to the revocation list, which prevents filling it with invented requests.
+- **Any approver** of the request (same OIDC `sub`) may always revoke it. **Anyone else** needs an OPA decision with `input.action == "revoke"` (see `policy/authz.rego`).
+- The revoker's attestation must be at most 10 minutes old.
+- A revocation lasts until no approval of the request could still be valid (`approval_validity` after the latest approver's login).
 
-Without a central revocation service (below), the revocation list is **in-memory and per-agent**: submit the revocation to every agent the bundle targets, and note that an agent restart forgets it.
+Without a central revocation service (below), the revocation list is **in-memory and per-agent**: submit the revocation to every agent the request targets, and note that an agent restart forgets it.
 
 ## Central revocation service (`remonce revocation-service`)
 
@@ -430,12 +431,12 @@ revocation_service_url = "https://revocations.example.com:10023"
 
 Semantics:
 
-- The service exposes the same `POST /revoke` endpoint as the agent and performs the **same full verification** (approver bundle genuineness, revoker attestation, self-vs-third-party OPA check) — it cannot be poisoned with unverified entries. `remonce revoke --agent https://revocations...` can therefore target it directly.
-- When `revocation_service_url` is set, the agent checks `GET /revoked/{key_binding}` (64 lowercase hex characters) before every execution and a revocation submitted to any agent is forwarded to the service.
+- The service exposes the same `POST /revoke` endpoint as the agent and performs the **same full verification** (genuine approvals, revoker attestation, approver-vs-third-party OPA check) — it cannot be poisoned with unverified entries. `remonce revoke --agent https://revocations...` can therefore target it directly.
+- When `revocation_service_url` is set, the agent checks `GET /v2/revoked/{request_id}` (64 lowercase hex characters) before every execution, and a revocation submitted to any agent is forwarded to the service.
 - **Fail-closed**: if the service is configured but unreachable, the agent denies execution (`Revocation Check Failed`). A configured revocation service must be available — there is deliberately no fail-open mode.
-- Revocations expire from the store when the underlying approval would have aged out of `approver_max_validity` anyway; expired entries are compacted out of the JSONL file on service restart.
-- The service reads the same `config.toml` sections as the agent (`[oidc]`, `[timestamp_authority]`, `[[commands]]`, `opa_url`), since it performs the same verification. It also accepts revocations for commands missing from its own `[[commands]]` (verified with default windows; third parties judged by the default OPA rule), since it serves agents whose command sets it may not mirror.
-- `retention` must be at least the longest `approver_max_validity` any agent allows; each revocation is kept until the revoked approval's `iat` plus the larger of the two.
+- Revocations expire from the store once they can no longer matter (see `retention`); expired entries are compacted out of the JSONL file on service restart.
+- The service reads the same `config.toml` sections as the agent (`[oidc]`, `[timestamp_authority]`, `[[commands]]`, `opa_url`), since it performs the same verification. It also accepts revocations for commands missing from its own `[[commands]]` (verified with the default `approval_validity`; third parties judged by the default OPA rule), since it serves agents whose command sets it may not mirror.
+- `retention` must be at least the longest `approval_validity` any agent allows; each revocation is kept until the latest approver's `iat` plus the larger of the two.
 - Writes are fsync'd before the service acknowledges them. A torn final line left by a crash is ignored at startup; corruption anywhere else refuses to start (agents then fail closed).
 
 ## Upgrading to per-signature logins
@@ -445,3 +446,13 @@ This release changes what agents accept, with no compatibility mode:
 1. **Register two OIDC clients.** Create a new signing client (or reuse the old one) and a new viewer client, add both to the provider, and set `client_id` and `viewer_client_id`. See "IdP requirements" above; for Vault, [docs/idp/VAULT.md](docs/idp/VAULT.md).
 2. **Upgrade the signer, CLI, agents and revocation service together.** Bundles signed by older signers lack the re-authentication evidence (and may carry high-S signatures), so agents reject them. Re-sign any outstanding approvals.
 3. **Archive the revocation log.** The revocation service now records key bindings instead of signature hex, and refuses to start on an old `revocations.jsonl`. Move it aside; approvals it listed can't pass the new verification anyway.
+
+## Upgrading to requests with independent approvals
+
+This release replaces approver/operator bundles, again with no compatibility mode:
+
+1. **Requests, not delegation.** A request is `{command, approvals}`; each approval is an independent signature over the same payload. `operator_requires`, co-signing and `remonce cosign` are gone. Signers, CLIs and agents reject each other's formats across versions, and name the old one when they see it. Re-create outstanding requests.
+2. **Move rules into requirement documents.** What `operator_requires` said (who may run it) and any four-eyes rules (`not input.self_executed`) become a command's `executors` and `approvals` in `policy/requirements.json`; see [Requirement documents](#requirement-documents). OPA input changed: `input.approver` / `input.operator` / `input.self_executed` are replaced by `input.approvers`, `input.executor` and `input.request_id`. The shipped policy denies commands with no document.
+3. **Replace validity settings.** `approver_max_validity` and `operator_max_validity` are replaced by `approval_validity`; the old keys are rejected with a hint.
+4. **Agents need `viewer_client_id`.** Submitting a request now requires a viewer login, which identifies the executor.
+5. **Upgrade agents and the revocation service together**, and archive the revocation log. Revocations are now by request id at `/v2/revoked/{request_id}`, and the service refuses to start on an older `revocations.jsonl`.

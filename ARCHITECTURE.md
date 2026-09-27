@@ -26,7 +26,7 @@ This architecture uses the same core mechanism as [OpenPubkey](https://github.co
 
 1.  **Ephemeral Key Generation**: The client generates a random key pair for **one signature**.
 2.  **Identity Binding**: The client runs a fresh OIDC login to the *signing* client, putting the hash of the Public Key into the JWT `nonce` and forcing re-authentication (`max_age`, optionally `prompt=login`).
-3.  **Command Signing**: The client signs the command payload with the private key (normalized to low-S), then discards the key.
+3.  **Request Signing**: The client signs the request payload with the private key (normalized to low-S), then discards the key.
 4.  **Verification Chain**:
     -   The **Signature** validates the command was signed by the Private Key.
     -   The **JWT** (signed by IdP) validates that the Public Key (in `nonce`) belongs to the User (in `sub`).
@@ -50,133 +50,138 @@ OpenPubkey is an open-source protocol that augments OIDC with proof-of-possessio
 | **Use Case** | Remote command execution | General identity signing |
 | **Timestamping** | RFC 3161 TSA for non-repudiation | Not standard |
 | **Policy Engine** | Built-in OPA integration | Application-specific |
-| **MFA Cosigner** | Not implemented | Optional (reduces single IdP trust) |
+| **Multi-party approval** | N independent approvals, requirements set by policy | Optional MFA cosigner (reduces single IdP trust) |
 
 Remonce extends the OpenPubkey concept with **integrated authorization** (OPA) and **cryptographic timestamping** (TSA), making it purpose-built for auditable command execution rather than general-purpose signing.
 
 ### Time-Bounding & Non-Repudiation
 
-JWTs are short-lived, but we may want to execute commands slightly later. However, we must prove the command was signed *while the user was present*.
+JWTs are short-lived, but a request may run some time after it is approved. We must still prove each approval was made *while the approver was present*.
 
 -   **Solution**: **Timestamping Authority (TSA)**.
 -   We send the signature to an RFC 3161 TSA.
 -   The TSA returns a signed timestamp proving the signature existed at time $T$.
--   **Validation**: The Agent checks that $T$ is within the validity period of the User's ID Token.
+-   **Validation**: The Agent checks that $T$ is within the validity period of the approver's ID Token.
 -   **Freshness is measured from the login, not the timestamp.** A TSA will timestamp any bytes, so whoever holds a signature and its ID token can obtain a *fresh* timestamp over them. The timestamp alone therefore can't bound freshness. Because every signature gets its own login, the token's IdP-signed `iat` is effectively the signing time, and the agent requires:
     -   `iat − skew ≤ T ≤ iat + MAX_SIGN_DELAY` (5 minutes): a signature can't be re-timestamped long after the login that produced it;
     -   `iat − auth_time ≤ MAX_AUTH_AGE` (5 minutes): the login was a real re-authentication, not a silent SSO refresh;
-    -   the role's freshness window (`operator_max_validity` / `approver_max_validity`) measured from **both** `iat` and $T$.
+    -   the command's `approval_validity` (default 1 hour) measured from **both** `iat` and $T$.
 
-    The token's `exp` only has to be after $T$. Its lifetime is the IdP's choice and no longer extends how long a signature is usable: a signature is usable until `iat + window`, whatever the IdP issues.
+    The token's `exp` only has to be after $T$. Its lifetime is the IdP's choice and doesn't extend how long an approval is usable: an approval is usable until `iat + approval_validity`, whatever the IdP issues.
 
-## Delegated Signing (Approver + Operator)
+## Requests and Approvals
 
-Real-world operations rarely have the person authorizing an action also executing it. A senior engineer wants to approve a maintenance runbook in advance so the on-call NOC operator can execute it at 3am without waking the approver. Remonce models this directly with a two-signature protocol.
+Signing *is* approving. A **request** is a command — what to run, where, with which parameters, and a unique `id` — and each **approval** is one person's independent signature over it, made with their own fresh login and one-time key. Approvals can be added in any order, on any machine; nobody signs "for" anyone else.
 
-### Roles
-
--   **Approver**: authorizes an action. Signs the command + constraints with a **long** validity (default: 3 days). Can optionally restrict *who* may execute via OIDC claim predicates.
--   **Operator**: executes the action. Adds a co-signature with a **short** validity (default: 10 minutes). Provides at-execution-time freshness and attribution.
--   **Approver self-execute**: when the approver's own TSA timestamp is within the short (operator) window, no co-signature is required — they are acting as both roles. This is the common path for synchronous operations.
-
-### Delegation mode is signed
-
-Whether a bundle is meant for self-execution or for delegation is part of what the approver signs: the `operator_requires` field doubles as the mode.
-
-| `operator_requires` | Mode | Self-execute | Co-sign |
-|---|---|---|---|
-| absent / `null` | Self-execute only | allowed (within the short window) | **rejected** |
-| `{ "any_of": [] }` | Delegated to any operator | **rejected** | allowed (OPA still applies) |
-| `{ "any_of": [ ... ] }` | Delegated with constraints | **rejected** | allowed if a predicate matches |
-
-Without this, the unsigned `operator` field alone would decide the path: anyone holding a bundle meant for a `noc-l2` operator could drop the field and run it as the approver, and any self-execute bundle could be co-signed by anyone for days.
+How many approvals a command needs, from whom, and who may run it is **policy's** decision, not the requester's: nothing in a request says what it needs. Policy publishes that as a *requirement document* per command, which the agent serves in its catalog so anyone looking at a command can see what it takes.
 
 ### Bundle shape
 
 ```
-ExecutionBundle
-├── approver: ApproverBundle
-│     command                    // the JSON the approver authorized
-│     operator_requires?         // null = self-execute only; present = delegated (+ predicates)
-│     signature                  // over canonical(command + operator_requires)
-│     id_token, public_key, timestamp_token
-└── operator: OperatorCosign?    // absent when the approver self-executes
-      approver_sig               // hex of the approver's signature — binds this cosign
-      signature                  // over (approver_sig || operator.public_key_pem)
+RequestBundle
+├── command                      // the JSON being approved: command, id, target_machines, params, not_before/not_after
+└── approvals: [Approval]        // 0 while it's still a bare request; at most 16
+      signature                  // over canonical({"command": …, "remonce": "request/v2"})
       id_token, public_key, timestamp_token
 ```
 
+Every approval signs the same bytes: the command wrapped with a domain tag, as compact JSON with sorted keys. The **request id** is the hex SHA-256 of those bytes. It names the request for replay protection and revocation, and it is the same however many approvals the bundle carries. A bundle is plain JSON, so it travels as a file (`.request.json` with no approvals, `.approval.json` with some) over whatever channel reaches the next person.
+
+### The executor
+
+Whoever submits a complete bundle to an agent is the **executor**. Submitting needs an ordinary login to the *viewer* client, whose token goes with the request as a bearer credential. The executor is never anonymous: they are recorded in the audit log and the run log, and passed to policy as `input.executor`, where the requirement document's `executors` rule (and any other policy) restricts them like any other identity. An executor doesn't need to be an approver and doesn't sign anything; their viewer token can't sign or approve, and approvals' tokens (signing client) are rejected as executor credentials.
+
 ### Verification (agent)
 
-0.  Enforce the signed delegation mode: reject a co-sign on a self-execute-only bundle, and a missing co-sign on a delegated one. All signature hex must be canonical lowercase, and every signature must be **low-S** (the `s → n−s` twin of a valid ECDSA signature is rejected).
-1.  Verify the approver signature over `canonical(command + operator_requires)`.
-2.  Verify the approver's TSA token covers `(approver_signature || approver_id_token)`.
-3.  Verify the approver's OIDC JWT: signature, issuer, **strict audience** (`aud` is exactly the signing client — a string or one-element array — and `azp`, if present, matches), `nonce == SHA256(approver.public_key_pem)`, `exp > approver_tsa_timestamp`, and the `iat` / `auth_time` rules above.
-4.  **If operator cosign present**:
-    -   Verify the operator signature covers `(approver_sig_hex || operator.public_key_pem)` — this binds the cosign to *this specific* approver signature (prevents stapling).
-    -   Verify the operator's TSA token and JWT the same way as the approver's.
-    -   **Freshness**: the operator's `iat` and TSA time must be within `operator_max_validity`; the approver's within `approver_max_validity`.
-    -   **Claim predicates**: if `operator_requires.any_of` is non-empty, at least one predicate must match the operator's JWT claims.
-5.  **Else (self-execute)**: the approver's own `iat` and TSA time must be within the short (`operator_max_validity`) window.
-6.  `self_executed` is true whenever approver and operator share the same OIDC `sub` — including an approver co-signing their own delegated bundle — so four-eyes policies (`not input.self_executed`) can't be satisfied by one person.
+In this order; each step's failure is audited and stops the request.
 
-Only after these checks does the agent hand control to OPA, which sees both identities as `input.approver` and `input.operator` plus an `input.self_executed` flag. Most policy rules will be approver-centric; operator attestation is a fixed agent-level control.
+1.  **Executor**: a viewer-client bearer token, strictly audience-checked. Missing or invalid → 401.
+2.  **Parse** the bundle (a pre-v2 approver/operator bundle gets a clear "made by an older version" error), find the command in this agent's config, and require a UUID `id`.
+3.  **Approvals** (`verify_request`): 1–16 of them. For each, in bundle order:
+    -   canonical lowercase signature hex, **low-S** (the `s → n−s` twin of a valid ECDSA signature is rejected), and a valid signature over the canonical request payload;
+    -   the TSA token covers `(signature || id_token)`;
+    -   the OIDC JWT: signature, issuer, **strict audience** (`aud` is exactly the signing client — a string or one-element array — and `azp`, if present, matches), `nonce == SHA256(public_key_pem)`, `exp > T`, a non-empty `sub`, and the `iat` / `auth_time` rules above;
+    -   fresh within the command's `approval_validity`.
 
-### Claim predicates
+    Then **no two approvals may share a `sub`**: two approvals are always two people. Errors name the approval's index.
+4.  **Command checks**: this host is in `target_machines`, `not_before` / `not_after` hold, and parameters validate against the config.
+5.  **Revocation**: the request id against the local revocation set, then the central service if one is configured (fail-closed).
+6.  **Policy**: OPA gets `action = "execute"`, the command, the request id, every approver (`username`, `claims`, `signed_at`), the executor and the host.
+7.  **Replay**: the request id is recorded, and a second submission is refused. This is last, so a request refused for another reason isn't used up.
 
-The predicate language is deliberately small — if you need more expressive logic, put it in OPA rather than growing the predicate grammar:
+### Requirement documents
+
+Policy data at `data.remonce.requirements[<command>]` (shipped in [policy/requirements.json](policy/requirements.json)):
+
+```json
+{
+  "description": "Two people must agree before this runs",
+  "approvals": [
+    { "description": "a DBA",       "any_of": [ { "op": "contains", "claim": "groups", "value": "dba" } ] },
+    { "description": "security",    "any_of": [ { "op": "contains", "claim": "groups", "value": "security" } ] }
+  ],
+  "executors": { "description": "on-call SRE", "any_of": [ { "op": "contains", "claim": "groups", "value": "sre-oncall" } ] },
+  "additional_policy": "Not during the Friday change freeze"
+}
+```
+
+-   Each entry in `approvals` is a **slot** that needs its own approver: the request is satisfied when every slot can be given a *different* approver whose claims it accepts. This is checked with Hall's condition over subsets of slots (at most 8), not greedily, so a valid assignment is always found if one exists. With no slots, one approval from anyone is enough (an agent never runs a request without at least one).
+-   `executors` says who may submit it.
+-   `any_of: []` means anyone; a missing `any_of` means no one.
+-   `additional_policy` is a description, shown to people, of rules the policy adds beyond the document.
+
+The shared Rego helper [policy/lib.rego](policy/lib.rego) evaluates a document (`lib.satisfied(requirement, input)`), so what the catalog shows and what policy enforces come from the same data. [policy/authz.rego](policy/authz.rego) denies a command with no published document; a test in `policy_test/` checks that meeting a document is enough to be allowed unless the document declares `additional_policy`, so the two can't silently drift apart.
+
+The predicate language is deliberately small; put anything more expressive in Rego and describe it in `additional_policy`:
 
 | Op | Shape | Matches when |
 |----|-------|-------------|
-| `equals`    | `{ "op": "equals", "claim": "team", "value": "webapp" }` | Claim scalar equals `value` |
+| `equals`    | `{ "op": "equals", "claim": "team", "value": "webapp" }` | Claim equals `value` |
 | `contains`  | `{ "op": "contains", "claim": "groups", "value": "noc-l2" }` | Claim array contains `value` |
 
-`any_of` semantics: if any predicate in the list matches, the operator passes. Empty list means no claim restriction. Evaluation happens at **execution time** against the operator's freshly-issued OIDC token — so personnel changes (someone leaving a group) take effect immediately, not at approval time.
+Predicates are evaluated at **execution time** against the approvers' and executor's verified claims, so a group change takes effect for requests not yet run.
+
+### The catalog
+
+`GET /api/commands` on the agent (viewer bearer; policy's `view_docs` decides who may see it) lists what can be requested there: each command's name, description, parameters, `approval_validity`, and its requirement document fetched from OPA, plus the agent's hostname. It never includes how a command runs (executable, arguments, working directory, environment, policy rule). The signer's UI reads the catalog of whichever agent is selected.
 
 ### Replay protection
 
-The agent keeps an in-memory cache keyed on the *executor's key binding* (operator if delegated, approver if self-executing): the verified `nonce`, `SHA256(public_key_pem)`. It sits inside the IdP-signed token, so unlike signature bytes it can't be mauled into a fresh-looking variant, and with one key per signature it identifies the signature uniquely. The first submission succeeds; later submissions are rejected for as long as the signature could still pass freshness — until the executor's `iat` plus `operator_max_validity`. The entry is recorded as the last check before the process spawns (and released if spawning fails), so a bundle rejected for an unrelated reason can be retried.
+The agent keeps an in-memory cache keyed on the **request id**. The hash of the signed request can't be re-encoded or re-signed into a different key: a request carries a unique `id`, and any change to the command is a different request that needs new approvals. The first submission runs; later ones are refused, whoever approved or submits them. An entry lasts until every approval that could have run the request has expired (`now + skew + approval_validity`, or later if an approval in the bundle lasts longer). It is recorded as the last check before the process spawns, and released if spawning fails.
 
-Revocations key on the approver's key binding the same way, on every agent and on the central revocation service.
+## Revocation
 
-This complements — doesn't replace — the freshness windows: freshness bounds exposure, replay cache prevents double-execution within that window.
+Revoking cancels a **whole request**, whoever approved it: the revocation list is keyed on the request id, so neither these approvals nor any later ones can run it. The revoker presents the request with at least one genuine approval (so nobody can fill the list with invented requests; the approvals needn't still be fresh) and their own fresh signature, at most 10 minutes old, over a domain-separated payload that is never valid as an approval:
+
+```
+"REMONCE-REVOKE/v2:" || request_id || revoker_public_key_pem
+```
+
+Any of the request's approvers may revoke it. Anyone else needs policy's permission (`action = "revoke"`, with the approvers and `input.revoker`). A revocation is kept until no approval of the request could still be valid, or for the central service's retention period if that's longer. Agents consult a central revocation service fail-closed (`GET /v2/revoked/{request_id}`), and pin every revocation locally too. See [CONFIGURATION.md](CONFIGURATION.md#revoking-a-request-remonce-revoke).
 
 ## Policy Engine (OPA)
 
 Authentication proves *who* you are. Authorization proves *what* you can do.
 
-Remonce integrates **Open Policy Agent (OPA)** to evaluate every request. OPA receives both the approver and operator identities (claims, username, signed_at) plus `self_executed`. Rules can:
+Remonce integrates **Open Policy Agent (OPA)** to decide every execution, revocation by a non-approver, and read of files, logs and the catalog. For an execution, OPA sees the command, request id, every verified approver, the executor and the host. The shipped policy allows a run when the command's requirement document is satisfied and no extra rule denies it; add rules in `extra_denials` (and describe them in the document's `additional_policy`).
 
--   Allow based on the approver's group (`input.approver.claims.groups`).
--   Require distinct identities via `not input.self_executed` (four-eyes).
--   Layer additional operator-side restrictions beyond the approver-embedded `operator_requires`.
-
-A deny-by-default posture is the default. Example rules in [policy/authz.rego](policy/authz.rego).
+Deny-by-default is the posture. Example rules in [policy/authz.rego](policy/authz.rego); tests in `policy_test/`.
 
 ## Future Considerations
 
-### Revocation
-Implemented: approvers (or, with OPA's consent, others) can revoke an approval before it expires, per agent or estate-wide through a central revocation service that agents consult fail-closed. See [CONFIGURATION.md](CONFIGURATION.md#revoking-an-approval-remonce-revoke).
+### Zero Knowledge Proofs (ZK-JWT) — proposal, not implemented
+A request exposes each approver's full ID token to whoever holds the bundle. The token is useless for signing new commands (it is nonce-bound to a one-time key), and its audience is the *signing* client, which the agent's viewer endpoints and executor check reject. It still discloses every claim the IdP put in it, and it remains a valid bearer token for any *other* service that accepts that audience without checking the binding.
 
-### Multi-party approval chains
-The current design accepts exactly one approver + one optional operator. For workflows that need $N$ approvers, the approver bundle would generalize to a list, with the verification extending naturally. Not currently implemented.
+A zero-knowledge proof could keep the raw JWT (and its signature) with the approver, disclosing only the claims policy needs:
 
-### Zero Knowledge Proofs (ZK-JWT) with SP1 — proposal, not implemented
-Delegation currently exposes the approver's full ID token to whoever executes the bundle. The token is useless for signing new commands (it is nonce-bound to the approver's ephemeral key), and its audience is the *signing* client, which the agent's viewer endpoints reject — so it can't be used to browse files or logs either. It still discloses every claim the IdP put in it, and it remains a valid bearer token for any *other* service that accepts that audience without checking the binding.
-
-A general-purpose zkVM such as [SP1](https://github.com/succinctlabs/sp1) could remove that exposure. The goal is not to hide *who* approved, but to keep the raw JWT (and its signature) away from the executor:
-
-*   **Mechanism**: the approver runs a Rust program inside the zkVM with the JWT and ephemeral public key as private inputs.
-*   **Circuit logic**: verify the ID token's signature against the IdP key (public input), and extract `sub`, `iss`, `aud`, `exp`, `nonce` and `groups`/`roles`.
-*   **Public outputs**: the identity claims, the ephemeral public key the nonce binds, and the `kid` that verified the token.
-*   **Agent flow**: verify the command signature against the public key, verify the proof, check the `kid` against the IdP's JWKS, and check the proof binds that same public key.
-*   **Trade-offs**: logic is plain Rust rather than a circuit DSL, but proving takes seconds to minutes versus microseconds for native checks.
-
-Earlier we also looked at zkSNARKs such as [Spartan](https://github.com/Microsoft/Spartan) for privacy-preserving signatures; standard OIDC was judged sufficient without the proving overhead.
+*   **Mechanism**: the approver proves, with the JWT and ephemeral public key as private inputs, that the token verifies against the IdP key (public input) and binds that public key.
+*   **Public outputs**: the claims policy needs (`sub`, `iss`, `aud`, `iat`, `auth_time`, groups/roles), the bound public key, and the `kid` that verified the token.
+*   **Agent flow**: verify the request signature against the public key, verify the proof, check the `kid` against the IdP's JWKS.
+*   **Where proving runs**: in the approver's browser, so the signing token never has to leave it. [Noir](https://noir-lang.org/) compiled to a circuit and proved with Barretenberg's WebAssembly prover is the candidate: its proofs are small and it can prove a JWT check in seconds in a browser. A general-purpose zkVM ([SP1](https://github.com/succinctlabs/sp1)) was set aside: its STARK proofs aren't zero-knowledge (they would leak the private inputs), and wrapping them in Groth16 or PLONK needs far more memory, and a multi-gigabyte proving-key download, than a workstation should.
 
 #### Why keep ephemeral keys?
-Each login now signs exactly one thing, so the command hash could go straight into the nonce. The key stays because:
+Each login signs exactly one thing, so the request hash could go straight into the nonce. The key stays because:
 
--   cosign and revocation payloads include the signer's public key, and the TSA timestamp covers a proof-of-possession signature;
--   the wire format and verifier are the same for approve, cosign and revoke;
--   the key binding is a stable, non-malleable identity for the replay and revocation caches.
+-   the revocation payload includes the signer's public key, and the TSA timestamp covers a proof-of-possession signature;
+-   the wire format and verifier are the same for approving and revoking;
+-   a ZK proof would bind the public key rather than a particular payload.

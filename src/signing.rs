@@ -43,15 +43,6 @@ pub fn key_from_hex(hex_str: &str) -> Result<SigningKey, String> {
         .map_err(|_| "Invalid signing key bytes".to_string())
 }
 
-/// One signed, timestamped leg: the fields shared by `ApproverBundle`,
-/// `OperatorCosign` and `RevokerAttestation`.
-pub struct Attestation {
-    pub signature: String,
-    pub id_token: String,
-    pub public_key: String,
-    pub timestamp_token: String,
-}
-
 /// Sign `payload` (low-S) and obtain an RFC 3161 timestamp over
 /// `(sig_bytes || id_token)`.
 pub async fn attest(
@@ -61,7 +52,7 @@ pub async fn attest(
     public_key_pem: &str,
     id_token: String,
     payload: &[u8],
-) -> Result<Attestation, String> {
+) -> Result<crate::security::Approval, String> {
     let signature = crate::security::sign_low_s(key, payload);
     let signature_bytes = signature.to_bytes();
 
@@ -71,7 +62,7 @@ pub async fn attest(
         .await
         .map_err(|e| format!("TSA error: {e}"))?;
 
-    Ok(Attestation {
+    Ok(crate::security::Approval {
         signature: hex::encode(signature_bytes),
         id_token,
         public_key: public_key_pem.to_string(),

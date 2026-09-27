@@ -154,6 +154,7 @@ a:hover { text-decoration: underline; }
   font-size: 12px;
   width: min(420px, 50%);
 }
+.agent-where { flex: 0 0 auto; font-size: 11.5px; color: var(--fg-3); white-space: nowrap; }
 .agent-field:focus-within { border-color: var(--accent-dim); box-shadow: 0 0 0 3px var(--accent-bg); }
 .agent-field label { text-transform: uppercase; letter-spacing: 0.08em; font-size: 10.5px; font-weight: 600; color: var(--fg-4); }
 .agent-field input {
@@ -278,6 +279,12 @@ button.cmd-card:hover { border-color: var(--line-3); background: var(--bg-3); }
 }
 .cmd-name { font-family: var(--mono); font-size: 14px; font-weight: 500; letter-spacing: -0.01em; word-break: break-all; }
 .cmd-desc { color: var(--fg-3); font-size: 12.5px; line-height: 1.5; }
+.cmd-req { color: var(--fg-2); font-size: 12.5px; line-height: 1.5; }
+.tag { display: inline-flex; align-items: center; gap: 4px; margin-left: 8px; padding: 1px 7px; border: 1px solid var(--line-2); border-radius: 999px; font-size: 11.5px; color: var(--fg-3); vertical-align: 1px; }
+.tag .icon { width: 11px; height: 11px; }
+.tag.ok { border-color: oklch(0.88 0.17 150 / 0.4); background: var(--accent-bg); color: var(--fg-1); }
+.tag.ok .icon { color: var(--accent); }
+.tag.bad { border-color: var(--danger-line); background: var(--danger-bg); color: var(--danger-fg); }
 .cmd-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .meta-pill {
   display: inline-flex; align-items: center; gap: 5px;
@@ -376,9 +383,6 @@ button.cmd-card:hover .cmd-sign { background: var(--accent); border-color: var(-
 
 .empty { color: var(--fg-3); padding: 28px; text-align: center; border: 1px dashed var(--line-2); border-radius: var(--radius-md); }
 
-/* Delegation requirement rows */
-.req-row { display: grid; grid-template-columns: 1fr 120px 1fr auto; gap: 8px; margin-bottom: 8px; }
-
 /* ========== Modal ========== */
 .modal-scrim {
   position: fixed; inset: 0;
@@ -436,17 +440,6 @@ button.cmd-card:hover .cmd-sign { background: var(--accent); border-color: var(-
 .signet { width: 148px; height: 148px; justify-self: center; filter: drop-shadow(0 8px 20px oklch(0 0 0 / 0.4)); }
 .signet svg { width: 100%; height: 100%; display: block; }
 .sign-headline { font-family: var(--serif); font-style: italic; font-size: 26px; letter-spacing: -0.01em; line-height: 1.1; margin-bottom: 12px; }
-.token-strip {
-  margin-top: 16px;
-  padding: 10px 12px;
-  border-radius: var(--radius-md);
-  background: var(--bg-0);
-  border: 1px solid var(--line-1);
-  font-family: var(--mono); font-size: 11.5px;
-  display: flex; align-items: center; gap: 10px;
-}
-.token-strip .lbl { color: var(--fg-4); text-transform: uppercase; letter-spacing: 0.08em; font-size: 10px; flex: 0 0 auto; }
-.token-strip .val { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 
 /* ========== Monitor ========== */
 .live-pill {
@@ -569,5 +562,4 @@ button.cmd-card:hover .cmd-sign { background: var(--accent); border-color: var(-
   .form-grid, .sealed { grid-template-columns: 1fr; }
   .facts { grid-template-columns: 1fr; gap: 2px 0; }
   .facts dd { margin-bottom: 8px; }
-  .req-row { grid-template-columns: 1fr 1fr; }
 }
