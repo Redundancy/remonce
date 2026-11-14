@@ -45,26 +45,36 @@ fn echo_command() -> (String, Vec<&'static str>) {
     }
 }
 
-/// A command that runs for 30 seconds unless it is stopped, as
-/// `(executable, args, env)`.
+/// A command that prints a line and then runs for 30 seconds unless it is
+/// stopped, as `(executable, args, env)`. The waiting is done by a process
+/// the command starts (a shell's child), which holds the command's output
+/// open: stopping only the shell would leave it running.
 fn sleep_command() -> (String, Vec<&'static str>, String) {
     if cfg!(windows) {
-        // ping needs SystemRoot to load Winsock; the agent clears the rest.
+        // ping needs SystemRoot to load Winsock, and cmd needs PATH to find
+        // ping; the agent clears everything else.
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let path = format!(r"{system_root}\System32");
         (
-            "ping".into(),
-            vec!["-n", "30", "127.0.0.1"],
-            format!("env = {{ SystemRoot = {system_root:?} }}"),
+            std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()),
+            vec!["/C", "ping", "-n", "30", "127.0.0.1"],
+            format!("env = {{ SystemRoot = {system_root:?}, PATH = {path:?} }}"),
         )
     } else {
-        ("/bin/sleep".into(), vec!["30"], String::new())
+        (
+            "/bin/sh".into(),
+            vec!["-c", "echo waiting for thirty seconds; sleep 30; true"],
+            r#"env = { PATH = "/bin:/usr/bin" }"#.into(),
+        )
     }
 }
 
-/// An agent config with two runnable commands the shipped policy publishes
-/// requirements for (one approval and an executor, both in `webapp-users`):
-/// `ping-test` echoes its `count`, and `test` runs far longer than its
-/// one-second timeout. The run logs are also offered as files.
+/// An agent config with runnable commands the shipped policy publishes
+/// requirements for (approvers and an executor in `webapp-users`):
+/// `ping-test` echoes its `count`; `test` runs far longer than its
+/// one-second timeout; and `ping-pair` (two approvals) runs for 30 seconds
+/// and keeps only the first 10 bytes of its output. The run logs are also
+/// offered as files.
 pub(crate) fn test_config(logs_dir: &std::path::Path) -> crate::config::Config {
     let (executable, args) = echo_command();
     let (sleep_executable, sleep_args, sleep_env) = sleep_command();
@@ -98,6 +108,14 @@ args = {sleep_args:?}
 command_timeout = "1s"
 {sleep_env}
 
+[[commands]]
+name = "ping-pair"
+opa_rule = "data.remonce.authz.decision"
+executable = {sleep_executable:?}
+args = {sleep_args:?}
+max_output_bytes = 10
+{sleep_env}
+
 [[files]]
 path = {log_files:?}
 name = "execution-logs"
@@ -114,6 +132,8 @@ pub(crate) struct TestAgent {
     pub addr: std::net::SocketAddr,
     pub logs: std::sync::Arc<TempDir>,
     pub http: reqwest::Client,
+    /// The agent's running commands (its last "boot", after a restart).
+    pub runs: crate::agent::Runs,
 }
 
 impl TestAgent {
@@ -144,6 +164,7 @@ impl TestAgent {
             revocations: crate::replay::RevocationCache::new(),
             revocation_service: None,
             policy: std::sync::Arc::new(policy),
+            runs: crate::agent::Runs::default(),
         }
     }
 
@@ -151,12 +172,14 @@ impl TestAgent {
         let env = new_env();
         let logs = std::sync::Arc::new(TempDir::new("agent-logs"));
         let state = Self::state(&env, test_config(&logs.0));
+        let runs = state.runs.clone();
         let addr = Self::serve(state).await;
         TestAgent {
             env,
             addr,
             logs,
             http: reqwest::Client::new(),
+            runs,
         }
     }
 
@@ -167,6 +190,7 @@ impl TestAgent {
             addr: self.addr,
             logs: self.logs.clone(),
             http: self.http.clone(),
+            runs: self.runs.clone(),
         }
     }
 
@@ -237,7 +261,7 @@ impl TestAgent {
         let path = self.logs.0.join(format!("{execution_id}.log"));
         for _ in 0..200 {
             if let Ok(text) = std::fs::read_to_string(&path)
-                && (text.contains("--- EXIT") || text.contains("--- TIMEOUT") || text.contains("--- WAIT ERROR"))
+                && ["--- EXIT", "--- TIMEOUT", "--- WAIT ERROR", "--- STOPPED"].iter().any(|t| text.contains(t))
             {
                 return text;
             }
@@ -363,6 +387,7 @@ async fn idp_key_rotation_is_followed_without_a_restart() {
     );
     let before = TestAgent {
         env: old,
+        runs: state.runs.clone(),
         addr: TestAgent::serve(state).await,
         logs,
         http: reqwest::Client::new(),
@@ -408,6 +433,7 @@ async fn state_dir_remembers_runs_and_revocations_across_a_restart() {
         env,
         logs: logs.clone(),
         http: reqwest::Client::new(),
+        runs: Default::default(),
     };
     let token = agent.viewer_token("bob");
 
@@ -453,6 +479,7 @@ async fn without_state_dir_a_restart_forgets() {
         env,
         logs: logs.clone(),
         http: reqwest::Client::new(),
+        runs: Default::default(),
     };
     let token = agent.viewer_token("bob");
     let bundle = agent.request(&[ALICE]);
@@ -511,7 +538,14 @@ async fn a_timed_out_run_is_killed_and_audited_as_a_timeout() {
     let id = execution_id(agent.execute(&bundle, Some(&agent.viewer_token("bob"))).await).await;
     let log = agent.finished_log(&id).await;
     assert!(log.contains("--- TIMEOUT"), "{log}");
-    assert!(started.elapsed() < Duration::from_secs(20), "the 30s command was cut short");
+    // The command's own child does the waiting and holds its output open.
+    // Had only the command been killed, the log would have stayed open for
+    // the 5s drain limit (and the child would still be running).
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "everything the command started was stopped with it ({:?})",
+        started.elapsed()
+    );
 
     let records = audit_of(&bundle);
     let finished = records.iter().find(|(e, _, _)| e == "command_finished").expect("finish record");
@@ -602,4 +636,51 @@ async fn file_policy_and_audit_see_where_a_path_resolves() {
     assert_eq!(record["file"]["path"], roundabout.to_string_lossy().as_ref());
     let resolved = std::fs::canonicalize(&direct).unwrap();
     assert_eq!(record["file"]["resolved_path"], resolved.to_string_lossy().as_ref());
+}
+
+/// Wait until the run's log contains `needle`.
+async fn log_containing(agent: &TestAgent, execution_id: &str, needle: &str) -> String {
+    let path = agent.logs.0.join(format!("{execution_id}.log"));
+    for _ in 0..200 {
+        if let Ok(bytes) = std::fs::read(&path) {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            if text.contains(needle) {
+                return text;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("run {execution_id}: no {needle:?} in {:?}", std::fs::read_to_string(&path));
+}
+
+#[tokio::test]
+async fn output_past_the_limit_is_cut_and_shutdown_stops_running_commands() {
+    let agent = TestAgent::start().await;
+    // `ping-pair`: 30 seconds, more than 10 bytes of output, two approvals.
+    let bundle = agent.request_for("ping-pair", json!({}), &[ALICE, BOB]);
+    let started = std::time::Instant::now();
+    let id = execution_id(agent.execute(&bundle, Some(&agent.viewer_token("carol"))).await).await;
+
+    // The log keeps the first 10 bytes and says it stopped there; the
+    // command itself is left running.
+    let log = log_containing(&agent, &id, "--- OUTPUT TRUNCATED").await;
+    let output = log.split("---------------------\n").nth(1).expect("output follows the header");
+    let kept = output.split("\n--- OUTPUT TRUNCATED").next().unwrap();
+    assert_eq!(kept.len(), 10, "{log}");
+    assert!(!log.contains("--- EXIT") && !log.contains("--- STOPPED"), "{log}");
+
+    // The agent shuts down: the command is stopped, and says why.
+    agent.runs.stop_all(Duration::from_secs(10)).await;
+    let log = agent.finished_log(&id).await;
+    assert!(log.contains("--- STOPPED: the agent shut down"), "{log}");
+    assert!(started.elapsed() < Duration::from_secs(15), "the 30s command was cut short");
+
+    let records = audit_of(&bundle);
+    let finished = records.iter().find(|(e, _, _)| e == "command_finished").expect("finish record");
+    assert_eq!(finished.2["outcome"]["result"], "agent_shutdown");
+    assert_eq!(finished.2["outcome"]["output_truncated"], true);
+
+    // Nothing new starts on an agent that is shutting down.
+    let late = agent.execute(&agent.request(&[ALICE]), Some(&agent.viewer_token("carol"))).await;
+    assert_eq!(late.status(), 503);
 }

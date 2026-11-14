@@ -40,13 +40,18 @@ pub fn set_audit_file(path: &str) -> Result<(), String> {
 /// How a run ended.
 #[derive(Serialize, Clone, Debug)]
 pub struct AuditOutcome {
-    /// "exited", "timeout" (killed by the agent) or "wait_error".
+    /// "exited", "timeout" (killed by the agent), "agent_shutdown" (killed
+    /// because the agent was stopping) or "wait_error".
     pub result: &'static str,
     /// The process's exit code, when it exited with one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     /// From the process starting to it exiting or being killed.
     pub duration_ms: u64,
+    /// Set when the output outgrew `max_output_bytes` and the run log holds
+    /// only the start of it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub output_truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -203,6 +208,7 @@ mod tests {
                     result: "exited",
                     exit_code: Some(0),
                     duration_ms: 12,
+                    output_truncated: false,
                 }),
                 ..Default::default()
             },

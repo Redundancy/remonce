@@ -310,10 +310,15 @@ pub struct CommandConfig {
     pub approval_validity: Option<std::time::Duration>,
 
     /// Wall-clock timeout for the spawned process. Once exceeded, the agent
-    /// SIGKILLs the child and writes a "TIMEOUT" trailer into the execution
-    /// log. Defaults to 5 minutes if not specified.
+    /// kills it, along with every process it started, and writes a "TIMEOUT"
+    /// trailer into the execution log. Defaults to 5 minutes if not specified.
     #[serde(default, with = "humantime_serde")]
     pub command_timeout: Option<std::time::Duration>,
+
+    /// How much of the command's output (stdout and stderr together) is
+    /// kept in its run log, in bytes. Past this the log notes the cut and
+    /// the rest is discarded; the command keeps running. Defaults to 64 MiB.
+    pub max_output_bytes: Option<u64>,
 
     /// Environment variables passed to the spawned process. The agent calls
     /// `env_clear()` before applying these — no parent-process env leaks
@@ -361,10 +366,15 @@ pub struct ParamConfig {
 }
 
 pub const DEFAULT_APPROVAL_VALIDITY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 impl CommandConfig {
     pub fn approval_validity_or_default(&self) -> std::time::Duration {
         self.approval_validity.unwrap_or(DEFAULT_APPROVAL_VALIDITY)
+    }
+
+    pub fn max_output_bytes_or_default(&self) -> u64 {
+        self.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
     }
 
     pub fn command_timeout_or_default(&self) -> std::time::Duration {

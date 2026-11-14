@@ -34,6 +34,8 @@ pub struct AgentState {
     pub revocation_service: Option<(Client, url::Url)>,
     /// The authorization policy, evaluated in-process.
     pub policy: std::sync::Arc<crate::policy::Policy>,
+    /// The commands running now.
+    pub runs: Runs,
 }
 
 // ExecutionRequest is imported from security module
@@ -220,7 +222,9 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         revocations,
         revocation_service,
         policy,
+        runs: Runs::default(),
     };
+    let runs = state.runs.clone();
 
     let app = build_router(state, &agent_config.cors_allowed_origins);
 
@@ -231,11 +235,45 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(event = "tcp_listen", address = %addr, tls_mode = ?agent_config.tls, "Agent listening (TLS)");
 
     let listener = TcpListener::bind(&addr).await?;
-    crate::tls::serve_with_tls(listener, app, &agent_config.tls)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+    tokio::select! {
+        served = crate::tls::serve_with_tls(listener, app, &agent_config.tls) => {
+            served.map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+        }
+        // Asked to stop: no more requests, and nothing left running behind
+        // us with nobody to time it out.
+        _ = shutdown_signal() => {
+            tracing::info!(event = "agent_shutdown", "Shutting down: stopping running commands");
+            runs.stop_all(SHUTDOWN_GRACE).await;
+        }
+    }
 
     Ok(())
+}
+
+/// How long shutdown waits for stopped commands' logs and audit records.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves when the process is asked to stop: Ctrl-C, or SIGTERM on Unix.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => ctrl_c.await,
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }
 
 /// The agent's routes over `state`, with CORS for `cors_allowed_origins`
@@ -641,6 +679,11 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
         crate::audit::log_audit(decision, reason, user.clone(), ip.clone(), hostname.clone(), audit_ctx.clone())
     };
 
+    if state.runs.stop.is_cancelled() {
+        audit("error", "Refusing to run: the agent is shutting down".into());
+        return Err(ErrorResponse::new(StatusCode::SERVICE_UNAVAILABLE, "The agent is shutting down"));
+    }
+
     // 8. Replay: one run per request. Remembered past every approval that
     //    could exist now; released if we fail before the process starts.
     let ttl = crate::security::replay_ttl(now, &approvers, validity);
@@ -722,7 +765,8 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
     // Spawn Command — hardened:
     //   - stdin closed (commands that read stdin would otherwise hang forever)
     //   - parent env scrubbed; only operator-configured `env` survives
-    //   - wall-clock timeout enforced via tokio::time::timeout + child.kill()
+    //   - at the head of its own process tree, so a wall-clock timeout (or
+    //     the agent shutting down) stops everything it started too
     let timeout = cmd_config.command_timeout_or_default();
 
     let mut spawn_cmd = tokio::process::Command::new(&executable);
@@ -736,18 +780,15 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
     for (k, v) in &cmd_config.env {
         spawn_cmd.env(k, v);
     }
+    crate::process_tree::isolate(&mut spawn_cmd);
 
-    let mut child = spawn_cmd.spawn().map_err(|e| {
+    let child = spawn_cmd.spawn().map_err(|e| {
         release_replay();
         audit("error", format!("Failed to spawn command: {e}"));
         ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Execution Failed")
     })?;
+    let tree = crate::process_tree::ProcessTree::of(&child);
 
-    // Pipe Output and enforce timeout in a background task.
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let exec_id_for_log = execution_id.clone();
-    let log_path_for_task = log_path.clone();
     let process_started = std::time::Instant::now();
     // The run's own records name it, so its start, end and log tie up.
     let run_ctx = AuditContext {
@@ -756,7 +797,7 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
     };
     let finished = {
         let (user, ip, hostname, run_ctx) = (user.clone(), ip.clone(), hostname.clone(), run_ctx.clone());
-        move |result: &'static str, exit_code: Option<i32>, reason: String| {
+        move |result: &'static str, exit_code: Option<i32>, output_truncated: bool, reason: String| {
             crate::audit::log_audit(
                 "completed",
                 reason,
@@ -769,6 +810,7 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
                         result,
                         exit_code,
                         duration_ms: u64::try_from(process_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        output_truncated,
                     }),
                     ..run_ctx
                 },
@@ -776,117 +818,22 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
         }
     };
 
-    tokio::spawn(async move {
-        let mut stdout_reader = tokio::io::BufReader::new(stdout);
-        let mut stderr_reader = tokio::io::BufReader::new(stderr);
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
-        let tx2 = tx.clone();
-
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            loop {
-                let n = stdout_reader.read(&mut buf).await.unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&buf[..n]).to_string();
-                let _ = tx.send(s).await;
-            }
-        });
-
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            loop {
-                let n = stderr_reader.read(&mut buf).await.unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&buf[..n]).to_string();
-                let _ = tx2.send(s).await;
-            }
-        });
-
-        // Pipe writer (terminates when both pump tasks drop their senders).
-        // Runs as its own task so output drains while the child runs; if it
-        // only ran after exit, a full channel would stall the child's pipes.
-        let mut writer = tokio::spawn(async move {
-            let mut file_out = log_file;
-            while let Some(msg) = rx.recv().await {
-                let _ = file_out.write_all(msg.as_bytes()).await;
-                let _ = file_out.flush().await;
-            }
-            file_out
-        });
-
-        // Race the child's exit against the timeout. If the timer fires first,
-        // SIGKILL the child and continue draining its remaining output.
-        let wait_result = tokio::select! {
-            r = child.wait() => Some(r),
-            _ = tokio::time::sleep(timeout) => {
-                tracing::warn!(
-                    "Command {} exceeded timeout ({:?}); killing",
-                    exec_id_for_log, timeout
-                );
-                let _ = child.kill().await;
-                None
-            }
-        };
-        // Recorded as soon as it is known, whatever happens to the log.
-        match &wait_result {
-            Some(Ok(status)) => finished("exited", status.code(), format!("Command exited: {status}")),
-            Some(Err(e)) => finished("wait_error", None, format!("Waiting for the command failed: {e}")),
-            None => finished(
-                "timeout",
-                None,
-                format!("Command killed after exceeding its timeout ({})", humantime_serde::re::humantime::format_duration(timeout)),
-            ),
-        }
-
-        // Grandchildren that inherited stdout/stderr keep the pipes open
-        // after the direct child exits or is killed, so bound the drain and
-        // reopen the log to write the trailer if we had to give up on it.
-        let mut file_out = match tokio::time::timeout(LOG_DRAIN_TIMEOUT, &mut writer).await {
-            Ok(Ok(f)) => f,
-            _ => {
-                writer.abort();
-                tracing::warn!(
-                    "Command {}: output still open {:?} after exit (orphaned child processes?)",
-                    exec_id_for_log,
-                    LOG_DRAIN_TIMEOUT
-                );
-                match tokio::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&log_path_for_task)
-                    .await
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!("Failed to reopen log for trailer: {}", e);
-                        return;
-                    }
-                }
-            }
-        };
-        match wait_result {
-            Some(Ok(status)) => {
-                let _ = file_out
-                    .write_all(format!("\n--- EXIT: {} ---\n", status).as_bytes())
-                    .await;
-            }
-            Some(Err(e)) => {
-                let _ = file_out
-                    .write_all(format!("\n--- WAIT ERROR: {} ---\n", e).as_bytes())
-                    .await;
-            }
-            None => {
-                let _ = file_out
-                    .write_all(b"\n--- TIMEOUT: process killed by agent ---\n")
-                    .await;
-            }
-        }
-        let _ = file_out.flush().await;
-    });
+    // From here the run looks after itself, whatever becomes of this
+    // request: its output goes to the log, and it is stopped on timeout or
+    // when the agent shuts down.
+    state.runs.tasks.spawn(supervise(
+        Supervised {
+            child,
+            tree,
+            log_file,
+            log_path,
+            execution_id: execution_id.clone(),
+            timeout,
+            max_output: cmd_config.max_output_bytes_or_default(),
+            stop: state.runs.stop.clone(),
+        },
+        finished,
+    ));
 
     crate::audit::log_audit(
         "allow",
@@ -904,6 +851,188 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
         request_id,
         execution_time: Some(started),
     })
+}
+
+/// The commands this agent is running, so they can be stopped when it is.
+#[derive(Clone, Default)]
+pub struct Runs {
+    /// Cancelled when the agent is shutting down.
+    stop: tokio_util::sync::CancellationToken,
+    /// One task per running command.
+    tasks: tokio_util::task::TaskTracker,
+}
+
+impl Runs {
+    /// Stop every running command (and what each started), and wait up to
+    /// `grace` for their logs and audit records to be finished off. No new
+    /// command starts afterwards.
+    pub async fn stop_all(&self, grace: std::time::Duration) {
+        self.stop.cancel();
+        self.tasks.close();
+        if tokio::time::timeout(grace, self.tasks.wait()).await.is_err() {
+            tracing::warn!("Some commands were still being stopped after {grace:?}");
+        }
+    }
+}
+
+/// A started command and what is needed to see it through.
+struct Supervised {
+    child: tokio::process::Child,
+    tree: crate::process_tree::ProcessTree,
+    log_file: tokio::fs::File,
+    log_path: PathBuf,
+    execution_id: String,
+    timeout: std::time::Duration,
+    /// Bytes of output kept in the log.
+    max_output: u64,
+    stop: tokio_util::sync::CancellationToken,
+}
+
+/// How a supervised command came to an end.
+enum Ending {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Timeout,
+    Shutdown,
+}
+
+/// See a command through to its end: copy its output to the run log, stop
+/// it (and everything it started) on timeout or shutdown, then record how
+/// it ended — `finished(result, exit code, output truncated, reason)` for
+/// the audit log, and a trailer in the run log.
+async fn supervise(
+    run: Supervised,
+    finished: impl FnOnce(&'static str, Option<i32>, bool, String),
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let Supervised {
+        mut child,
+        tree,
+        log_file,
+        log_path,
+        execution_id,
+        timeout,
+        max_output,
+        stop,
+    } = run;
+
+    // Output is copied as the bytes it is: decoding each chunk separately
+    // would mangle a character that straddles two of them.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    fn pump(pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+        let Some(mut pipe) = pipe else { return };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = pipe.read(&mut buf).await.unwrap_or(0);
+                if n == 0 || tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    pump(child.stdout.take(), tx.clone());
+    pump(child.stderr.take(), tx);
+
+    // The writer ends when both pumps have dropped their senders. It runs
+    // as its own task so output drains while the child runs; and it keeps
+    // draining past the limit, discarding, so a chatty command isn't left
+    // blocked on a full pipe.
+    let truncated = std::sync::Arc::new(AtomicBool::new(false));
+    let mut writer = tokio::spawn({
+        let truncated = truncated.clone();
+        async move {
+            let mut file_out = log_file;
+            let mut written: u64 = 0;
+            while let Some(chunk) = rx.recv().await {
+                let room = usize::try_from(max_output - written).unwrap_or(usize::MAX);
+                let keep = chunk.len().min(room);
+                if keep > 0 {
+                    let _ = file_out.write_all(&chunk[..keep]).await;
+                    written += keep as u64;
+                }
+                if keep < chunk.len() && !truncated.swap(true, Ordering::SeqCst) {
+                    let note = format!(
+                        "\n--- OUTPUT TRUNCATED: over {max_output} bytes; the rest is not kept (the command runs on) ---\n"
+                    );
+                    let _ = file_out.write_all(note.as_bytes()).await;
+                }
+                let _ = file_out.flush().await;
+            }
+            file_out
+        }
+    });
+
+    let ending = tokio::select! {
+        r = child.wait() => Ending::Exited(r),
+        _ = tokio::time::sleep(timeout) => Ending::Timeout,
+        _ = stop.cancelled() => Ending::Shutdown,
+    };
+    if !matches!(ending, Ending::Exited(_)) {
+        tracing::warn!(
+            "Stopping command {execution_id} ({})",
+            if matches!(ending, Ending::Timeout) { "timed out" } else { "agent shutting down" }
+        );
+        // The whole tree, then the child itself (which also reaps it).
+        tree.kill();
+        let _ = child.kill().await;
+    }
+
+    // Processes the command left running that inherited its stdout/stderr
+    // keep the pipes open, so bound the drain, and reopen the log to write
+    // the trailer if we had to give up on it.
+    let file_out = match tokio::time::timeout(LOG_DRAIN_TIMEOUT, &mut writer).await {
+        Ok(Ok(f)) => Some(f),
+        _ => {
+            writer.abort();
+            tracing::warn!(
+                "Command {execution_id}: output still open {LOG_DRAIN_TIMEOUT:?} after it ended (it left processes running?)"
+            );
+            match tokio::fs::OpenOptions::new().append(true).open(&log_path).await {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::error!("Failed to reopen log for trailer: {e}");
+                    None
+                }
+            }
+        }
+    };
+
+    let (result, exit_code, reason, trailer) = match &ending {
+        Ending::Exited(Ok(status)) => (
+            "exited",
+            status.code(),
+            format!("Command exited: {status}"),
+            format!("\n--- EXIT: {status} ---\n"),
+        ),
+        Ending::Exited(Err(e)) => (
+            "wait_error",
+            None,
+            format!("Waiting for the command failed: {e}"),
+            format!("\n--- WAIT ERROR: {e} ---\n"),
+        ),
+        Ending::Timeout => (
+            "timeout",
+            None,
+            format!(
+                "Command killed after exceeding its timeout ({})",
+                humantime_serde::re::humantime::format_duration(timeout)
+            ),
+            "\n--- TIMEOUT: process killed by agent ---\n".to_string(),
+        ),
+        Ending::Shutdown => (
+            "agent_shutdown",
+            None,
+            "Command killed because the agent was shutting down".to_string(),
+            "\n--- STOPPED: the agent shut down ---\n".to_string(),
+        ),
+    };
+    // Audited whatever became of the log.
+    finished(result, exit_code, truncated.load(Ordering::SeqCst), reason);
+    if let Some(mut file_out) = file_out {
+        let _ = file_out.write_all(trailer.as_bytes()).await;
+        let _ = file_out.flush().await;
+    }
 }
 
 #[derive(Serialize)]

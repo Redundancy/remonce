@@ -19,6 +19,7 @@ pub mod acme_http01;
 pub mod insecure;
 pub mod policy;
 pub mod params;
+pub mod process_tree;
 pub mod replay;
 pub mod revocation;
 pub mod store;

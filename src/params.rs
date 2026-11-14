@@ -174,6 +174,7 @@ mod tests {
             cwd: None,
             approval_validity: None,
             command_timeout: None,
+            max_output_bytes: None,
             env: Default::default(),
             params,
         }
