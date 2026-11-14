@@ -206,30 +206,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         policy,
     };
 
-    let mut app = Router::new()
-        .route("/execute", post(execute_handler))
-        .route("/revoke", post(revoke_handler))
-        .route("/api/commands", get(catalog_handler))
-        .route("/stream/{id}", get(stream_logs_handler))
-        .route("/api/files", get(list_files_handler))
-        .route("/api/files/stream", get(stream_file_handler))
-        .with_state(state);
-
-    if !agent_config.cors_allowed_origins.is_empty() {
-        use tower_http::cors::AllowOrigin;
-        use axum::http::HeaderValue;
-        let origins: Vec<HeaderValue> = agent_config
-            .cors_allowed_origins
-            .iter()
-            .filter_map(|o| HeaderValue::from_str(o).ok())
-            .collect();
-        app = app.layer(
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::list(origins))
-                .allow_headers(tower_http::cors::Any)
-                .allow_methods(tower_http::cors::Any),
-        );
-    }
+    let app = build_router(state, &agent_config.cors_allowed_origins);
 
     let addr: SocketAddr = agent_config
         .listen_address
@@ -243,6 +220,36 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
 
     Ok(())
+}
+
+/// The agent's routes over `state`, with CORS for `cors_allowed_origins`
+/// (none when empty). Handlers read the peer address from
+/// `ConnectInfo<PeerAddr>`, so serve it with that connect info.
+pub fn build_router(state: AgentState, cors_allowed_origins: &[String]) -> Router {
+    let mut app = Router::new()
+        .route("/execute", post(execute_handler))
+        .route("/revoke", post(revoke_handler))
+        .route("/api/commands", get(catalog_handler))
+        .route("/stream/{id}", get(stream_logs_handler))
+        .route("/api/files", get(list_files_handler))
+        .route("/api/files/stream", get(stream_file_handler))
+        .with_state(state);
+
+    if !cors_allowed_origins.is_empty() {
+        use tower_http::cors::AllowOrigin;
+        use axum::http::HeaderValue;
+        let origins: Vec<HeaderValue> = cors_allowed_origins
+            .iter()
+            .filter_map(|o| HeaderValue::from_str(o).ok())
+            .collect();
+        app = app.layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_headers(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any),
+        );
+    }
+    app
 }
 
 /// Replace control characters so a value can't break the log's line

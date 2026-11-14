@@ -33,6 +33,8 @@ pub fn http_client() -> reqwest::Client {
 }
 
 #[cfg(test)]
+mod agent_tests;
+#[cfg(test)]
 mod golden_tests;
 #[cfg(test)]
 mod security_tests;

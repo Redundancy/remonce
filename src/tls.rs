@@ -282,6 +282,14 @@ where
     }
 }
 
+/// Plain TCP, for serving the agent's router in tests without TLS.
+#[cfg(test)]
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TcpListener>> for PeerAddr {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TcpListener>) -> Self {
+        PeerAddr(*stream.remote_addr())
+    }
+}
+
 /// The port an ACME CA connects to for TLS-ALPN-01 validation (RFC 8737 §3).
 pub const ACME_VALIDATION_PORT: u16 = 443;
 
