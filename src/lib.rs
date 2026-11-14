@@ -12,6 +12,7 @@ pub mod web_sign;
 pub mod oidc_client;
 pub mod signing;
 pub mod files;
+pub mod idp_keys;
 pub mod audit;
 pub mod tls;
 pub mod acme_http01;

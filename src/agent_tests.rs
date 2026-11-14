@@ -4,7 +4,9 @@
 
 use crate::agent::{AgentState, build_router};
 use crate::security::RequestBundle;
-use crate::security_tests::tests::{ALICE, BOB, CLIENT, Env, ISSUER, approve, create_valid_jwt, new_env};
+use crate::security_tests::tests::{
+    ALICE, BOB, CLIENT, Env, ISSUER, approve, create_valid_jwt, new_env, new_env_with_kid,
+};
 use futures::StreamExt;
 use serde_json::json;
 use std::path::PathBuf;
@@ -78,7 +80,7 @@ max = 100
 pub(crate) struct TestAgent {
     pub env: Env,
     pub addr: std::net::SocketAddr,
-    pub logs: TempDir,
+    pub logs: std::sync::Arc<TempDir>,
     pub http: reqwest::Client,
 }
 
@@ -103,12 +105,7 @@ impl TestAgent {
         AgentState {
             http_client: crate::http_client(),
             config,
-            oidc_metadata: crate::web::OidcMetadata {
-                authorization_endpoint: String::new(),
-                token_endpoint: String::new(),
-                jwks_uri: String::new(),
-            },
-            jwks: env.jwks.clone(),
+            idp_keys: crate::idp_keys::IdpKeys::fixed(env.jwks.clone()),
             hostname: HOST.into(),
             trusted_roots: vec![env.tsa_keys.cert_der.clone()],
             replay_cache: crate::replay::ReplayCache::new(),
@@ -120,7 +117,7 @@ impl TestAgent {
 
     pub(crate) async fn start() -> Self {
         let env = new_env();
-        let logs = TempDir::new("agent-logs");
+        let logs = std::sync::Arc::new(TempDir::new("agent-logs"));
         let state = Self::state(&env, test_config(&logs.0));
         let addr = Self::serve(state).await;
         TestAgent {
@@ -128,6 +125,16 @@ impl TestAgent {
             addr,
             logs,
             http: reqwest::Client::new(),
+        }
+    }
+
+    /// The same agent, as seen by people whose tokens come from `env`.
+    pub(crate) fn with_env(&self, env: Env) -> Self {
+        TestAgent {
+            env,
+            addr: self.addr,
+            logs: self.logs.clone(),
+            http: self.http.clone(),
         }
     }
 
@@ -272,4 +279,54 @@ async fn two_approvals_from_one_person_do_not_run() {
     bundle.approvals[1] = second_alice;
     let resp = agent.execute(&bundle, Some(&agent.viewer_token("bob"))).await;
     assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn idp_key_rotation_is_followed_without_a_restart() {
+    // The IdP signs with one key, then rotates to another and withdraws the
+    // first. The agent keeps running throughout.
+    let old = new_env_with_kid("idp-2025");
+    let new = new_env_with_kid("idp-2026");
+    let published = std::sync::Arc::new(std::sync::Mutex::new(old.jwks.clone()));
+
+    let logs = std::sync::Arc::new(TempDir::new("agent-logs"));
+    let mut state = TestAgent::state(&old, test_config(&logs.0));
+    state.trusted_roots.push(new.tsa_keys.cert_der.clone());
+    state.idp_keys = crate::idp_keys::IdpKeys::refreshing(
+        old.jwks.clone(),
+        {
+            let published = published.clone();
+            move || {
+                let keys = published.lock().unwrap().clone();
+                async move { Ok(keys) }
+            }
+        },
+        Duration::ZERO,
+    );
+    let before = TestAgent {
+        env: old,
+        addr: TestAgent::serve(state).await,
+        logs,
+        http: reqwest::Client::new(),
+    };
+
+    // Before the rotation, the old key's tokens work.
+    let token = before.viewer_token("bob");
+    let id = execution_id(before.execute(&before.request(&[ALICE]), Some(&token)).await).await;
+    before.finished_log(&id).await;
+    let approved_before = before.request(&[ALICE]);
+
+    *published.lock().unwrap() = new.jwks.clone();
+    let after = before.with_env(new);
+
+    // Tokens signed with the new key are accepted straight away.
+    let token = after.viewer_token("bob");
+    let id = execution_id(after.execute(&after.request(&[ALICE]), Some(&token)).await).await;
+    after.finished_log(&id).await;
+
+    // The withdrawn key no longer verifies anything: not a login...
+    let stale_login = before.viewer_token("bob");
+    assert_eq!(after.execute(&after.request(&[ALICE]), Some(&stale_login)).await.status(), 401);
+    // ...and not an approval made while it was current.
+    assert_eq!(after.execute(&approved_before, Some(&token)).await.status(), 400);
 }

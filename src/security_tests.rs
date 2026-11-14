@@ -30,8 +30,8 @@ pub(crate) mod tests {
 
     pub(crate) struct TestKeys {
         signing_key: SigningKey,
-        kid: String,
-        public_key_pem: String,
+        pub(crate) kid: String,
+        pub(crate) public_key_pem: String,
     }
 
     pub(crate) struct TsaKeys {
@@ -331,7 +331,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn new_env() -> Env {
-        let idp = setup_keys("idp-kid");
+        new_env_with_kid("idp-kid")
+    }
+
+    /// An IdP whose signing key has this id (and its own TSA).
+    pub(crate) fn new_env_with_kid(kid: &str) -> Env {
+        let idp = setup_keys(kid);
         let jwks = JwkSet {
             keys: vec![keys_to_jwk(&idp)],
         };
@@ -1092,5 +1097,26 @@ pub(crate) mod tests {
         let v = verify(&env, &bundle(vec![a])).unwrap();
         assert_eq!(v.approvers[0].key_binding, expected);
         assert_eq!(v.approvers[0].claims["nonce"], expected);
+    }
+
+    #[test]
+    fn symmetric_algorithm_tokens_rejected() {
+        // A token that picks HS256 and names the IdP's key id must not get
+        // as far as trying that key as a shared secret.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let header = jsonwebtoken::Header {
+            alg: jsonwebtoken::Algorithm::HS256,
+            kid: Some(env.idp.kid.clone()),
+            ..Default::default()
+        };
+        let claims = json!({
+            "sub": "alice", "iss": ISSUER, "aud": "remonce-viewer",
+            "iat": now, "exp": now + 3600,
+        });
+        let secret = jsonwebtoken::EncodingKey::from_secret(env.idp.public_key_pem.as_bytes());
+        let token = jsonwebtoken::encode(&header, &claims, &secret).unwrap();
+        let err = verify_bearer_token(&token, &env.jwks, ISSUER, "remonce-viewer").unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidJwtHeader(_)), "{err}");
     }
 }

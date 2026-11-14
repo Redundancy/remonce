@@ -171,7 +171,7 @@ pub async fn discover(
     http: &reqwest::Client,
     issuer_url: &str,
 ) -> Result<(OidcMetadata, jsonwebtoken::jwk::JwkSet), String> {
-    let discovery_url = format!("{issuer_url}/.well-known/openid-configuration");
+    let discovery_url = format!("{}/.well-known/openid-configuration", issuer_url.trim_end_matches('/'));
     let meta: OidcMetadata = http
         .get(&discovery_url)
         .send()
@@ -180,6 +180,15 @@ pub async fn discover(
         .json()
         .await
         .map_err(|e| format!("Invalid OIDC discovery document: {}", e.without_url()))?;
+    // OIDC Discovery 4.3: the document must be the configured issuer's own.
+    // Tokens are checked against the configured issuer; their keys must
+    // come from the same place.
+    if meta.issuer.trim_end_matches('/') != issuer_url.trim_end_matches('/') {
+        return Err(format!(
+            "OIDC discovery at {issuer_url} describes a different issuer ('{}')",
+            meta.issuer
+        ));
+    }
     let jwks = http
         .get(&meta.jwks_uri)
         .send()
@@ -197,6 +206,7 @@ mod tests {
 
     fn meta() -> OidcMetadata {
         OidcMetadata {
+            issuer: "https://idp.example".into(),
             authorization_endpoint: "https://idp.example/authorize".into(),
             token_endpoint: "https://idp.example/token".into(),
             jwks_uri: "https://idp.example/jwks".into(),
@@ -240,5 +250,47 @@ mod tests {
         let url = params(None);
         assert_eq!(query(&url, "max_age"), None);
         assert_eq!(query(&url, "prompt"), None);
+    }
+
+    /// A discovery endpoint on loopback that says it is `issuer` (or, with
+    /// `None`, the address it is served from). Returns its base URL.
+    async fn fake_idp(issuer: Option<&str>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let doc = serde_json::json!({
+            "issuer": issuer.unwrap_or(&base),
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+            "jwks_uri": format!("{base}/jwks"),
+        });
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                axum::routing::get(move || async move { axum::Json(doc) }),
+            )
+            .route(
+                "/jwks",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({ "keys": [] })) }),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn discovery_must_describe_the_configured_issuer() {
+        let http = reqwest::Client::new();
+
+        let base = fake_idp(None).await;
+        let (meta, keys) = discover(&http, &base).await.expect("matching issuer");
+        assert_eq!(meta.issuer, base);
+        assert!(keys.keys.is_empty());
+        // A trailing slash on either side is the same issuer.
+        discover(&http, &format!("{base}/")).await.expect("trailing slash");
+
+        let base = fake_idp(Some("https://someone-else.example")).await;
+        let err = discover(&http, &base).await.unwrap_err();
+        assert!(err.contains("different issuer"), "{err}");
     }
 }

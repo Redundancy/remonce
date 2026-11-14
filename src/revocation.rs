@@ -354,7 +354,8 @@ impl PersistentRevocationStore {
 pub struct ServiceState {
     pub policy: std::sync::Arc<crate::policy::Policy>,
     pub config: Config,
-    pub jwks: jsonwebtoken::jwk::JwkSet,
+    /// The IdP's token-signing keys, refreshed as it rotates them.
+    pub idp_keys: crate::idp_keys::IdpKeys,
     pub hostname: String,
     pub trusted_roots: Vec<Vec<u8>>,
     pub store: PersistentRevocationStore,
@@ -392,15 +393,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     // The service performs the same bundle verification as the agent, so it
     // needs the OIDC keys and TSA trust anchors too.
-    let discovery_url = format!("{}/.well-known/openid-configuration", config.oidc.issuer_url);
-    let discovery: crate::web::OidcMetadata =
-        http_client.get(&discovery_url).send().await?.json().await?;
-    let jwks = http_client
-        .get(&discovery.jwks_uri)
-        .send()
-        .await?
-        .json()
-        .await?;
+    let (_, idp_keys) = crate::idp_keys::IdpKeys::discover(&http_client, &config.oidc.issuer_url).await?;
 
     let trusted_roots = crate::tsa::load_trust_anchors(
         config.timestamp_authority.ca_path.as_deref(),
@@ -427,7 +420,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     let state = ServiceState {
         policy,
         config,
-        jwks,
+        idp_keys,
         hostname,
         trusted_roots,
         store,
@@ -460,9 +453,10 @@ async fn revoke_handler(
 ) -> Result<Json<crate::agent::RevocationResponse>, ErrorResponse> {
     let ip = addr.ip_string();
 
+    let keys = state.idp_keys.for_tokens(req.id_tokens()).await;
     let ctx = RevocationCtx {
         config: &state.config,
-        jwks: &state.jwks,
+        jwks: &keys,
         trusted_roots: &state.trusted_roots,
         policy: &state.policy,
         hostname: &state.hostname,

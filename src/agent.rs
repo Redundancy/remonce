@@ -16,7 +16,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use tokio::net::TcpListener;
 // Removed unused imports
 use crate::config::Config;
-use crate::web::OidcMetadata;
 use crate::files;
 use tower_http::cors::CorsLayer;
 
@@ -24,9 +23,8 @@ use tower_http::cors::CorsLayer;
 pub struct AgentState {
     pub http_client: Client,
     pub config: Config,
-    #[allow(dead_code)]
-    pub oidc_metadata: OidcMetadata,
-    pub jwks: jsonwebtoken::jwk::JwkSet,
+    /// The IdP's token-signing keys, refreshed as it rotates them.
+    pub idp_keys: crate::idp_keys::IdpKeys,
     pub hostname: String,
     pub trusted_roots: Vec<Vec<u8>>,
     pub replay_cache: crate::replay::ReplayCache,
@@ -40,7 +38,7 @@ pub struct AgentState {
 
 // ExecutionRequest is imported from security module
 
-/// Verify a viewer bearer token against the agent's pinned JWKS. Used by
+/// Verify a viewer bearer token against the IdP's current keys. Used by
 /// `/api/files`, `/api/files/stream` and `/stream/{id}`, where the bearer
 /// token is the only auth. Returns the JWT claims.
 ///
@@ -48,7 +46,7 @@ pub struct AgentState {
 /// signing token — including an approver's token carried inside a delegated
 /// bundle — can never be used to browse. Without `viewer_client_id` the
 /// endpoints are disabled.
-fn verify_query_token(
+async fn verify_query_token(
     token: &str,
     state: &AgentState,
 ) -> Result<serde_json::Value, (axum::http::StatusCode, &'static str)> {
@@ -59,7 +57,8 @@ fn verify_query_token(
             "File viewing disabled (no viewer_client_id configured)",
         ));
     };
-    crate::security::verify_bearer_token(token, &state.jwks, &state.config.oidc.issuer_url, viewer)
+    let keys = state.idp_keys.for_tokens([token]).await;
+    crate::security::verify_bearer_token(token, &keys, &state.config.oidc.issuer_url, viewer)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid Token"))
 }
 
@@ -131,15 +130,8 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     let http_client = crate::http_client();
 
-    // 2. Fetch OIDC Metadata and Keys (Agent needs to verify JWTs)
-    let discovery_url = format!("{}/.well-known/openid-configuration", config.oidc.issuer_url);
-    let discovery: OidcMetadata = http_client.get(&discovery_url).send().await?.json().await?;
-    let jwks = http_client
-        .get(&discovery.jwks_uri)
-        .send()
-        .await?
-        .json()
-        .await?;
+    // 2. The IdP's signing keys, to verify tokens with; kept current.
+    let (_, idp_keys) = crate::idp_keys::IdpKeys::discover(&http_client, &config.oidc.issuer_url).await?;
 
     // 3. Load TSA Trusted Roots
     let trusted_roots = crate::tsa::load_trust_anchors(
@@ -196,8 +188,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     let state = AgentState {
         http_client,
         config,
-        oidc_metadata: discovery,
-        jwks,
+        idp_keys,
         hostname,
         trusted_roots,
         replay_cache: crate::replay::ReplayCache::new(),
@@ -396,7 +387,7 @@ async fn execute_handler(
         audit("deny", "No executor token".into(), "unauthenticated", AuditContext::default());
         return Err(ErrorResponse::new(StatusCode::UNAUTHORIZED, "Log in to execute: missing bearer token"));
     };
-    let executor_claims = verify_query_token(&token, &state).map_err(|(status, msg)| {
+    let executor_claims = verify_query_token(&token, &state).await.map_err(|(status, msg)| {
         audit("deny", format!("Executor token rejected: {msg}"), "unauthenticated", AuditContext::default());
         ErrorResponse::new(status, msg)
     })?;
@@ -450,10 +441,14 @@ async fn execute_handler(
 
     // 4. Every approval: genuine, fresh, from different people.
     let validity = cmd_config.approval_validity_or_default();
+    let keys = state
+        .idp_keys
+        .for_tokens(bundle.approvals.iter().map(|a| a.id_token.as_str()))
+        .await;
     let verifier_config = crate::security::VerifierConfig {
         client_id: state.config.oidc.signing_client_id.clone(),
         issuer_url: state.config.oidc.issuer_url.clone(),
-        jwks: state.jwks.clone(),
+        jwks: (*keys).clone(),
         trusted_roots: state.trusted_roots.clone(),
         approval_validity: validity,
     };
@@ -806,9 +801,10 @@ async fn revoke_handler(
     let ip = addr.ip_string();
     let hostname = state.hostname.clone();
 
+    let keys = state.idp_keys.for_tokens(req.id_tokens()).await;
     let ctx = crate::revocation::RevocationCtx {
         config: &state.config,
-        jwks: &state.jwks,
+        jwks: &keys,
         trusted_roots: &state.trusted_roots,
         policy: &state.policy,
         hostname: &hostname,
@@ -907,7 +903,7 @@ async fn catalog_handler(State(state): State<AgentState>, headers: axum::http::H
     let Some(token) = bearer_token(&headers) else {
         return (StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
     };
-    let claims = match verify_query_token(&token, &state) {
+    let claims = match verify_query_token(&token, &state).await {
         Ok(c) => c,
         Err((status, msg)) => return (status, msg).into_response(),
     };
@@ -952,7 +948,7 @@ async fn stream_logs_handler(
         Some(t) => t,
         None => return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response(),
     };
-    let claims = match verify_query_token(&token, &state) {
+    let claims = match verify_query_token(&token, &state).await {
         Ok(c) => c,
         Err((status, msg)) => return (status, msg).into_response(),
     };
@@ -1033,7 +1029,7 @@ async fn list_files_handler(
     let Some(token) = bearer_token(&headers) else {
         return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
     };
-    match verify_query_token(&token, &state) {
+    match verify_query_token(&token, &state).await {
         Ok(_claims) => Json(files::list_available_files(&state.config.files)).into_response(),
         Err((status, msg)) => (status, msg).into_response(),
     }
@@ -1080,7 +1076,7 @@ async fn stream_file_handler(
         log_audit("deny", "Missing bearer token".into(), "unknown".into(), None);
         return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
     };
-    let claims = match verify_query_token(&token, &state) {
+    let claims = match verify_query_token(&token, &state).await {
         Ok(c) => c,
         Err((status, msg)) => {
             log_audit("deny", msg.into(), "unknown".into(), None);
