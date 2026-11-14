@@ -292,13 +292,20 @@ pub fn build_router(state: AgentState, cors_allowed_origins: &[String]) -> Route
     if !cors_allowed_origins.is_empty() {
         use tower_http::cors::AllowOrigin;
         use axum::http::HeaderValue;
-        let origins: Vec<HeaderValue> = cors_allowed_origins
-            .iter()
-            .filter_map(|o| HeaderValue::from_str(o).ok())
-            .collect();
+        // "*" (which needs `--insecure`) is any origin; it can't be mixed
+        // into a list of named ones.
+        let allow_origin = if cors_allowed_origins.iter().any(|o| o == "*") {
+            AllowOrigin::any()
+        } else {
+            let origins: Vec<HeaderValue> = cors_allowed_origins
+                .iter()
+                .filter_map(|o| HeaderValue::from_str(o).ok())
+                .collect();
+            AllowOrigin::list(origins)
+        };
         app = app.layer(
             CorsLayer::new()
-                .allow_origin(AllowOrigin::list(origins))
+                .allow_origin(allow_origin)
                 .allow_headers(tower_http::cors::Any)
                 .allow_methods(tower_http::cors::Any),
         );
@@ -1507,37 +1514,14 @@ async fn tail_file(mut socket: WebSocket, path: PathBuf, tail_lines: Option<usiz
             return;
         }
     };
-    
-    // Seek logic for tailing
+
+    // Start near the end: roughly the last `tail_lines` lines, estimated at
+    // 200 bytes each rather than counted, so the first line sent may be a
+    // partial one. If seeking fails, the stream starts from the top.
     if let Some(n) = tail_lines {
-        // This is complex for variable length lines.
-        // Simplified: read valid utf8 from end?
-        // Or just read whole file and take last N lines if file is small?
-        // For strict correctness on huge files, we need to seek from end.
-        // Let's implement a simple buffer approach: Read entire file (if manageable) or last X bytes.
-        // Given complexity, maybe just read from start if not excessively large, or seek to file_len - (avg_line_len * N)?
-        
-        // Strategy: 
-        // 1. Get file size.
-        // 2. If small (< 1MB), read all, take last N lines.
-        // 3. If large, seek to end - (N * 200 bytes?), read, split lines, take last N.
-        
         let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-        
-        // Arbitrary buffer size estimate: 200 chars per line?
-        let est_bytes = (n as u64) * 200;
-        let start_pos = if len > est_bytes { len - est_bytes } else { 0 };
-        
-        use std::io::SeekFrom;
-        if let Err(_) = file.seek(SeekFrom::Start(start_pos)).await {
-            // ignore error, read from start
-        }
-        
-        // We might start in middle of line.
-        // Since we are just streaming text, send it? Clients might see partial first line.
-        // If we want clean lines, we should read and find first newline.
-        // Leaving as simple byte stream for now, client handles display.
-        // Wait, current logic sends chunks.
+        let wanted = u64::try_from(n).unwrap_or(u64::MAX).saturating_mul(200);
+        let _ = file.seek(std::io::SeekFrom::Start(len.saturating_sub(wanted))).await;
     }
 
     // Stream until the client goes away. Watching the socket matters: at EOF

@@ -139,9 +139,13 @@ pub(crate) struct TestAgent {
 impl TestAgent {
     /// Serve `state`'s router on a loopback port.
     pub(crate) async fn serve(state: AgentState) -> std::net::SocketAddr {
+        Self::serve_with_cors(state, &[]).await
+    }
+
+    pub(crate) async fn serve_with_cors(state: AgentState, cors_allowed_origins: &[String]) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = build_router(state, &[]);
+        let app = build_router(state, cors_allowed_origins);
         tokio::spawn(async move {
             let _ = axum::serve(
                 listener,
@@ -683,4 +687,57 @@ async fn output_past_the_limit_is_cut_and_shutdown_stops_running_commands() {
     // Nothing new starts on an agent that is shutting down.
     let late = agent.execute(&agent.request(&[ALICE]), Some(&agent.viewer_token("carol"))).await;
     assert_eq!(late.status(), 503);
+}
+
+#[tokio::test]
+async fn cors_allows_the_configured_origins_or_any() {
+    let env = new_env();
+    let logs = TempDir::new("agent-logs");
+    let http = reqwest::Client::new();
+    let allowed_for = |cors: Vec<String>, origin: &'static str| {
+        let state = TestAgent::state(&env, test_config(&logs.0));
+        let http = http.clone();
+        async move {
+            let addr = TestAgent::serve_with_cors(state, &cors).await;
+            let resp = http
+                .get(format!("http://{addr}/api/commands"))
+                .header("Origin", origin)
+                .send()
+                .await
+                .unwrap();
+            resp.headers()
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().unwrap().to_string())
+        }
+    };
+
+    // Named origins: only those.
+    let named = vec!["https://ui.example".to_string()];
+    assert_eq!(allowed_for(named.clone(), "https://ui.example").await.as_deref(), Some("https://ui.example"));
+    assert_eq!(allowed_for(named, "https://other.example").await, None);
+    // "*": any origin (this used to stop the agent at startup).
+    assert_eq!(allowed_for(vec!["*".to_string()], "https://other.example").await.as_deref(), Some("*"));
+    // None configured: no CORS headers at all.
+    assert_eq!(allowed_for(vec![], "https://ui.example").await, None);
+}
+
+#[tokio::test]
+async fn an_absurd_tail_length_is_just_the_whole_file() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let agent = TestAgent::start().await;
+    let token = agent.viewer_token("bob");
+    let id = execution_id(agent.execute(&agent.request(&[ALICE]), Some(&token)).await).await;
+    agent.finished_log(&id).await;
+
+    let mut url = url::Url::parse(&format!("ws://{}/api/files/stream", agent.addr)).unwrap();
+    url.query_pairs_mut()
+        .append_pair("path", &agent.logs.0.join(format!("{id}.log")).to_string_lossy())
+        .append_pair("tail_lines", &u64::MAX.to_string());
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("the file streams");
+    let first = tokio::time::timeout(Duration::from_secs(10), ws.next()).await.unwrap().unwrap().unwrap();
+    assert!(first.to_text().unwrap().starts_with("--- EXECUTION LOG ---"), "{first:?}");
 }
