@@ -102,6 +102,13 @@ description = "Server configuration file"
 # listen_address = "0.0.0.0:10022"   # "127.0.0.1:10022" to keep it on this machine
 # cors_allowed_origins = []  # empty = no CORS layer
 #
+# Recommended: remember which requests ran, and which were revoked here,
+# across restarts. Without it a restart forgets both.
+# state_dir = "state"
+#
+# Optional: also append audit records to a file (they always go to stdout).
+# audit_log_path = "audit.jsonl"
+#
 # Optional central revocation service. FAIL-CLOSED: when set, the agent
 # checks it before every execution and denies if it is unreachable.
 # revocation_service_url = "https://revocations.example.com:10023"

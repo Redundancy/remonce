@@ -9,3 +9,5 @@ terraform.tfstate.backup
 /dist
 /vault.log
 /.claude/
+/state
+/audit.jsonl

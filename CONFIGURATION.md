@@ -84,8 +84,7 @@ agent_ca_path = "./certs/agent-fullchain.pem"
 
 Each user can add agents without editing the shared `config.toml`. The signer reads, at startup:
 
-- Windows: `%APPDATA%
-emoncegents.toml`
+- Windows: `%APPDATA%\remonce\agents.toml`
 - elsewhere: `$XDG_CONFIG_HOME/remonce/agents.toml`, or `~/.config/remonce/agents.toml`
 - or whatever `REMONCE_AGENTS_FILE` names.
 
@@ -126,7 +125,19 @@ listen_address = "0.0.0.0:10022"
 # CORS origins allowed to call the agent. Empty = no CORS layer (recommended
 # unless a browser app talks to the agent directly).
 cors_allowed_origins = []
+
+# Recommended: a directory where the agent keeps which requests it has run
+# and which were revoked here, so a restart doesn't forget them. Unset, both
+# live in memory: after a restart a request that already ran can run again,
+# and a local revocation is gone, for as long as the approvals last.
+state_dir = "state"
+
+# Optional: also append audit records to this file, one JSON object per
+# line. They always go to stdout, mixed with the agent's ordinary log lines.
+audit_log_path = "audit.jsonl"
 ```
+
+Stopping the agent (Ctrl-C, or SIGTERM on Unix) stops the commands it is running, with everything they started, and notes that in each run's log and audit record.
 
 ### Agent TLS — **required**
 
@@ -268,9 +279,9 @@ Policy decisions requested by the agent (`input.action`):
 |--------|------|-------|
 | `execute` | Running an approved request | `command`, `request_id`, `approvers` (each `username`, `claims`, `signed_at`), `executor` (`username`, `claims`), `host` |
 | `revoke` | Someone who didn't approve a request revokes it | `command`, `request_id`, `approvers`, `revoker`, `host` |
-| `read_file` | Streaming an allowed file | `viewer` (`username`, `claims`), `file` |
+| `read_file` | Streaming an allowed file | `viewer` (`username`, `claims`), `file` (`name` or `path` as asked for, and `resolved_path`: the file that names, as the file list shows it — match on this one, since a path can be spelled many ways) |
 | `view_execution` | Streaming an execution's output log | `viewer`, `execution_id` |
-| `view_docs` | Reading the agent's command catalog | `viewer` |
+| `view_docs` | Reading the agent's command catalog, or its list of files | `viewer` |
 
 Execution and revocation decisions come from each command's `opa_rule` (the shipped policy's is `data.remonce.authz.decision`, returning `{allow, reason}`); viewing decisions from `data.remonce.authz.allow`. The agent also reads `data.remonce.requirements` (see [Requirement documents](#requirement-documents)) to publish in its catalog.
 
@@ -318,9 +329,18 @@ opa_rule = "data.remonce.authz.decision" # The OPA rule to query for authorizati
 executable = "ping"
 args = ["-n", "4", "127.0.0.1"]
 
-# Optional: wall-clock timeout. Once exceeded, the agent SIGKILLs the child
-# and writes a TIMEOUT trailer into the execution log. Default: 5m.
+# Optional: wall-clock timeout. Once exceeded, the agent kills the command,
+# along with every process it started, and writes a TIMEOUT trailer into
+# the execution log. Default: 5m.
 command_timeout = "5m"
+
+# Optional: how much output (stdout and stderr together, in bytes) the run
+# log keeps. Past it the log notes the cut and the rest is discarded; the
+# command keeps running. Default: 67108864 (64 MiB).
+max_output_bytes = 67108864
+
+# Optional: the working directory to run in. Default: the agent's own.
+# cwd = "/var/lib/myapp"
 
 # Optional: environment variables passed to the child. The agent calls
 # env_clear() before applying these — *no* parent-process env leaks
@@ -468,14 +488,14 @@ The same flow is on the web UI's Execute page (**Revoke request**), which runs i
 
 How it works:
 
-- A revocation cancels the **whole request**, by request id (the hash of the signed request). Neither its current approvals nor any later ones can run it.
+- A revocation cancels the **whole request**, by request id (the hash of the signed request). Neither its current approvals nor any added while the revocation lasts can run it.
 - The revoker signs a domain-separated payload, `REMONCE-REVOKE/v2:` || request id || their public key, which is never valid as an approval (and an approval is never valid as a revocation).
 - The agent re-verifies the request's approvals first (they needn't still be fresh). Only requests with a genuine approval can be pinned to the revocation list, which prevents filling it with invented requests.
 - **Any approver** of the request (same OIDC `sub`) may always revoke it. **Anyone else** needs an OPA decision with `input.action == "revoke"` (see `policy/authz.rego`).
 - The revoker's attestation must be at most 10 minutes old.
 - A revocation lasts until no approval of the request could still be valid (`approval_validity` after the latest approver's login).
 
-Without a central revocation service (below), the revocation list is **in-memory and per-agent**: submit the revocation to every agent the request targets, and note that an agent restart forgets it.
+Without a central revocation service (below), the revocation list is **per-agent**: submit the revocation to every agent the request targets. Set `[agent] state_dir` on each, or an agent restart forgets it.
 
 ## Central revocation service (`remonce revocation-service`)
 

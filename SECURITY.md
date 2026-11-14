@@ -36,7 +36,7 @@ A request is a command plus any number of independent approvals, each one person
     -   **Parameters**: signed `params` validated against `[[commands.params]]`, fail-closed.
 6.  **Revocation**: the **request id** (hex SHA-256 of the signed payload) must not be on the agent's revocation list, nor (when configured) on the central revocation service's — an unreachable service denies execution.
 7.  **Policy authorization** (Rego, embedded or on an OPA server): input is the command, request id, every approver (`username`, full claims, `signed_at`), the executor (`username`, claims) and the host. The shipped policy allows when the command's published requirement document is satisfied — every slot filled by a different approver, and the executor accepted — and no extra rule denies. Deny-by-default.
-8.  **Replay cache**: last, just before spawning. The request id is recorded until every approval that could run it has expired; first-seen wins, and if spawning fails the entry is released so the request can be retried.
+8.  **Replay cache**: last, just before spawning. The request id is recorded until every approval that could run it has expired; first-seen wins, and if spawning fails the entry is released so the request can be retried. With `[agent] state_dir` set, the record is on disk and survives a restart; a run that can't be recorded doesn't start.
 
 ## Threat Model
 
@@ -51,7 +51,7 @@ A request is a command plus any number of independent approvals, each one person
 
 3.  **Replay Attacks (Short-term, within the validity window)**
     *   *Attack*: Attacker obtains an approved bundle (in flight, from a shared folder, from logs) and resubmits it.
-    *   *Mitigation*: **Replay cache keyed on the request id**. The first run wins; any resubmission of the same request is refused, whoever submits it and whichever of its approvals it carries. The cache is in memory: an agent restart forgets it, and exposure after a restart is bounded by `approval_validity`. Keep that short for sensitive commands, or make the request single-use by other means (the attacker also needs a viewer login that policy accepts as executor).
+    *   *Mitigation*: **Replay cache keyed on the request id**. The first run wins; any resubmission of the same request is refused, whoever submits it and whichever of its approvals it carries. Set `[agent] state_dir` so the cache is kept on disk and survives a restart. Without it the cache is in memory: a restart forgets it, and a request that already ran can run again until its approvals expire (`approval_validity`) — though the attacker also needs a viewer login that policy accepts as executor.
 
 4.  **Key Compromise (Ephemeral User Keys)**
     *   *Attack*: Attacker steals the user's private signing key.
@@ -59,7 +59,7 @@ A request is a command plus any number of independent approvals, each one person
 
 5.  **Man-in-the-Middle (MitM)**
     *   *Attack*: Interception of traffic between the signer and the agent.
-    *   *Mitigation*: **Mandatory TLS on the agent**. The agent refuses to serve without TLS configured (file-based cert or ACME). The signer is meant to run on the approver's workstation bound to loopback; when it serves a remote browser, give it TLS.
+    *   *Mitigation*: **Mandatory TLS on the agent**. The agent refuses to serve without TLS configured (file-based cert or ACME). The signer runs on the approver's workstation and binds only to loopback.
 
 6.  **Approval Transplant**
     *   *Attack*: Attacker takes a genuine approval of request A and attaches it to request B (different parameters, target, or just a different `id`), hoping B runs with A's approvers.
@@ -84,7 +84,7 @@ A request is a command plus any number of independent approvals, each one person
 
 11. **Subprocess Misbehavior (long-running, env exfiltration, stdin hang)**
     *   *Attack*: A configured command runs indefinitely, leaks parent-process env vars, or hangs reading stdin.
-    *   *Mitigation*: Every spawned process has stdin closed (`Stdio::null`), a fully cleared environment (`env_clear()` plus only the operator-supplied `env` map from `[[commands]]`), and a wall-clock timeout (`command_timeout`, default 5 minutes). On timeout, the agent SIGKILLs the child and writes a TIMEOUT trailer into the execution log.
+    *   *Mitigation*: Every spawned process has stdin closed (`Stdio::null`), a fully cleared environment (`env_clear()` plus only the operator-supplied `env` map from `[[commands]]`), and a wall-clock timeout (`command_timeout`, default 5 minutes). It runs at the head of its own process group (Unix) or Job Object (Windows): on timeout the agent kills it together with every process it started and writes a TIMEOUT trailer into the execution log. Stopping the agent stops its running commands the same way (a STOPPED trailer), rather than leaving them with nobody to time them out. The run log keeps at most `max_output_bytes` of output (64 MiB by default) and notes the cut, so a chatty command can't fill the disk.
 
 12. **Path Traversal via execution ID**
     *   *Attack*: A signed request includes `id: "../../etc/passwd"`; the agent uses it to construct the log file path.
@@ -96,7 +96,7 @@ A request is a command plus any number of independent approvals, each one person
 
 14. **Unauthenticated File Listing**
     *   *Attack*: Anyone who can reach the agent's `/api/files` discovers the configured file allowlist (paths, names, descriptions).
-    *   *Mitigation*: `/api/files` now requires the same bearer ID token as `/api/files/stream`. Token verification is shared via `verify_query_token` so the two endpoints can't drift apart. Only viewer-client tokens are accepted.
+    *   *Mitigation*: `/api/files` requires a viewer-client bearer token and policy's `view_docs` decision, the same as the command catalog, and each listing is audited.
 
 15. **Signature Malleability**
     *   *Attack*: ECDSA signatures come in pairs: if `(r, s)` is valid, so is `(r, n−s)`. A holder of any bundle derives the twin, obtains a fresh timestamp over it, and resubmits a byte-different but valid bundle — dodging a replay cache or revocation list keyed on signature bytes.
@@ -108,14 +108,17 @@ A request is a command plus any number of independent approvals, each one person
 
 ## Audit Logging
 
-Every execution attempt (Allowed or Denied) and every revocation generates a structured audit log entry on the agent's stdout.
-- **Contents**: timestamp, event type, `user` (the executor, or the revoker), source IP, decision, reason, the full command, the `request_id`, and every approver (`username`, `sub`, signing time).
-- **Run log**: `logs/<execution_id>.log` starts with a header naming the request id, each approver and when they signed, the executor, and the start time.
+The agent writes one JSON object per line to stdout, and also to a file when `[agent] audit_log_path` is set (stdout is shared with the agent's ordinary log output).
+
+- **Executions**: every attempt, allowed or denied (`command_execution`), with `user` (the executor), source IP, decision, reason, the full command, the `request_id`, and every approver (`username`, `sub`, signing time). A run that starts also gets a `command_finished` record when it ends: its `execution_id`, and an `outcome` with how it ended (`exited` with the exit code, `timeout`, `agent_shutdown` or `wait_error`), how long it ran, and whether its output was cut at `max_output_bytes`.
+- **Revocations**: every attempt (`request_revocation`), with the revoker.
+- **Viewing**: every read of the command catalog (`catalog_access`), the file list (`file_list_access`), a file (`file_access`, with the path as asked for and the file it resolved to) and an execution log (`execution_log_access`), allowed or refused.
+- **Run log**: `logs/<execution_id>.log` starts with a header naming the request id, each approver and when they signed, the executor, and the start time, and ends with a trailer saying how the run ended.
 
 ## Key Management
 
 - **User Keys**: A fresh ECDSA key per signature, generated by the signer (or CLI) for one OIDC login and discarded after one signature. The private key never leaves the machine running the signer; between the IdP redirect and the callback it sits in the signer's in-memory session.
-- **Identity Keys**: Managed by the OIDC Provider (Vault/Okta/etc.). Pinned at agent startup via a one-time discovery + JWKS fetch.
+- **Identity Keys**: Managed by the OIDC Provider (Vault/Okta/etc.). The agent, the revocation service and the signer fetch them by discovery at startup (the discovery document must describe the configured issuer) and keep them current: they are refetched when a token names a key that isn't held (at most once a minute) and hourly. The IdP is followed exactly: a key it has withdrawn stops verifying, including for approvals made while it was current, so keep each command's `approval_validity` within the time your IdP keeps a rotated key published. If the IdP can't be reached, the last keys it gave stay in use. Tokens that choose a symmetric algorithm are refused.
 - **TSA Keys**: Managed by the Timestamp Authority.
 
 ## TSA trust model

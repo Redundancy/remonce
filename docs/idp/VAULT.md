@@ -101,10 +101,12 @@ Vault signs every ID token it issues with a key; remonce fetches the public half
 resource "vault_identity_oidc_key" "remonce" {
   name             = "remonce"
   algorithm        = "RS256"
-  rotation_period  = 604800  # 1 week; older keys stay published until their tokens expire
-  verification_ttl = 86400
+  rotation_period  = 604800  # 1 week
+  verification_ttl = 86400   # a rotated key stays published this long (1 day)
 }
 ```
+
+remonce follows the rotation by itself: the agent, the revocation service and the signer refetch the keys when they see a token signed with one they don't hold, so nothing needs restarting. Once Vault stops publishing a rotated key (`verification_ttl` after the rotation), tokens it signed no longer verify, and that includes the tokens inside approvals. Keep every command's `approval_validity` within `verification_ttl`, or raise `verification_ttl` to cover your longest one.
 
 ## Step 4: Create the Two OIDC Clients
 

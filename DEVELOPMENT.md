@@ -104,6 +104,7 @@ Authorization is Rego policy, evaluated inside the agent (embedded [Regorus](htt
 
 -   **Modify Policy**: Edit `policy/authz.rego`, the shared helper `policy/lib.rego`, or the per-command requirement documents in `policy/requirements.json`.
 -   **Apply Changes**: The agent notices changed `.rego`, `.json` and `.yaml` files on its next decision. You do not need to restart anything.
+-   **Agent tests**: `src/agent_tests.rs` serves the agent's real routes on a loopback port (plain TCP), with a fake IdP key set and TSA, the shipped policy, and commands that really run. Add to it when changing how the agent verifies, runs or records a request.
 -   **Test**: `cargo test` runs `policy_test/` on the embedded engine. With OPA installed, `bin\opa.exe test policy policy_test -v` runs them on OPA; `opa run --server policy` plus `REMONCE_TEST_OPA_URL=http://127.0.0.1:8181 cargo test policy` checks that both engines agree. The tests live outside `policy/` so they aren't loaded as policy.
 
 ## Authentication Flow (Local)

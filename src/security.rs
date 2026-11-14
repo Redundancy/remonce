@@ -585,7 +585,7 @@ fn whole_secs(d: time::Duration) -> u64 {
     d.whole_seconds().max(0) as u64
 }
 
-/// Decode and verify a JWT's signature and issuer against the pinned JWKS,
+/// Decode and verify a JWT's signature and issuer against the IdP's keys,
 /// plus the strict audience rule. `validate_exp` controls whether `exp` is
 /// checked against the wall clock.
 fn decode_verified(
