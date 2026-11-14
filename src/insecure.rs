@@ -296,6 +296,7 @@ mod tests {
             cors_allowed_origins: vec!["*".into()],
             revocation_service_url: None,
             revocation_service_ca_path: None,
+            state_dir: None,
         });
         assert!(matches!(
             validate(&cfg, false),

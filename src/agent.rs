@@ -185,14 +185,34 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     let policy = std::sync::Arc::new(crate::policy::Policy::from_config(&config)?);
     tracing::info!(backend = %policy.describe(), "Policy ready");
 
+    // Which requests have run, and which were revoked here.
+    let (replay_cache, revocations) = match &agent_config.state_dir {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("Failed to create agent.state_dir '{}': {e}", dir.display()))?;
+            tracing::info!(dir = %dir.display(), "Executed and revoked requests are remembered across restarts");
+            (
+                crate::replay::ReplayCache::persistent(&dir)?,
+                crate::replay::RevocationCache::persistent(&dir)?,
+            )
+        }
+        None => {
+            tracing::warn!(
+                "agent.state_dir is not set: a restart forgets which requests ran and which were revoked here"
+            );
+            (crate::replay::ReplayCache::new(), crate::replay::RevocationCache::new())
+        }
+    };
+
     let state = AgentState {
         http_client,
         config,
         idp_keys,
         hostname,
         trusted_roots,
-        replay_cache: crate::replay::ReplayCache::new(),
-        revocations: crate::replay::RevocationCache::new(),
+        replay_cache,
+        revocations,
         revocation_service,
         policy,
     };
@@ -538,15 +558,108 @@ async fn execute_handler(
         ));
     }
 
+    // 8, 9. Replay, then run — in a task of its own. Once the request is
+    //       marked as used, a client that hangs up must not be able to stop
+    //       it short of starting (or of having the mark released).
+    let run = Run {
+        cmd_config,
+        command_name,
+        command_json,
+        execution_id,
+        request_id,
+        approvers,
+        audit_approvers,
+        rendered_args,
+        user,
+        ip,
+        validity,
+        now,
+    };
+    match tokio::spawn(start_run(state, run)).await {
+        Ok(result) => result.map(Json),
+        Err(e) => {
+            tracing::error!("Run task failed: {e}");
+            Err(ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error"))
+        }
+    }
+}
+
+/// A request that has passed every check, ready to run.
+struct Run {
+    cmd_config: crate::config::CommandConfig,
+    command_name: String,
+    command_json: serde_json::Value,
+    /// The request's signed id; names the run and its log.
+    execution_id: String,
+    request_id: String,
+    approvers: Vec<crate::security::SignerIdentity>,
+    audit_approvers: Vec<crate::audit::AuditSigner>,
+    rendered_args: Vec<String>,
+    /// The executor.
+    user: String,
+    ip: String,
+    validity: std::time::Duration,
+    /// When the request was verified.
+    now: time::OffsetDateTime,
+}
+
+/// Mark the request as used, then start its command. Returns once the
+/// process is running (or couldn't be started, in which case the mark is
+/// released so the request can be retried).
+async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, ErrorResponse> {
+    use crate::audit::AuditContext;
+    use axum::http::StatusCode;
+
+    let Run {
+        cmd_config,
+        command_name,
+        command_json,
+        execution_id,
+        request_id,
+        approvers,
+        audit_approvers,
+        rendered_args,
+        user,
+        ip,
+        validity,
+        now,
+    } = run;
+    let hostname = state.hostname.clone();
+    let audit = |decision: &'static str, reason: String| {
+        crate::audit::log_audit(
+            decision,
+            reason,
+            user.clone(),
+            ip.clone(),
+            hostname.clone(),
+            AuditContext {
+                event_type: Some("command_execution"),
+                command: Some(command_json.clone()),
+                request_id: Some(request_id.clone()),
+                approvers: Some(audit_approvers.clone()),
+                ..Default::default()
+            },
+        )
+    };
+
     // 8. Replay: one run per request. Remembered past every approval that
     //    could exist now; released if we fail before the process starts.
     let ttl = crate::security::replay_ttl(now, &approvers, validity);
-    if state.replay_cache.check_and_insert(&request_id, ttl).is_err() {
-        audit("deny", "Replay: request already executed".into(), &user, full_ctx());
-        return Err(ErrorResponse::new(
-            StatusCode::CONFLICT,
-            "This request has already been executed on this agent",
-        ));
+    match state.replay_cache.check_and_insert(&request_id, ttl) {
+        Ok(()) => {}
+        Err(crate::replay::ReplayError::AlreadyRun) => {
+            audit("deny", "Replay: request already executed".into());
+            return Err(ErrorResponse::new(
+                StatusCode::CONFLICT,
+                "This request has already been executed on this agent",
+            ));
+        }
+        Err(e @ crate::replay::ReplayError::Store(_)) => {
+            // Not running is the only safe answer: a run we can't remember
+            // could be repeated.
+            audit("error", format!("Refusing to run: {e}"));
+            return Err(ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error"));
+        }
     }
     let release_replay = || state.replay_cache.release(&request_id);
 
@@ -558,7 +671,7 @@ async fn execute_handler(
     if !logs_dir.exists() {
         tokio::fs::create_dir_all(&logs_dir).await.map_err(|e| {
             release_replay();
-            audit("error", format!("Failed to create logs dir: {e}"), &user, full_ctx());
+            audit("error", format!("Failed to create logs dir: {e}"));
             ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error")
         })?;
     }
@@ -586,7 +699,7 @@ async fn execute_handler(
     };
     let mut log_file = log_result.map_err(|e| {
         release_replay();
-        audit("error", format!("Failed to create log file: {e}"), &user, full_ctx());
+        audit("error", format!("Failed to create log file: {e}"));
         ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error")
     })?;
 
@@ -627,7 +740,7 @@ async fn execute_handler(
 
     let mut child = spawn_cmd.spawn().map_err(|e| {
         release_replay();
-        audit("error", format!("Failed to spawn command: {e}"), &user, full_ctx());
+        audit("error", format!("Failed to spawn command: {e}"));
         ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Execution Failed")
     })?;
 
@@ -739,15 +852,15 @@ async fn execute_handler(
         let _ = file_out.flush().await;
     });
 
-    audit("allow", "Command Started".to_string(), &user, full_ctx());
+    audit("allow", "Command Started".to_string());
 
-    Ok(Json(ExecutionResponse {
+    Ok(ExecutionResponse {
         status: "authorized".to_string(),
         // The execution id, which the client streams the log by.
         message: execution_id,
         request_id,
         execution_time: Some(started),
-    }))
+    })
 }
 
 #[derive(Serialize)]
@@ -839,7 +952,20 @@ async fn revoke_handler(
     let now = time::OffsetDateTime::now_utc();
     if verified.keep_until > now {
         let remaining: std::time::Duration = (verified.keep_until - now).try_into().unwrap_or_default();
-        state.revocations.revoke(&revocation.request_id, remaining);
+        if let Err(e) = state.revocations.revoke(&revocation.request_id, remaining) {
+            crate::audit::log_audit(
+                "error",
+                format!("Failed to record revocation: {e}"),
+                revoker_user.clone(),
+                ip.clone(),
+                hostname.clone(),
+                revoke_ctx(),
+            );
+            return Err(ErrorResponse::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Error",
+            ));
+        }
     }
 
     // Forward to the central revocation service so a single submission

@@ -96,6 +96,12 @@ pub struct AgentConfig {
     /// the revocation service (e.g. a self-signed cert). Added on top of
     /// the system trust store.
     pub revocation_service_ca_path: Option<String>,
+
+    /// Directory where the agent keeps what must survive a restart: which
+    /// requests it has run (replay protection) and which were revoked here.
+    /// Unset, both live in memory, and a restart forgets them — a request
+    /// that already ran can then run again while its approvals last.
+    pub state_dir: Option<String>,
 }
 
 fn default_agent_listen_address() -> String {

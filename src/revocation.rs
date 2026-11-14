@@ -12,12 +12,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::Write as _;
+use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 use crate::config::Config;
 
@@ -193,161 +190,6 @@ pub async fn verify_and_authorize(
     })
 }
 
-// --- Persistent store -----------------------------------------------------
-
-/// Version tag on every stored line.
-const STORE_VERSION: u32 = 2;
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredRevocation {
-    v: u32,
-    /// The revoked request's id (hex SHA-256 of the signed request).
-    request_id: String,
-    expires_at_unix: i64,
-}
-
-/// Revoked requests (by request id) backed by a JSONL append log, so the
-/// set survives service restarts. Expired entries are dropped (and the file
-/// compacted) on load.
-#[derive(Clone)]
-pub struct PersistentRevocationStore {
-    inner: Arc<Mutex<StoreInner>>,
-}
-
-struct StoreInner {
-    map: HashMap<String, i64>,
-    path: PathBuf,
-}
-
-impl PersistentRevocationStore {
-    pub fn load(path: PathBuf) -> Result<Self, String> {
-        let mut map: HashMap<String, i64> = HashMap::new();
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-
-        if path.exists() {
-            let contents = std::fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
-            let lines: Vec<&str> = contents
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .collect();
-            for (idx, line) in lines.iter().enumerate() {
-                // Older logs keyed revocations on approvals, which no longer
-                // name anything. Refuse rather than silently dropping them —
-                // even as the last line, where the torn-write tolerance
-                // below would otherwise swallow it.
-                if let Ok(serde_json::Value::Object(obj)) =
-                    serde_json::from_str::<serde_json::Value>(line)
-                    && obj.get("v").and_then(|v| v.as_u64()) != Some(STORE_VERSION as u64)
-                {
-                    return Err(format!(
-                        "'{}' is a revocation log from an older version of Remonce (line {}); \
-                         archive it and start a fresh one (see the upgrade notes in CONFIGURATION.md)",
-                        path.display(),
-                        idx + 1
-                    ));
-                }
-                let entry: StoredRevocation = match serde_json::from_str(line) {
-                    Ok(e) => e,
-                    // A crash mid-append leaves a torn final line. Refusing
-                    // to start would halt every agent (they fail closed), and
-                    // the torn write was never acknowledged to a client.
-                    Err(e) if idx == lines.len() - 1 => {
-                        tracing::warn!(
-                            "Ignoring torn final entry in '{}': {e}",
-                            path.display()
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "Corrupt revocation entry in '{}' (line {}): {e}",
-                            path.display(),
-                            idx + 1
-                        ));
-                    }
-                };
-                if entry.expires_at_unix <= now {
-                    continue;
-                }
-                let slot = map.entry(entry.request_id).or_insert(entry.expires_at_unix);
-                if *slot < entry.expires_at_unix {
-                    *slot = entry.expires_at_unix;
-                }
-            }
-        }
-
-        let store = Self {
-            inner: Arc::new(Mutex::new(StoreInner { map, path })),
-        };
-        store.compact()?;
-        Ok(store)
-    }
-
-    /// Rewrite the log with only the live entries (atomic via temp + rename).
-    fn compact(&self) -> Result<(), String> {
-        let inner = self.inner.lock().expect("revocation store lock poisoned");
-        let mut out = String::new();
-        for (key, expires_at_unix) in &inner.map {
-            let line = serde_json::to_string(&StoredRevocation {
-                v: STORE_VERSION,
-                request_id: key.clone(),
-                expires_at_unix: *expires_at_unix,
-            })
-            .map_err(|e| format!("Serialize error: {e}"))?;
-            out.push_str(&line);
-            out.push('\n');
-        }
-        let tmp = inner.path.with_extension("tmp");
-        std::fs::write(&tmp, out).map_err(|e| format!("Failed to write '{}': {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &inner.path)
-            .map_err(|e| format!("Failed to replace '{}': {e}", inner.path.display()))?;
-        Ok(())
-    }
-
-    /// Record `key` as revoked until `expires_at_unix`, appending to the
-    /// log. Idempotent; keeps the later expiry if revoked twice.
-    pub fn revoke(&self, key: &str, expires_at_unix: i64) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("revocation store lock poisoned");
-        match inner.map.get(key) {
-            Some(existing) if *existing >= expires_at_unix => return Ok(()),
-            _ => {}
-        }
-
-        // Durable first, then visible: if the append fails, the in-memory map
-        // must not claim the revocation exists (a retry would short-circuit
-        // above and the revocation would vanish on restart).
-        let line = serde_json::to_string(&StoredRevocation {
-            v: STORE_VERSION,
-            request_id: key.to_string(),
-            expires_at_unix,
-        })
-        .map_err(|e| format!("Serialize error: {e}"))?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&inner.path)
-            .map_err(|e| format!("Failed to open '{}': {e}", inner.path.display()))?;
-        writeln!(file, "{line}").map_err(|e| format!("Failed to append revocation: {e}"))?;
-        file.sync_data()
-            .map_err(|e| format!("Failed to sync revocation log: {e}"))?;
-        inner.map.insert(key.to_string(), expires_at_unix);
-        Ok(())
-    }
-
-    pub fn is_revoked(&self, key: &str) -> bool {
-        let inner = self.inner.lock().expect("revocation store lock poisoned");
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        inner
-            .map
-            .get(key)
-            .map(|expires_at| *expires_at > now)
-            .unwrap_or(false)
-    }
-}
-
 // --- Service --------------------------------------------------------------
 
 #[derive(Clone)]
@@ -358,7 +200,7 @@ pub struct ServiceState {
     pub idp_keys: crate::idp_keys::IdpKeys,
     pub hostname: String,
     pub trusted_roots: Vec<Vec<u8>>,
-    pub store: PersistentRevocationStore,
+    pub store: crate::store::ExpiringSet,
     pub retention: std::time::Duration,
 }
 
@@ -405,7 +247,7 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let store = PersistentRevocationStore::load(PathBuf::from(&svc_config.persist_path))
+    let store = crate::store::ExpiringSet::load(PathBuf::from(&svc_config.persist_path))
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     tracing::info!(
@@ -476,7 +318,7 @@ async fn revoke_handler(
 
     state
         .store
-        .revoke(&revocation.request_id, verified.keep_until.unix_timestamp())
+        .insert(&revocation.request_id, verified.keep_until.unix_timestamp())
         .map_err(|e| {
             crate::audit::log_audit(
                 "error",
@@ -518,141 +360,6 @@ async fn revoked_handler(
         return Err((axum::http::StatusCode::BAD_REQUEST, "Invalid request id"));
     }
     Ok(Json(RevokedStatus {
-        revoked: state.store.is_revoked(&request_id),
+        revoked: state.store.contains(&request_id),
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temp_path(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("remonce-revstore-{}-{}.jsonl", name, uuid::Uuid::new_v4()));
-        p
-    }
-
-    fn far_future() -> i64 {
-        time::OffsetDateTime::now_utc().unix_timestamp() + 3600
-    }
-
-    #[test]
-    fn revoke_and_check() {
-        let path = temp_path("basic");
-        let store = PersistentRevocationStore::load(path.clone()).unwrap();
-        store.revoke("abc", far_future()).unwrap();
-        assert!(store.is_revoked("abc"));
-        assert!(!store.is_revoked("def"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn revocations_survive_reload() {
-        let path = temp_path("reload");
-        {
-            let store = PersistentRevocationStore::load(path.clone()).unwrap();
-            store.revoke("abc", far_future()).unwrap();
-        }
-        let store = PersistentRevocationStore::load(path.clone()).unwrap();
-        assert!(store.is_revoked("abc"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn expired_entries_dropped_on_load() {
-        let path = temp_path("expired");
-        let past = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
-        {
-            let store = PersistentRevocationStore::load(path.clone()).unwrap();
-            store.revoke("old", past).unwrap();
-            store.revoke("live", far_future()).unwrap();
-        }
-        let store = PersistentRevocationStore::load(path.clone()).unwrap();
-        assert!(!store.is_revoked("old"));
-        assert!(store.is_revoked("live"));
-        // Compaction removed the expired line from disk entirely.
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(!contents.contains("old"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn re_revoke_keeps_later_expiry() {
-        let path = temp_path("later");
-        let store = PersistentRevocationStore::load(path.clone()).unwrap();
-        store.revoke("abc", far_future()).unwrap();
-        store
-            .revoke("abc", time::OffsetDateTime::now_utc().unix_timestamp() - 10)
-            .unwrap();
-        assert!(store.is_revoked("abc"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn corrupt_middle_entry_is_rejected() {
-        let path = temp_path("corrupt");
-        let live = format!(
-            "{{\"v\":2,\"request_id\":\"abc\",\"expires_at_unix\":{}}}",
-            far_future()
-        );
-        std::fs::write(&path, format!("not json\n{live}\n")).unwrap();
-        assert!(PersistentRevocationStore::load(path.clone()).is_err());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn torn_final_entry_is_ignored() {
-        // A crash mid-append must not stop the service from starting.
-        let path = temp_path("torn");
-        let live = format!(
-            "{{\"v\":2,\"request_id\":\"abc\",\"expires_at_unix\":{}}}",
-            far_future()
-        );
-        std::fs::write(&path, format!("{live}\n{{\"v\":2,\"request_id\":\"de")).unwrap();
-        let store = PersistentRevocationStore::load(path.clone()).unwrap();
-        assert!(store.is_revoked("abc"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn older_log_formats_refused() {
-        // Both earlier formats: keyed on approver signature, then on
-        // approver key binding.
-        for old_key in ["sig", "key"] {
-            let path = temp_path("oldformat");
-            let old = format!("{{\"{old_key}\":\"abc\",\"expires_at_unix\":{}}}", far_future());
-            let new = format!("{{\"v\":2,\"request_id\":\"def\",\"expires_at_unix\":{}}}", far_future());
-            std::fs::write(&path, format!("{old}\n{new}\n")).unwrap();
-            let err = PersistentRevocationStore::load(path.clone()).err().unwrap();
-            assert!(err.contains("older version"), "{err}");
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    #[test]
-    fn old_format_single_line_not_treated_as_torn() {
-        // A one-line old log is also the "last line"; it must not be
-        // silently dropped by the torn-write tolerance.
-        let path = temp_path("oldsingle");
-        let old = format!("{{\"key\":\"abc\",\"expires_at_unix\":{}}}", far_future());
-        std::fs::write(&path, format!("{old}\n")).unwrap();
-        assert!(PersistentRevocationStore::load(path.clone()).is_err());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn failed_persist_is_not_remembered() {
-        // Point the log at a directory so the append fails.
-        let dir = temp_path("dir");
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = PersistentRevocationStore {
-            inner: Arc::new(Mutex::new(StoreInner {
-                map: HashMap::new(),
-                path: dir.clone(),
-            })),
-        };
-        assert!(store.revoke("abc", far_future()).is_err());
-        assert!(!store.is_revoked("abc"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
 }

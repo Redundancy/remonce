@@ -1,5 +1,5 @@
-//! In-memory replay cache for executed requests, and the agent's local set
-//! of revoked requests.
+//! The agent's replay cache for executed requests, and its local set of
+//! revoked requests.
 //!
 //! Both are keyed by request id — the hash of the signed request, which
 //! every approval of it signs, so no re-signing or re-encoding yields a
@@ -8,97 +8,127 @@
 //!
 //! Each entry expires once no approval that could run the request is still
 //! valid (see `security::replay_ttl`), so there's no need to keep it longer.
+//!
+//! With `[agent] state_dir` set, both are written to disk and survive a
+//! restart; otherwise they live in memory, and a restart forgets which
+//! requests ran and which were revoked.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use crate::store::ExpiringSet;
+use std::path::Path;
+use std::time::Duration;
 
-const SWEEP_THRESHOLD: usize = 10_000;
+/// File names inside `[agent] state_dir`.
+const REPLAY_FILE: &str = "replay.jsonl";
+const REVOCATIONS_FILE: &str = "revocations.jsonl";
 
-#[derive(Clone, Default)]
+/// The Unix time `ttl` from now, rounded up to a whole second.
+fn expiry(ttl: Duration) -> i64 {
+    let secs = ttl.as_secs().saturating_add(u64::from(ttl.subsec_nanos() > 0));
+    time::OffsetDateTime::now_utc()
+        .unix_timestamp()
+        .saturating_add(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReplayError {
+    /// The request is already recorded and unexpired.
+    #[error("request already executed")]
+    AlreadyRun,
+    /// The record couldn't be written, so the request must not run.
+    #[error("could not record the request: {0}")]
+    Store(String),
+}
+
+#[derive(Clone)]
 pub struct ReplayCache {
-    /// Key → the instant the entry may be forgotten. Per-entry expiry, so a
-    /// sweep triggered by a short-window request can't evict entries that
-    /// belong to a longer window.
-    inner: Arc<Mutex<HashMap<String, Instant>>>,
+    set: ExpiringSet,
+}
+
+impl Default for ReplayCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReplayCache {
+    /// In memory only.
     pub fn new() -> Self {
-        Self::default()
+        ReplayCache {
+            set: ExpiringSet::in_memory(),
+        }
     }
 
-    /// Record `key` as used for the next `ttl` and return `Ok(())`, or
-    /// `Err(())` if it is already recorded and unexpired.
-    pub fn check_and_insert(&self, key: &str, ttl: Duration) -> Result<(), ()> {
-        let mut map = self.inner.lock().expect("replay cache lock poisoned");
-        let now = Instant::now();
+    /// Kept in `state_dir`, so it survives a restart.
+    pub fn persistent(state_dir: &Path) -> Result<Self, String> {
+        Ok(ReplayCache {
+            set: ExpiringSet::load(state_dir.join(REPLAY_FILE))?,
+        })
+    }
 
-        if map.len() > SWEEP_THRESHOLD {
-            map.retain(|_, expires_at| *expires_at > now);
+    /// Record `key` as used for the next `ttl`. Fails if it is already
+    /// recorded and unexpired, or if the record can't be written — a run
+    /// that can't be remembered must not start.
+    pub fn check_and_insert(&self, key: &str, ttl: Duration) -> Result<(), ReplayError> {
+        match self.set.insert_new(key, expiry(ttl)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ReplayError::AlreadyRun),
+            Err(e) => Err(ReplayError::Store(e)),
         }
-
-        if map.get(key).is_some_and(|expires_at| *expires_at > now) {
-            return Err(());
-        }
-
-        map.insert(key.to_string(), now + ttl);
-        Ok(())
     }
 
     /// Forget `key`, e.g. when execution failed before the process
-    /// started, so the signer can retry without re-signing.
+    /// started, so the request can be retried without new approvals.
     pub fn release(&self, key: &str) {
-        let mut map = self.inner.lock().expect("replay cache lock poisoned");
-        map.remove(key);
+        if let Err(e) = self.set.remove(key) {
+            // The entry stays: the request counts as used, which is the
+            // safe way to be wrong.
+            tracing::error!("Failed to release replay entry: {e}");
+        }
     }
 
     #[cfg(test)]
     fn sweep_now(&self) {
-        let now = Instant::now();
-        self.inner
-            .lock()
-            .unwrap()
-            .retain(|_, expires_at| *expires_at > now);
+        self.set.sweep_now();
     }
 }
 
-/// In-memory set of revoked requests, keyed by request id. Each entry
-/// carries its own expiry: the moment every approval of the request would
-/// have aged out of `approval_validity` anyway, after which keeping it is
-/// pointless.
-#[derive(Clone, Default)]
+/// Revoked requests, keyed by request id. Each entry carries its own
+/// expiry: the moment every approval of the request would have aged out of
+/// `approval_validity` anyway, after which keeping it is pointless.
+#[derive(Clone)]
 pub struct RevocationCache {
-    inner: Arc<Mutex<HashMap<String, Instant>>>,
+    set: ExpiringSet,
+}
+
+impl Default for RevocationCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RevocationCache {
+    /// In memory only.
     pub fn new() -> Self {
-        Self::default()
+        RevocationCache {
+            set: ExpiringSet::in_memory(),
+        }
     }
 
-    /// Record `key` as revoked for the next `remaining` duration.
-    pub fn revoke(&self, key: &str, remaining: Duration) {
-        let mut map = self.inner.lock().expect("revocation cache lock poisoned");
-        let now = Instant::now();
-        if map.len() > SWEEP_THRESHOLD {
-            map.retain(|_, expires_at| *expires_at > now);
-        }
-        let expires_at = now + remaining;
-        // Keep the later expiry if revoked twice.
-        match map.get(key) {
-            Some(existing) if *existing >= expires_at => {}
-            _ => {
-                map.insert(key.to_string(), expires_at);
-            }
-        }
+    /// Kept in `state_dir`, so it survives a restart.
+    pub fn persistent(state_dir: &Path) -> Result<Self, String> {
+        Ok(RevocationCache {
+            set: ExpiringSet::load(state_dir.join(REVOCATIONS_FILE))?,
+        })
+    }
+
+    /// Record `key` as revoked for the next `remaining` duration; keeps the
+    /// later expiry if revoked twice.
+    pub fn revoke(&self, key: &str, remaining: Duration) -> Result<(), String> {
+        self.set.insert(key, expiry(remaining))
     }
 
     pub fn is_revoked(&self, key: &str) -> bool {
-        let map = self.inner.lock().expect("revocation cache lock poisoned");
-        map.get(key)
-            .map(|expires_at| *expires_at > Instant::now())
-            .unwrap_or(false)
+        self.set.contains(key)
     }
 }
 
@@ -107,9 +137,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revoked_sig_is_reported() {
+    fn revoked_request_is_reported() {
         let cache = RevocationCache::new();
-        cache.revoke("abc", Duration::from_secs(60));
+        cache.revoke("abc", Duration::from_secs(60)).unwrap();
         assert!(cache.is_revoked("abc"));
         assert!(!cache.is_revoked("def"));
     }
@@ -117,15 +147,15 @@ mod tests {
     #[test]
     fn expired_revocation_is_forgotten() {
         let cache = RevocationCache::new();
-        cache.revoke("abc", Duration::from_secs(0));
+        cache.revoke("abc", Duration::from_secs(0)).unwrap();
         assert!(!cache.is_revoked("abc"));
     }
 
     #[test]
     fn re_revoke_keeps_later_expiry() {
         let cache = RevocationCache::new();
-        cache.revoke("abc", Duration::from_secs(60));
-        cache.revoke("abc", Duration::from_secs(0));
+        cache.revoke("abc", Duration::from_secs(60)).unwrap();
+        cache.revoke("abc", Duration::from_secs(0)).unwrap();
         assert!(cache.is_revoked("abc"));
     }
 
@@ -134,11 +164,11 @@ mod tests {
         let cache = ReplayCache::new();
         let ttl = Duration::from_secs(60);
         assert!(cache.check_and_insert("abc", ttl).is_ok());
-        assert!(cache.check_and_insert("abc", ttl).is_err());
+        assert!(matches!(cache.check_and_insert("abc", ttl), Err(ReplayError::AlreadyRun)));
     }
 
     #[test]
-    fn released_sig_can_be_used_again() {
+    fn released_request_can_be_used_again() {
         let cache = ReplayCache::new();
         let ttl = Duration::from_secs(60);
         assert!(cache.check_and_insert("abc", ttl).is_ok());
@@ -157,10 +187,29 @@ mod tests {
     }
 
     #[test]
-    fn distinct_sigs_independent() {
+    fn distinct_requests_independent() {
         let cache = ReplayCache::new();
         let ttl = Duration::from_secs(60);
         assert!(cache.check_and_insert("abc", ttl).is_ok());
         assert!(cache.check_and_insert("def", ttl).is_ok());
+    }
+
+    #[test]
+    fn persistent_caches_remember_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("remonce-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ttl = Duration::from_secs(60);
+        {
+            let replay = ReplayCache::persistent(&dir).unwrap();
+            replay.check_and_insert("ran", ttl).unwrap();
+            replay.check_and_insert("failed-to-start", ttl).unwrap();
+            replay.release("failed-to-start");
+            RevocationCache::persistent(&dir).unwrap().revoke("revoked", ttl).unwrap();
+        }
+        let replay = ReplayCache::persistent(&dir).unwrap();
+        assert!(matches!(replay.check_and_insert("ran", ttl), Err(ReplayError::AlreadyRun)));
+        assert!(replay.check_and_insert("failed-to-start", ttl).is_ok());
+        assert!(RevocationCache::persistent(&dir).unwrap().is_revoked("revoked"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

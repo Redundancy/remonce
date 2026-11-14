@@ -330,3 +330,80 @@ async fn idp_key_rotation_is_followed_without_a_restart() {
     // ...and not an approval made while it was current.
     assert_eq!(after.execute(&approved_before, Some(&token)).await.status(), 400);
 }
+
+#[tokio::test]
+async fn state_dir_remembers_runs_and_revocations_across_a_restart() {
+    use crate::security_tests::tests::revoke_sig;
+
+    let env = new_env();
+    let logs = std::sync::Arc::new(TempDir::new("agent-logs"));
+    let state_dir = TempDir::new("agent-state");
+    // An agent process over the same directories: each call is a restart.
+    let boot = |env: &Env| {
+        let mut state = TestAgent::state(env, test_config(&logs.0));
+        state.replay_cache = crate::replay::ReplayCache::persistent(&state_dir.0).unwrap();
+        state.revocations = crate::replay::RevocationCache::persistent(&state_dir.0).unwrap();
+        TestAgent::serve(state)
+    };
+    let mut agent = TestAgent {
+        addr: boot(&env).await,
+        env,
+        logs: logs.clone(),
+        http: reqwest::Client::new(),
+    };
+    let token = agent.viewer_token("bob");
+
+    // One request runs; another is revoked by its approver before it does.
+    let ran = agent.request(&[ALICE]);
+    let id = execution_id(agent.execute(&ran, Some(&token)).await).await;
+    agent.finished_log(&id).await;
+
+    let revoked = agent.request(&[ALICE]);
+    let request_id = crate::security::request_id(&revoked.command);
+    let revocation = crate::security::RevocationBundle {
+        revoker: revoke_sig(&agent.env, ALICE, &request_id, OffsetDateTime::now_utc()),
+        request: revoked.clone(),
+    };
+    let resp = agent
+        .http
+        .post(format!("http://{}/revoke", agent.addr))
+        .json(&revocation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+    // The agent restarts. Both are still remembered.
+    agent.addr = boot(&agent.env).await;
+    assert_eq!(agent.execute(&ran, Some(&token)).await.status(), 409);
+    assert_eq!(agent.execute(&revoked, Some(&token)).await.status(), 403);
+
+    // A request it has never seen still runs.
+    let id = execution_id(agent.execute(&agent.request(&[ALICE]), Some(&token)).await).await;
+    agent.finished_log(&id).await;
+}
+
+#[tokio::test]
+async fn without_state_dir_a_restart_forgets() {
+    // The default (no `state_dir`), pinned down so the difference is
+    // deliberate: after a restart the same approved request runs again.
+    let env = new_env();
+    let logs = std::sync::Arc::new(TempDir::new("agent-logs"));
+    let boot = |env: &Env| TestAgent::serve(TestAgent::state(env, test_config(&logs.0)));
+    let mut agent = TestAgent {
+        addr: boot(&env).await,
+        env,
+        logs: logs.clone(),
+        http: reqwest::Client::new(),
+    };
+    let token = agent.viewer_token("bob");
+    let bundle = agent.request(&[ALICE]);
+    let id = execution_id(agent.execute(&bundle, Some(&token)).await).await;
+    agent.finished_log(&id).await;
+    assert_eq!(agent.execute(&bundle, Some(&token)).await.status(), 409);
+
+    agent.addr = boot(&agent.env).await;
+    let second = execution_id(agent.execute(&bundle, Some(&token)).await).await;
+    assert_ne!(second, id, "the second run gets its own log");
+    agent.finished_log(&second).await;
+}

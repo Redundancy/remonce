@@ -21,6 +21,7 @@ pub mod policy;
 pub mod params;
 pub mod replay;
 pub mod revocation;
+pub mod store;
 pub mod tsa;
 
 /// HTTP client for OIDC discovery, JWKS, TSA and OPA calls. Bounded
