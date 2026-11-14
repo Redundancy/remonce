@@ -297,6 +297,7 @@ mod tests {
             revocation_service_url: None,
             revocation_service_ca_path: None,
             state_dir: None,
+            audit_log_path: None,
         });
         assert!(matches!(
             validate(&cfg, false),

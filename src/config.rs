@@ -102,6 +102,10 @@ pub struct AgentConfig {
     /// Unset, both live in memory, and a restart forgets them — a request
     /// that already ran can then run again while its approvals last.
     pub state_dir: Option<String>,
+
+    /// File the agent appends its audit records to (one JSON object per
+    /// line), as well as printing them on stdout.
+    pub audit_log_path: Option<String>,
 }
 
 fn default_agent_listen_address() -> String {

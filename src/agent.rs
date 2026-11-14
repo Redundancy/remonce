@@ -128,6 +128,11 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .ok_or("Missing [agent] section in config.toml — the agent requires an `[agent]` block with TLS configuration. See CONFIGURATION.md.")?;
 
+    if let Some(path) = &agent_config.audit_log_path {
+        crate::audit::set_audit_file(path)?;
+        tracing::info!(path = %path, "Audit records are also appended to a file");
+    }
+
     let http_client = crate::http_client();
 
     // 2. The IdP's signing keys, to verify tokens with; kept current.
@@ -625,21 +630,15 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
         now,
     } = run;
     let hostname = state.hostname.clone();
+    let audit_ctx = AuditContext {
+        event_type: Some("command_execution"),
+        command: Some(command_json),
+        request_id: Some(request_id.clone()),
+        approvers: Some(audit_approvers),
+        ..Default::default()
+    };
     let audit = |decision: &'static str, reason: String| {
-        crate::audit::log_audit(
-            decision,
-            reason,
-            user.clone(),
-            ip.clone(),
-            hostname.clone(),
-            AuditContext {
-                event_type: Some("command_execution"),
-                command: Some(command_json.clone()),
-                request_id: Some(request_id.clone()),
-                approvers: Some(audit_approvers.clone()),
-                ..Default::default()
-            },
-        )
+        crate::audit::log_audit(decision, reason, user.clone(), ip.clone(), hostname.clone(), audit_ctx.clone())
     };
 
     // 8. Replay: one run per request. Remembered past every approval that
@@ -749,6 +748,33 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
     let stderr = child.stderr.take().unwrap();
     let exec_id_for_log = execution_id.clone();
     let log_path_for_task = log_path.clone();
+    let process_started = std::time::Instant::now();
+    // The run's own records name it, so its start, end and log tie up.
+    let run_ctx = AuditContext {
+        execution_id: Some(execution_id.clone()),
+        ..audit_ctx.clone()
+    };
+    let finished = {
+        let (user, ip, hostname, run_ctx) = (user.clone(), ip.clone(), hostname.clone(), run_ctx.clone());
+        move |result: &'static str, exit_code: Option<i32>, reason: String| {
+            crate::audit::log_audit(
+                "completed",
+                reason,
+                user,
+                ip,
+                hostname,
+                AuditContext {
+                    event_type: Some("command_finished"),
+                    outcome: Some(crate::audit::AuditOutcome {
+                        result,
+                        exit_code,
+                        duration_ms: u64::try_from(process_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    }),
+                    ..run_ctx
+                },
+            )
+        }
+    };
 
     tokio::spawn(async move {
         let mut stdout_reader = tokio::io::BufReader::new(stdout);
@@ -806,6 +832,16 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
                 None
             }
         };
+        // Recorded as soon as it is known, whatever happens to the log.
+        match &wait_result {
+            Some(Ok(status)) => finished("exited", status.code(), format!("Command exited: {status}")),
+            Some(Err(e)) => finished("wait_error", None, format!("Waiting for the command failed: {e}")),
+            None => finished(
+                "timeout",
+                None,
+                format!("Command killed after exceeding its timeout ({})", humantime_serde::re::humantime::format_duration(timeout)),
+            ),
+        }
 
         // Grandchildren that inherited stdout/stderr keep the pipes open
         // after the direct child exits or is killed, so bound the drain and
@@ -852,7 +888,14 @@ async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, Err
         let _ = file_out.flush().await;
     });
 
-    audit("allow", "Command Started".to_string());
+    crate::audit::log_audit(
+        "allow",
+        "Command Started".to_string(),
+        user.clone(),
+        ip.clone(),
+        hostname.clone(),
+        run_ctx,
+    );
 
     Ok(ExecutionResponse {
         status: "authorized".to_string(),
@@ -1021,37 +1064,108 @@ async fn revoke_handler(
     }))
 }
 
+/// Record a read-only action (catalog, file list, logs) in the audit log.
+fn audit_view(
+    state: &AgentState,
+    addr: &crate::tls::PeerAddr,
+    event_type: &'static str,
+    decision: &'static str,
+    reason: impl Into<String>,
+    user: &str,
+    file: Option<serde_json::Value>,
+) {
+    crate::audit::log_audit(
+        decision,
+        reason.into(),
+        user.to_string(),
+        addr.ip_string(),
+        state.hostname.clone(),
+        crate::audit::AuditContext {
+            file,
+            event_type: Some(event_type),
+            ..Default::default()
+        },
+    );
+}
+
+/// Who is asking, for a read-only endpoint: their verified viewer claims
+/// and username. A missing or invalid login is audited as `event_type` and
+/// comes back as the response to send.
+async fn authenticate_viewer(
+    state: &AgentState,
+    addr: &crate::tls::PeerAddr,
+    headers: &axum::http::HeaderMap,
+    event_type: &'static str,
+    file: Option<serde_json::Value>,
+) -> Result<(serde_json::Value, String), Box<Response>> {
+    let Some(token) = bearer_token(headers) else {
+        audit_view(state, addr, event_type, "deny", "Missing bearer token", "unauthenticated", file);
+        return Err(Box::new((axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response()));
+    };
+    match verify_query_token(&token, state).await {
+        Ok(claims) => {
+            let user = claims_username(&claims);
+            Ok((claims, user))
+        }
+        Err((status, msg)) => {
+            audit_view(state, addr, event_type, "deny", msg, "unauthenticated", file);
+            Err(Box::new((status, msg).into_response()))
+        }
+    }
+}
+
+/// Whether policy lets `viewer` see what this agent offers (`view_docs`):
+/// the command catalog and the list of files. A refusal is audited as
+/// `event_type` and comes back as the response to send.
+async fn require_view_docs(
+    state: &AgentState,
+    addr: &crate::tls::PeerAddr,
+    event_type: &'static str,
+    claims: serde_json::Value,
+    user: &str,
+) -> Result<(), Box<Response>> {
+    use axum::http::StatusCode;
+    let viewer = crate::policy::Identity {
+        username: user.to_string(),
+        claims,
+    };
+    match state.policy.allows_viewing(&crate::policy::ViewInput::ViewDocs { viewer }).await {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            audit_view(state, addr, event_type, "deny", "Denied by policy", user, None);
+            Err(Box::new((StatusCode::FORBIDDEN, "Policy does not allow you to view this").into_response()))
+        }
+        Err(e) => {
+            audit_view(state, addr, event_type, "error", format!("Policy evaluation failed: {e}"), user, None);
+            Err(Box::new((StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable").into_response()))
+        }
+    }
+}
+
 /// The command catalog: what can be requested here and what each command
 /// needs (published requirements from OPA). Viewer-token auth; policy
 /// decides who may see it.
-async fn catalog_handler(State(state): State<AgentState>, headers: axum::http::HeaderMap) -> Response {
-    use axum::http::StatusCode;
-    let Some(token) = bearer_token(&headers) else {
-        return (StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
+async fn catalog_handler(
+    State(state): State<AgentState>,
+    ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    const EVENT: &str = "catalog_access";
+    let (claims, user) = match authenticate_viewer(&state, &addr, &headers, EVENT, None).await {
+        Ok(v) => v,
+        Err(response) => return *response,
     };
-    let claims = match verify_query_token(&token, &state).await {
-        Ok(c) => c,
-        Err((status, msg)) => return (status, msg).into_response(),
-    };
-    let viewer = crate::policy::Identity {
-        username: claims_username(&claims),
-        claims: claims.clone(),
-    };
-    match state.policy.allows_viewing(&crate::policy::ViewInput::ViewDocs { viewer }).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (StatusCode::FORBIDDEN, "Policy does not allow you to view commands").into_response();
-        }
-        Err(e) => {
-            tracing::warn!("Policy view_docs check failed: {e}");
-            return (StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable").into_response();
-        }
+    if let Err(response) = require_view_docs(&state, &addr, EVENT, claims, &user).await {
+        return *response;
     }
     match state.policy.requirements().await {
-        Ok(published) => Json(crate::catalog::build(&state.config, &state.hostname, &published)).into_response(),
+        Ok(published) => {
+            audit_view(&state, &addr, EVENT, "allow", "Catalog served", &user, None);
+            Json(crate::catalog::build(&state.config, &state.hostname, &published)).into_response()
+        }
         Err(e) => {
-            tracing::warn!("Fetching published requirements failed: {e}");
-            (StatusCode::SERVICE_UNAVAILABLE, "Could not load published requirements").into_response()
+            audit_view(&state, &addr, EVENT, "error", format!("Fetching published requirements failed: {e}"), &user, None);
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Could not load published requirements").into_response()
         }
     }
 }
@@ -1063,64 +1177,37 @@ async fn stream_logs_handler(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    const EVENT: &str = "execution_log_access";
+
     // Path traversal guard: only allow canonical UUIDs through.
     if uuid::Uuid::parse_str(&id).is_err() {
+        audit_view(&state, &addr, EVENT, "deny", "Invalid log id", "unauthenticated", None);
         return (axum::http::StatusCode::BAD_REQUEST, "Invalid log id").into_response();
     }
+    let exec_info = Some(serde_json::json!({ "execution_id": id }));
 
     // Execution output can contain anything the command printed, so it gets
-    // the same bearer-token + OPA gate as file streaming.
-    let token = match bearer_token(&headers) {
-        Some(t) => t,
-        None => return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response(),
+    // the same bearer-token + policy gate as file streaming.
+    let (claims, user) = match authenticate_viewer(&state, &addr, &headers, EVENT, exec_info.clone()).await {
+        Ok(v) => v,
+        Err(response) => return *response,
     };
-    let claims = match verify_query_token(&token, &state).await {
-        Ok(c) => c,
-        Err((status, msg)) => return (status, msg).into_response(),
-    };
-    let user = claims
-        .get("username")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
 
     let allowed = policy_allows(
         &state,
         &crate::policy::ViewInput::ViewExecution {
             viewer: crate::policy::Identity {
-                username: claims_username(&claims),
-                claims: claims.clone(),
+                username: user.clone(),
+                claims,
             },
             execution_id: id.to_string(),
         },
     ).await;
-    let exec_info = Some(serde_json::json!({ "execution_id": id }));
     if !allowed {
-        crate::audit::log_audit(
-            "deny",
-            "Execution log access denied by OPA".into(),
-            user,
-            addr.ip_string(),
-            state.hostname.clone(),
-            crate::audit::AuditContext {
-                file: exec_info,
-                event_type: Some("execution_log_access"),
-                ..Default::default()
-            },
-        );
-        return (axum::http::StatusCode::FORBIDDEN, "OPA Denied").into_response();
+        audit_view(&state, &addr, EVENT, "deny", "Denied by policy", &user, exec_info);
+        return (axum::http::StatusCode::FORBIDDEN, "Denied by policy").into_response();
     }
-    crate::audit::log_audit(
-        "allow",
-        "Execution Log Stream Started".into(),
-        user,
-        addr.ip_string(),
-        state.hostname.clone(),
-        crate::audit::AuditContext {
-            file: exec_info,
-            ..Default::default()
-        },
-    );
+    audit_view(&state, &addr, EVENT, "allow", "Execution Log Stream Started", &user, exec_info);
 
     let log_path = PathBuf::from(&state.config.logs_dir).join(format!("{}.log", id));
     ws.on_upgrade(move |socket| tail_file(socket, log_path, None))
@@ -1147,18 +1234,23 @@ async fn policy_allows(state: &AgentState, input: &crate::policy::ViewInput) -> 
     })
 }
 
+/// The files this agent will show. Like the catalog, it says what the
+/// machine offers, so the same `view_docs` decision covers it.
 async fn list_files_handler(
     State(state): State<AgentState>,
+    ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    // Same auth posture as `/api/files/stream` — bearer ID token required.
-    let Some(token) = bearer_token(&headers) else {
-        return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
+    const EVENT: &str = "file_list_access";
+    let (claims, user) = match authenticate_viewer(&state, &addr, &headers, EVENT, None).await {
+        Ok(v) => v,
+        Err(response) => return *response,
     };
-    match verify_query_token(&token, &state).await {
-        Ok(_claims) => Json(files::list_available_files(&state.config.files)).into_response(),
-        Err((status, msg)) => (status, msg).into_response(),
+    if let Err(response) = require_view_docs(&state, &addr, EVENT, claims, &user).await {
+        return *response;
     }
+    audit_view(&state, &addr, EVENT, "allow", "File list served", &user, None);
+    Json(files::list_available_files(&state.config.files)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1226,7 +1318,7 @@ async fn stream_file_handler(
         return (axum::http::StatusCode::BAD_REQUEST, "Missing name or path").into_response();
     };
 
-    let file_info_json = match &identifier {
+    let mut file_info_json = match &identifier {
         files::FileIdentifier::Name(n) => serde_json::json!({ "name": n }),
         files::FileIdentifier::Path(p) => serde_json::json!({ "path": p }),
     };
@@ -1238,6 +1330,10 @@ async fn stream_file_handler(
              return (axum::http::StatusCode::FORBIDDEN, "File Access Denied").into_response();
         }
     };
+    // What was asked for can be spelled many ways (`..`, relative paths);
+    // policy and the audit log also get the one file it resolved to, as
+    // the file list shows it.
+    file_info_json["resolved_path"] = serde_json::Value::String(file_path.to_string_lossy().into_owned());
 
     // 3. Check OPA
     let allowed = policy_allows(

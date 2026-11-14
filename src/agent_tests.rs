@@ -45,11 +45,30 @@ fn echo_command() -> (String, Vec<&'static str>) {
     }
 }
 
-/// An agent config with one runnable command, `ping-test`, which the
-/// shipped policy publishes requirements for (one approval and an executor,
-/// both in `webapp-users`).
+/// A command that runs for 30 seconds unless it is stopped, as
+/// `(executable, args, env)`.
+fn sleep_command() -> (String, Vec<&'static str>, String) {
+    if cfg!(windows) {
+        // ping needs SystemRoot to load Winsock; the agent clears the rest.
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        (
+            "ping".into(),
+            vec!["-n", "30", "127.0.0.1"],
+            format!("env = {{ SystemRoot = {system_root:?} }}"),
+        )
+    } else {
+        ("/bin/sleep".into(), vec!["30"], String::new())
+    }
+}
+
+/// An agent config with two runnable commands the shipped policy publishes
+/// requirements for (one approval and an executor, both in `webapp-users`):
+/// `ping-test` echoes its `count`, and `test` runs far longer than its
+/// one-second timeout. The run logs are also offered as files.
 pub(crate) fn test_config(logs_dir: &std::path::Path) -> crate::config::Config {
     let (executable, args) = echo_command();
+    let (sleep_executable, sleep_args, sleep_env) = sleep_command();
+    let log_files = logs_dir.join("*.log");
     let text = format!(
         r#"
 logs_dir = {logs:?}
@@ -70,8 +89,21 @@ args = {args:?}
 name = "count"
 min = 1
 max = 100
+
+[[commands]]
+name = "test"
+opa_rule = "data.remonce.authz.decision"
+executable = {sleep_executable:?}
+args = {sleep_args:?}
+command_timeout = "1s"
+{sleep_env}
+
+[[files]]
+path = {log_files:?}
+name = "execution-logs"
 "#,
         logs = logs_dir.to_string_lossy(),
+        log_files = log_files.to_string_lossy(),
         policy = concat!(env!("CARGO_MANIFEST_DIR"), "/policy"),
     );
     crate::config::parse(&text).expect("test config parses")
@@ -153,17 +185,43 @@ impl TestAgent {
 
     /// A new `ping-test` request for this agent, approved by `approvers`.
     pub(crate) fn request(&self, approvers: &[usize]) -> RequestBundle {
+        self.request_for("ping-test", json!({ "count": "42" }), approvers)
+    }
+
+    /// A new request for `command` on this agent, approved by `approvers`.
+    pub(crate) fn request_for(&self, command: &str, params: serde_json::Value, approvers: &[usize]) -> RequestBundle {
         let command = json!({
-            "command": "ping-test",
+            "command": command,
             "id": uuid::Uuid::new_v4().to_string(),
             "target_machines": [HOST],
-            "params": { "count": "42" },
+            "params": params,
         });
         let now = OffsetDateTime::now_utc();
         RequestBundle {
             approvals: approvers.iter().map(|who| approve(&self.env, *who, &command, now)).collect(),
             command,
         }
+    }
+
+    /// A viewer login for `who` with these groups.
+    pub(crate) fn viewer_token_in(&self, who: &str, groups: &[&str]) -> String {
+        create_valid_jwt(
+            &self.env.idp,
+            ISSUER,
+            VIEWER_CLIENT,
+            who,
+            "viewer-nonce",
+            OffsetDateTime::now_utc(),
+            json!({ "groups": groups }),
+        )
+    }
+
+    pub(crate) async fn get(&self, path: &str, token: Option<&str>) -> reqwest::Response {
+        let mut req = self.http.get(format!("http://{}{path}", self.addr));
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        req.send().await.unwrap()
     }
 
     pub(crate) async fn execute(&self, bundle: &RequestBundle, token: Option<&str>) -> reqwest::Response {
@@ -406,4 +464,142 @@ async fn without_state_dir_a_restart_forgets() {
     let second = execution_id(agent.execute(&bundle, Some(&token)).await).await;
     assert_ne!(second, id, "the second run gets its own log");
     agent.finished_log(&second).await;
+}
+
+/// The audit records about one request, as (event type, decision, record).
+fn audit_of(bundle: &RequestBundle) -> Vec<(String, String, serde_json::Value)> {
+    let request_id = crate::security::request_id(&bundle.command);
+    crate::audit::test_capture::matching("request_id", &request_id)
+        .into_iter()
+        .map(|r| {
+            (
+                r["event_type"].as_str().unwrap().to_string(),
+                r["decision"].as_str().unwrap().to_string(),
+                r,
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_run_is_audited_from_start_to_finish() {
+    let agent = TestAgent::start().await;
+    let bundle = agent.request(&[ALICE]);
+    let id = execution_id(agent.execute(&bundle, Some(&agent.viewer_token("bob"))).await).await;
+    agent.finished_log(&id).await;
+
+    let records = audit_of(&bundle);
+    let kinds: Vec<(&str, &str)> = records.iter().map(|(e, d, _)| (e.as_str(), d.as_str())).collect();
+    assert_eq!(kinds, [("command_execution", "allow"), ("command_finished", "completed")], "{records:#?}");
+    for (_, _, record) in &records {
+        assert_eq!(record["execution_id"], id.as_str());
+        assert_eq!(record["user"], "bob");
+        assert_eq!(record["approvers"][0]["username"], "alice");
+        assert_eq!(record["command"]["command"], "ping-test");
+    }
+    let outcome = &records[1].2["outcome"];
+    assert_eq!(outcome["result"], "exited");
+    assert_eq!(outcome["exit_code"], 0);
+    assert!(outcome["duration_ms"].is_u64());
+}
+
+#[tokio::test]
+async fn a_timed_out_run_is_killed_and_audited_as_a_timeout() {
+    let agent = TestAgent::start().await;
+    let bundle = agent.request_for("test", json!({}), &[ALICE]);
+    let started = std::time::Instant::now();
+    let id = execution_id(agent.execute(&bundle, Some(&agent.viewer_token("bob"))).await).await;
+    let log = agent.finished_log(&id).await;
+    assert!(log.contains("--- TIMEOUT"), "{log}");
+    assert!(started.elapsed() < Duration::from_secs(20), "the 30s command was cut short");
+
+    let records = audit_of(&bundle);
+    let finished = records.iter().find(|(e, _, _)| e == "command_finished").expect("finish record");
+    assert_eq!(finished.2["outcome"]["result"], "timeout");
+    assert!(finished.2["outcome"].get("exit_code").is_none());
+}
+
+#[tokio::test]
+async fn refused_requests_are_audited_with_the_reason() {
+    let agent = TestAgent::start().await;
+    let bundle = agent.request(&[ALICE]);
+    let outsider = agent.viewer_token_in("mallory", &["someone-else"]);
+    assert_eq!(agent.execute(&bundle, Some(&outsider)).await.status(), 403);
+
+    let records = audit_of(&bundle);
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let (event, decision, record) = &records[0];
+    assert_eq!((event.as_str(), decision.as_str()), ("command_execution", "deny"));
+    assert_eq!(record["user"], "mallory");
+    assert!(record["reason"].as_str().unwrap().contains("not allowed to execute"), "{record}");
+    assert!(record.get("execution_id").is_none());
+}
+
+#[tokio::test]
+async fn what_the_agent_offers_is_shown_only_as_policy_allows_and_audited() {
+    let agent = TestAgent::start().await;
+    // Names unique to this test, to find its audit records by.
+    let member = format!("member-{}", uuid::Uuid::new_v4());
+    let outsider = format!("outsider-{}", uuid::Uuid::new_v4());
+    let member_token = agent.viewer_token_in(&member, &["webapp-users"]);
+    let outsider_token = agent.viewer_token_in(&outsider, &["someone-else"]);
+
+    for path in ["/api/commands", "/api/files"] {
+        assert_eq!(agent.get(path, None).await.status(), 401, "{path}");
+        assert_eq!(agent.get(path, Some(&outsider_token)).await.status(), 403, "{path}");
+        assert_eq!(agent.get(path, Some(&member_token)).await.status(), 200, "{path}");
+    }
+
+    let seen = |user: &str| -> Vec<(String, String)> {
+        crate::audit::test_capture::matching("user", user)
+            .iter()
+            .map(|r| (r["event_type"].as_str().unwrap().to_string(), r["decision"].as_str().unwrap().to_string()))
+            .collect()
+    };
+    let pairs = |decision: &str| {
+        vec![
+            ("catalog_access".to_string(), decision.to_string()),
+            ("file_list_access".to_string(), decision.to_string()),
+        ]
+    };
+    assert_eq!(seen(&member), pairs("allow"));
+    assert_eq!(seen(&outsider), pairs("deny"));
+}
+
+#[tokio::test]
+async fn file_policy_and_audit_see_where_a_path_resolves() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let agent = TestAgent::start().await;
+    let viewer = format!("viewer-{}", uuid::Uuid::new_v4());
+    let token = agent.viewer_token_in(&viewer, &["webapp-users"]);
+
+    // A run log to read, asked for by a roundabout spelling of its path.
+    let id = execution_id(agent.execute(&agent.request(&[ALICE]), Some(&token)).await).await;
+    agent.finished_log(&id).await;
+    let direct = agent.logs.0.join(format!("{id}.log"));
+    let roundabout = agent
+        .logs
+        .0
+        .join("..")
+        .join(agent.logs.0.file_name().unwrap())
+        .join(format!("{id}.log"));
+
+    let mut url = url::Url::parse(&format!("ws://{}/api/files/stream", agent.addr)).unwrap();
+    url.query_pairs_mut().append_pair("path", &roundabout.to_string_lossy());
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("the file streams");
+    let first = tokio::time::timeout(Duration::from_secs(10), ws.next()).await.unwrap().unwrap().unwrap();
+    assert!(first.to_text().unwrap().contains("--- EXECUTION LOG ---"));
+
+    let record = crate::audit::test_capture::matching("user", &viewer)
+        .into_iter()
+        .find(|r| r["event_type"] == "file_access")
+        .expect("file access is audited");
+    assert_eq!(record["decision"], "allow");
+    assert_eq!(record["file"]["path"], roundabout.to_string_lossy().as_ref());
+    let resolved = std::fs::canonicalize(&direct).unwrap();
+    assert_eq!(record["file"]["resolved_path"], resolved.to_string_lossy().as_ref());
 }
