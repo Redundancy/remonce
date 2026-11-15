@@ -147,11 +147,11 @@ Predicates are evaluated at **execution time** against the approvers' and execut
 
 ### Replay protection
 
-The agent keeps an in-memory cache keyed on the **request id**. The hash of the signed request can't be re-encoded or re-signed into a different key: a request carries a unique `id`, and any change to the command is a different request that needs new approvals. The first submission runs; later ones are refused, whoever approved or submits them. An entry lasts until every approval that could have run the request has expired (`now + skew + approval_validity`, or later if an approval in the bundle lasts longer). It is recorded as the last check before the process spawns, and released if spawning fails.
+The agent keeps a cache keyed on the **request id**: in memory, or on disk with `[agent] state_dir` so that it survives a restart. The hash of the signed request can't be re-encoded or re-signed into a different key: a request carries a unique `id`, and any change to the command is a different request that needs new approvals. The first submission runs; later ones are refused, whoever approved or submits them, for as long as the entry lasts: until every approval that could have run the request has expired (`now + skew + approval_validity`, or later if an approval in the bundle lasts longer). After that, only approvals made afresh could run the same request again. The entry is recorded as the last check before the process spawns, and released if spawning fails; recording and spawning happen together in a task of their own, so a client that disconnects in between can't use a request up without it running.
 
 ## Revocation
 
-Revoking cancels a **whole request**, whoever approved it: the revocation list is keyed on the request id, so neither these approvals nor any later ones can run it. The revoker presents the request with at least one genuine approval (so nobody can fill the list with invented requests; the approvals needn't still be fresh) and their own fresh signature, at most 10 minutes old, over a domain-separated payload that is never valid as an approval:
+Revoking cancels a **whole request**, whoever approved it: the revocation list is keyed on the request id, so neither these approvals nor any added while the revocation is kept can run it. The revoker presents the request with at least one genuine approval (so nobody can fill the list with invented requests; the approvals needn't still be fresh) and their own fresh signature, at most 10 minutes old, over a domain-separated payload that is never valid as an approval:
 
 ```
 "REMONCE-REVOKE/v2:" || request_id || revoker_public_key_pem

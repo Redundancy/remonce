@@ -251,6 +251,7 @@ mod tests {
             cwd: None,
             approval_validity: Some(v),
             command_timeout: None,
+            max_output_bytes: None,
             env: Default::default(),
             params: vec![],
         }
@@ -296,6 +297,8 @@ mod tests {
             cors_allowed_origins: vec!["*".into()],
             revocation_service_url: None,
             revocation_service_ca_path: None,
+            state_dir: None,
+            audit_log_path: None,
         });
         assert!(matches!(
             validate(&cfg, false),

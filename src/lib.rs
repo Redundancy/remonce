@@ -12,14 +12,17 @@ pub mod web_sign;
 pub mod oidc_client;
 pub mod signing;
 pub mod files;
+pub mod idp_keys;
 pub mod audit;
 pub mod tls;
 pub mod acme_http01;
 pub mod insecure;
 pub mod policy;
 pub mod params;
+pub mod process_tree;
 pub mod replay;
 pub mod revocation;
+pub mod store;
 pub mod tsa;
 
 /// HTTP client for OIDC discovery, JWKS, TSA and OPA calls. Bounded
@@ -32,6 +35,8 @@ pub fn http_client() -> reqwest::Client {
         .expect("static HTTP client configuration is valid")
 }
 
+#[cfg(test)]
+mod agent_tests;
 #[cfg(test)]
 mod golden_tests;
 #[cfg(test)]

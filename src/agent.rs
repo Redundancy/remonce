@@ -16,7 +16,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use tokio::net::TcpListener;
 // Removed unused imports
 use crate::config::Config;
-use crate::web::OidcMetadata;
 use crate::files;
 use tower_http::cors::CorsLayer;
 
@@ -24,9 +23,8 @@ use tower_http::cors::CorsLayer;
 pub struct AgentState {
     pub http_client: Client,
     pub config: Config,
-    #[allow(dead_code)]
-    pub oidc_metadata: OidcMetadata,
-    pub jwks: jsonwebtoken::jwk::JwkSet,
+    /// The IdP's token-signing keys, refreshed as it rotates them.
+    pub idp_keys: crate::idp_keys::IdpKeys,
     pub hostname: String,
     pub trusted_roots: Vec<Vec<u8>>,
     pub replay_cache: crate::replay::ReplayCache,
@@ -36,11 +34,13 @@ pub struct AgentState {
     pub revocation_service: Option<(Client, url::Url)>,
     /// The authorization policy, evaluated in-process.
     pub policy: std::sync::Arc<crate::policy::Policy>,
+    /// The commands running now.
+    pub runs: Runs,
 }
 
 // ExecutionRequest is imported from security module
 
-/// Verify a viewer bearer token against the agent's pinned JWKS. Used by
+/// Verify a viewer bearer token against the IdP's current keys. Used by
 /// `/api/files`, `/api/files/stream` and `/stream/{id}`, where the bearer
 /// token is the only auth. Returns the JWT claims.
 ///
@@ -48,7 +48,7 @@ pub struct AgentState {
 /// signing token — including an approver's token carried inside a delegated
 /// bundle — can never be used to browse. Without `viewer_client_id` the
 /// endpoints are disabled.
-fn verify_query_token(
+async fn verify_query_token(
     token: &str,
     state: &AgentState,
 ) -> Result<serde_json::Value, (axum::http::StatusCode, &'static str)> {
@@ -59,7 +59,8 @@ fn verify_query_token(
             "File viewing disabled (no viewer_client_id configured)",
         ));
     };
-    crate::security::verify_bearer_token(token, &state.jwks, &state.config.oidc.issuer_url, viewer)
+    let keys = state.idp_keys.for_tokens([token]).await;
+    crate::security::verify_bearer_token(token, &keys, &state.config.oidc.issuer_url, viewer)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid Token"))
 }
 
@@ -129,17 +130,15 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .ok_or("Missing [agent] section in config.toml — the agent requires an `[agent]` block with TLS configuration. See CONFIGURATION.md.")?;
 
+    if let Some(path) = &agent_config.audit_log_path {
+        crate::audit::set_audit_file(path)?;
+        tracing::info!(path = %path, "Audit records are also appended to a file");
+    }
+
     let http_client = crate::http_client();
 
-    // 2. Fetch OIDC Metadata and Keys (Agent needs to verify JWTs)
-    let discovery_url = format!("{}/.well-known/openid-configuration", config.oidc.issuer_url);
-    let discovery: OidcMetadata = http_client.get(&discovery_url).send().await?.json().await?;
-    let jwks = http_client
-        .get(&discovery.jwks_uri)
-        .send()
-        .await?
-        .json()
-        .await?;
+    // 2. The IdP's signing keys, to verify tokens with; kept current.
+    let (_, idp_keys) = crate::idp_keys::IdpKeys::discover(&http_client, &config.oidc.issuer_url).await?;
 
     // 3. Load TSA Trusted Roots
     let trusted_roots = crate::tsa::load_trust_anchors(
@@ -193,19 +192,94 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
     let policy = std::sync::Arc::new(crate::policy::Policy::from_config(&config)?);
     tracing::info!(backend = %policy.describe(), "Policy ready");
 
+    // Which requests have run, and which were revoked here.
+    let (replay_cache, revocations) = match &agent_config.state_dir {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("Failed to create agent.state_dir '{}': {e}", dir.display()))?;
+            tracing::info!(dir = %dir.display(), "Executed and revoked requests are remembered across restarts");
+            (
+                crate::replay::ReplayCache::persistent(&dir)?,
+                crate::replay::RevocationCache::persistent(&dir)?,
+            )
+        }
+        None => {
+            tracing::warn!(
+                "agent.state_dir is not set: a restart forgets which requests ran and which were revoked here"
+            );
+            (crate::replay::ReplayCache::new(), crate::replay::RevocationCache::new())
+        }
+    };
+
     let state = AgentState {
         http_client,
         config,
-        oidc_metadata: discovery,
-        jwks,
+        idp_keys,
         hostname,
         trusted_roots,
-        replay_cache: crate::replay::ReplayCache::new(),
-        revocations: crate::replay::RevocationCache::new(),
+        replay_cache,
+        revocations,
         revocation_service,
         policy,
+        runs: Runs::default(),
     };
+    let runs = state.runs.clone();
 
+    let app = build_router(state, &agent_config.cors_allowed_origins);
+
+    let addr: SocketAddr = agent_config
+        .listen_address
+        .parse()
+        .map_err(|e| format!("Invalid agent.listen_address: {e}"))?;
+    tracing::info!(event = "tcp_listen", address = %addr, tls_mode = ?agent_config.tls, "Agent listening (TLS)");
+
+    let listener = TcpListener::bind(&addr).await?;
+    tokio::select! {
+        served = crate::tls::serve_with_tls(listener, app, &agent_config.tls) => {
+            served.map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+        }
+        // Asked to stop: no more requests, and nothing left running behind
+        // us with nobody to time it out.
+        _ = shutdown_signal() => {
+            tracing::info!(event = "agent_shutdown", "Shutting down: stopping running commands");
+            runs.stop_all(SHUTDOWN_GRACE).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// How long shutdown waits for stopped commands' logs and audit records.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves when the process is asked to stop: Ctrl-C, or SIGTERM on Unix.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => ctrl_c.await,
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
+/// The agent's routes over `state`, with CORS for `cors_allowed_origins`
+/// (none when empty). Handlers read the peer address from
+/// `ConnectInfo<PeerAddr>`, so serve it with that connect info.
+pub fn build_router(state: AgentState, cors_allowed_origins: &[String]) -> Router {
     let mut app = Router::new()
         .route("/execute", post(execute_handler))
         .route("/revoke", post(revoke_handler))
@@ -215,34 +289,28 @@ pub async fn run(insecure: bool) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/files/stream", get(stream_file_handler))
         .with_state(state);
 
-    if !agent_config.cors_allowed_origins.is_empty() {
+    if !cors_allowed_origins.is_empty() {
         use tower_http::cors::AllowOrigin;
         use axum::http::HeaderValue;
-        let origins: Vec<HeaderValue> = agent_config
-            .cors_allowed_origins
-            .iter()
-            .filter_map(|o| HeaderValue::from_str(o).ok())
-            .collect();
+        // "*" (which needs `--insecure`) is any origin; it can't be mixed
+        // into a list of named ones.
+        let allow_origin = if cors_allowed_origins.iter().any(|o| o == "*") {
+            AllowOrigin::any()
+        } else {
+            let origins: Vec<HeaderValue> = cors_allowed_origins
+                .iter()
+                .filter_map(|o| HeaderValue::from_str(o).ok())
+                .collect();
+            AllowOrigin::list(origins)
+        };
         app = app.layer(
             CorsLayer::new()
-                .allow_origin(AllowOrigin::list(origins))
+                .allow_origin(allow_origin)
                 .allow_headers(tower_http::cors::Any)
                 .allow_methods(tower_http::cors::Any),
         );
     }
-
-    let addr: SocketAddr = agent_config
-        .listen_address
-        .parse()
-        .map_err(|e| format!("Invalid agent.listen_address: {e}"))?;
-    tracing::info!(event = "tcp_listen", address = %addr, tls_mode = ?agent_config.tls, "Agent listening (TLS)");
-
-    let listener = TcpListener::bind(&addr).await?;
-    crate::tls::serve_with_tls(listener, app, &agent_config.tls)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-
-    Ok(())
+    app
 }
 
 /// Replace control characters so a value can't break the log's line
@@ -389,7 +457,7 @@ async fn execute_handler(
         audit("deny", "No executor token".into(), "unauthenticated", AuditContext::default());
         return Err(ErrorResponse::new(StatusCode::UNAUTHORIZED, "Log in to execute: missing bearer token"));
     };
-    let executor_claims = verify_query_token(&token, &state).map_err(|(status, msg)| {
+    let executor_claims = verify_query_token(&token, &state).await.map_err(|(status, msg)| {
         audit("deny", format!("Executor token rejected: {msg}"), "unauthenticated", AuditContext::default());
         ErrorResponse::new(status, msg)
     })?;
@@ -443,10 +511,14 @@ async fn execute_handler(
 
     // 4. Every approval: genuine, fresh, from different people.
     let validity = cmd_config.approval_validity_or_default();
+    let keys = state
+        .idp_keys
+        .for_tokens(bundle.approvals.iter().map(|a| a.id_token.as_str()))
+        .await;
     let verifier_config = crate::security::VerifierConfig {
         client_id: state.config.oidc.signing_client_id.clone(),
         issuer_url: state.config.oidc.issuer_url.clone(),
-        jwks: state.jwks.clone(),
+        jwks: (*keys).clone(),
         trusted_roots: state.trusted_roots.clone(),
         approval_validity: validity,
     };
@@ -536,15 +608,107 @@ async fn execute_handler(
         ));
     }
 
+    // 8, 9. Replay, then run — in a task of its own. Once the request is
+    //       marked as used, a client that hangs up must not be able to stop
+    //       it short of starting (or of having the mark released).
+    let run = Run {
+        cmd_config,
+        command_name,
+        command_json,
+        execution_id,
+        request_id,
+        approvers,
+        audit_approvers,
+        rendered_args,
+        user,
+        ip,
+        validity,
+        now,
+    };
+    match tokio::spawn(start_run(state, run)).await {
+        Ok(result) => result.map(Json),
+        Err(e) => {
+            tracing::error!("Run task failed: {e}");
+            Err(ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error"))
+        }
+    }
+}
+
+/// A request that has passed every check, ready to run.
+struct Run {
+    cmd_config: crate::config::CommandConfig,
+    command_name: String,
+    command_json: serde_json::Value,
+    /// The request's signed id; names the run and its log.
+    execution_id: String,
+    request_id: String,
+    approvers: Vec<crate::security::SignerIdentity>,
+    audit_approvers: Vec<crate::audit::AuditSigner>,
+    rendered_args: Vec<String>,
+    /// The executor.
+    user: String,
+    ip: String,
+    validity: std::time::Duration,
+    /// When the request was verified.
+    now: time::OffsetDateTime,
+}
+
+/// Mark the request as used, then start its command. Returns once the
+/// process is running (or couldn't be started, in which case the mark is
+/// released so the request can be retried).
+async fn start_run(state: AgentState, run: Run) -> Result<ExecutionResponse, ErrorResponse> {
+    use crate::audit::AuditContext;
+    use axum::http::StatusCode;
+
+    let Run {
+        cmd_config,
+        command_name,
+        command_json,
+        execution_id,
+        request_id,
+        approvers,
+        audit_approvers,
+        rendered_args,
+        user,
+        ip,
+        validity,
+        now,
+    } = run;
+    let hostname = state.hostname.clone();
+    let audit_ctx = AuditContext {
+        event_type: Some("command_execution"),
+        command: Some(command_json),
+        request_id: Some(request_id.clone()),
+        approvers: Some(audit_approvers),
+        ..Default::default()
+    };
+    let audit = |decision: &'static str, reason: String| {
+        crate::audit::log_audit(decision, reason, user.clone(), ip.clone(), hostname.clone(), audit_ctx.clone())
+    };
+
+    if state.runs.stop.is_cancelled() {
+        audit("error", "Refusing to run: the agent is shutting down".into());
+        return Err(ErrorResponse::new(StatusCode::SERVICE_UNAVAILABLE, "The agent is shutting down"));
+    }
+
     // 8. Replay: one run per request. Remembered past every approval that
     //    could exist now; released if we fail before the process starts.
     let ttl = crate::security::replay_ttl(now, &approvers, validity);
-    if state.replay_cache.check_and_insert(&request_id, ttl).is_err() {
-        audit("deny", "Replay: request already executed".into(), &user, full_ctx());
-        return Err(ErrorResponse::new(
-            StatusCode::CONFLICT,
-            "This request has already been executed on this agent",
-        ));
+    match state.replay_cache.check_and_insert(&request_id, ttl) {
+        Ok(()) => {}
+        Err(crate::replay::ReplayError::AlreadyRun) => {
+            audit("deny", "Replay: request already executed".into());
+            return Err(ErrorResponse::new(
+                StatusCode::CONFLICT,
+                "This request has already been executed on this agent",
+            ));
+        }
+        Err(e @ crate::replay::ReplayError::Store(_)) => {
+            // Not running is the only safe answer: a run we can't remember
+            // could be repeated.
+            audit("error", format!("Refusing to run: {e}"));
+            return Err(ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error"));
+        }
     }
     let release_replay = || state.replay_cache.release(&request_id);
 
@@ -556,7 +720,7 @@ async fn execute_handler(
     if !logs_dir.exists() {
         tokio::fs::create_dir_all(&logs_dir).await.map_err(|e| {
             release_replay();
-            audit("error", format!("Failed to create logs dir: {e}"), &user, full_ctx());
+            audit("error", format!("Failed to create logs dir: {e}"));
             ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error")
         })?;
     }
@@ -584,7 +748,7 @@ async fn execute_handler(
     };
     let mut log_file = log_result.map_err(|e| {
         release_replay();
-        audit("error", format!("Failed to create log file: {e}"), &user, full_ctx());
+        audit("error", format!("Failed to create log file: {e}"));
         ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error")
     })?;
 
@@ -608,7 +772,8 @@ async fn execute_handler(
     // Spawn Command — hardened:
     //   - stdin closed (commands that read stdin would otherwise hang forever)
     //   - parent env scrubbed; only operator-configured `env` survives
-    //   - wall-clock timeout enforced via tokio::time::timeout + child.kill()
+    //   - at the head of its own process tree, so a wall-clock timeout (or
+    //     the agent shutting down) stops everything it started too
     let timeout = cmd_config.command_timeout_or_default();
 
     let mut spawn_cmd = tokio::process::Command::new(&executable);
@@ -622,130 +787,259 @@ async fn execute_handler(
     for (k, v) in &cmd_config.env {
         spawn_cmd.env(k, v);
     }
+    crate::process_tree::isolate(&mut spawn_cmd);
 
-    let mut child = spawn_cmd.spawn().map_err(|e| {
+    let child = spawn_cmd.spawn().map_err(|e| {
         release_replay();
-        audit("error", format!("Failed to spawn command: {e}"), &user, full_ctx());
+        audit("error", format!("Failed to spawn command: {e}"));
         ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "Execution Failed")
     })?;
+    let tree = crate::process_tree::ProcessTree::of(&child);
 
-    // Pipe Output and enforce timeout in a background task.
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let exec_id_for_log = execution_id.clone();
-    let log_path_for_task = log_path.clone();
-
-    tokio::spawn(async move {
-        let mut stdout_reader = tokio::io::BufReader::new(stdout);
-        let mut stderr_reader = tokio::io::BufReader::new(stderr);
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
-        let tx2 = tx.clone();
-
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            loop {
-                let n = stdout_reader.read(&mut buf).await.unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&buf[..n]).to_string();
-                let _ = tx.send(s).await;
-            }
-        });
-
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            loop {
-                let n = stderr_reader.read(&mut buf).await.unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&buf[..n]).to_string();
-                let _ = tx2.send(s).await;
-            }
-        });
-
-        // Pipe writer (terminates when both pump tasks drop their senders).
-        // Runs as its own task so output drains while the child runs; if it
-        // only ran after exit, a full channel would stall the child's pipes.
-        let mut writer = tokio::spawn(async move {
-            let mut file_out = log_file;
-            while let Some(msg) = rx.recv().await {
-                let _ = file_out.write_all(msg.as_bytes()).await;
-                let _ = file_out.flush().await;
-            }
-            file_out
-        });
-
-        // Race the child's exit against the timeout. If the timer fires first,
-        // SIGKILL the child and continue draining its remaining output.
-        let wait_result = tokio::select! {
-            r = child.wait() => Some(r),
-            _ = tokio::time::sleep(timeout) => {
-                tracing::warn!(
-                    "Command {} exceeded timeout ({:?}); killing",
-                    exec_id_for_log, timeout
-                );
-                let _ = child.kill().await;
-                None
-            }
-        };
-
-        // Grandchildren that inherited stdout/stderr keep the pipes open
-        // after the direct child exits or is killed, so bound the drain and
-        // reopen the log to write the trailer if we had to give up on it.
-        let mut file_out = match tokio::time::timeout(LOG_DRAIN_TIMEOUT, &mut writer).await {
-            Ok(Ok(f)) => f,
-            _ => {
-                writer.abort();
-                tracing::warn!(
-                    "Command {}: output still open {:?} after exit (orphaned child processes?)",
-                    exec_id_for_log,
-                    LOG_DRAIN_TIMEOUT
-                );
-                match tokio::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&log_path_for_task)
-                    .await
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!("Failed to reopen log for trailer: {}", e);
-                        return;
-                    }
-                }
-            }
-        };
-        match wait_result {
-            Some(Ok(status)) => {
-                let _ = file_out
-                    .write_all(format!("\n--- EXIT: {} ---\n", status).as_bytes())
-                    .await;
-            }
-            Some(Err(e)) => {
-                let _ = file_out
-                    .write_all(format!("\n--- WAIT ERROR: {} ---\n", e).as_bytes())
-                    .await;
-            }
-            None => {
-                let _ = file_out
-                    .write_all(b"\n--- TIMEOUT: process killed by agent ---\n")
-                    .await;
-            }
+    let process_started = std::time::Instant::now();
+    // The run's own records name it, so its start, end and log tie up.
+    let run_ctx = AuditContext {
+        execution_id: Some(execution_id.clone()),
+        ..audit_ctx.clone()
+    };
+    let finished = {
+        let (user, ip, hostname, run_ctx) = (user.clone(), ip.clone(), hostname.clone(), run_ctx.clone());
+        move |result: &'static str, exit_code: Option<i32>, output_truncated: bool, reason: String| {
+            crate::audit::log_audit(
+                "completed",
+                reason,
+                user,
+                ip,
+                hostname,
+                AuditContext {
+                    event_type: Some("command_finished"),
+                    outcome: Some(crate::audit::AuditOutcome {
+                        result,
+                        exit_code,
+                        duration_ms: u64::try_from(process_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        output_truncated,
+                    }),
+                    ..run_ctx
+                },
+            )
         }
-        let _ = file_out.flush().await;
-    });
+    };
 
-    audit("allow", "Command Started".to_string(), &user, full_ctx());
+    // From here the run looks after itself, whatever becomes of this
+    // request: its output goes to the log, and it is stopped on timeout or
+    // when the agent shuts down.
+    state.runs.tasks.spawn(supervise(
+        Supervised {
+            child,
+            tree,
+            log_file,
+            log_path,
+            execution_id: execution_id.clone(),
+            timeout,
+            max_output: cmd_config.max_output_bytes_or_default(),
+            stop: state.runs.stop.clone(),
+        },
+        finished,
+    ));
 
-    Ok(Json(ExecutionResponse {
+    crate::audit::log_audit(
+        "allow",
+        "Command Started".to_string(),
+        user.clone(),
+        ip.clone(),
+        hostname.clone(),
+        run_ctx,
+    );
+
+    Ok(ExecutionResponse {
         status: "authorized".to_string(),
         // The execution id, which the client streams the log by.
         message: execution_id,
         request_id,
         execution_time: Some(started),
-    }))
+    })
+}
+
+/// The commands this agent is running, so they can be stopped when it is.
+#[derive(Clone, Default)]
+pub struct Runs {
+    /// Cancelled when the agent is shutting down.
+    stop: tokio_util::sync::CancellationToken,
+    /// One task per running command.
+    tasks: tokio_util::task::TaskTracker,
+}
+
+impl Runs {
+    /// Stop every running command (and what each started), and wait up to
+    /// `grace` for their logs and audit records to be finished off. No new
+    /// command starts afterwards.
+    pub async fn stop_all(&self, grace: std::time::Duration) {
+        self.stop.cancel();
+        self.tasks.close();
+        if tokio::time::timeout(grace, self.tasks.wait()).await.is_err() {
+            tracing::warn!("Some commands were still being stopped after {grace:?}");
+        }
+    }
+}
+
+/// A started command and what is needed to see it through.
+struct Supervised {
+    child: tokio::process::Child,
+    tree: crate::process_tree::ProcessTree,
+    log_file: tokio::fs::File,
+    log_path: PathBuf,
+    execution_id: String,
+    timeout: std::time::Duration,
+    /// Bytes of output kept in the log.
+    max_output: u64,
+    stop: tokio_util::sync::CancellationToken,
+}
+
+/// How a supervised command came to an end.
+enum Ending {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Timeout,
+    Shutdown,
+}
+
+/// See a command through to its end: copy its output to the run log, stop
+/// it (and everything it started) on timeout or shutdown, then record how
+/// it ended — `finished(result, exit code, output truncated, reason)` for
+/// the audit log, and a trailer in the run log.
+async fn supervise(
+    run: Supervised,
+    finished: impl FnOnce(&'static str, Option<i32>, bool, String),
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let Supervised {
+        mut child,
+        tree,
+        log_file,
+        log_path,
+        execution_id,
+        timeout,
+        max_output,
+        stop,
+    } = run;
+
+    // Output is copied as the bytes it is: decoding each chunk separately
+    // would mangle a character that straddles two of them.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    fn pump(pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+        let Some(mut pipe) = pipe else { return };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = pipe.read(&mut buf).await.unwrap_or(0);
+                if n == 0 || tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    pump(child.stdout.take(), tx.clone());
+    pump(child.stderr.take(), tx);
+
+    // The writer ends when both pumps have dropped their senders. It runs
+    // as its own task so output drains while the child runs; and it keeps
+    // draining past the limit, discarding, so a chatty command isn't left
+    // blocked on a full pipe.
+    let truncated = std::sync::Arc::new(AtomicBool::new(false));
+    let mut writer = tokio::spawn({
+        let truncated = truncated.clone();
+        async move {
+            let mut file_out = log_file;
+            let mut written: u64 = 0;
+            while let Some(chunk) = rx.recv().await {
+                let room = usize::try_from(max_output - written).unwrap_or(usize::MAX);
+                let keep = chunk.len().min(room);
+                if keep > 0 {
+                    let _ = file_out.write_all(&chunk[..keep]).await;
+                    written += keep as u64;
+                }
+                if keep < chunk.len() && !truncated.swap(true, Ordering::SeqCst) {
+                    let note = format!(
+                        "\n--- OUTPUT TRUNCATED: over {max_output} bytes; the rest is not kept (the command runs on) ---\n"
+                    );
+                    let _ = file_out.write_all(note.as_bytes()).await;
+                }
+                let _ = file_out.flush().await;
+            }
+            file_out
+        }
+    });
+
+    let ending = tokio::select! {
+        r = child.wait() => Ending::Exited(r),
+        _ = tokio::time::sleep(timeout) => Ending::Timeout,
+        _ = stop.cancelled() => Ending::Shutdown,
+    };
+    if !matches!(ending, Ending::Exited(_)) {
+        tracing::warn!(
+            "Stopping command {execution_id} ({})",
+            if matches!(ending, Ending::Timeout) { "timed out" } else { "agent shutting down" }
+        );
+        // The whole tree, then the child itself (which also reaps it).
+        tree.kill();
+        let _ = child.kill().await;
+    }
+
+    // Processes the command left running that inherited its stdout/stderr
+    // keep the pipes open, so bound the drain, and reopen the log to write
+    // the trailer if we had to give up on it.
+    let file_out = match tokio::time::timeout(LOG_DRAIN_TIMEOUT, &mut writer).await {
+        Ok(Ok(f)) => Some(f),
+        _ => {
+            writer.abort();
+            tracing::warn!(
+                "Command {execution_id}: output still open {LOG_DRAIN_TIMEOUT:?} after it ended (it left processes running?)"
+            );
+            match tokio::fs::OpenOptions::new().append(true).open(&log_path).await {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::error!("Failed to reopen log for trailer: {e}");
+                    None
+                }
+            }
+        }
+    };
+
+    let (result, exit_code, reason, trailer) = match &ending {
+        Ending::Exited(Ok(status)) => (
+            "exited",
+            status.code(),
+            format!("Command exited: {status}"),
+            format!("\n--- EXIT: {status} ---\n"),
+        ),
+        Ending::Exited(Err(e)) => (
+            "wait_error",
+            None,
+            format!("Waiting for the command failed: {e}"),
+            format!("\n--- WAIT ERROR: {e} ---\n"),
+        ),
+        Ending::Timeout => (
+            "timeout",
+            None,
+            format!(
+                "Command killed after exceeding its timeout ({})",
+                humantime_serde::re::humantime::format_duration(timeout)
+            ),
+            "\n--- TIMEOUT: process killed by agent ---\n".to_string(),
+        ),
+        Ending::Shutdown => (
+            "agent_shutdown",
+            None,
+            "Command killed because the agent was shutting down".to_string(),
+            "\n--- STOPPED: the agent shut down ---\n".to_string(),
+        ),
+    };
+    // Audited whatever became of the log.
+    finished(result, exit_code, truncated.load(Ordering::SeqCst), reason);
+    if let Some(mut file_out) = file_out {
+        let _ = file_out.write_all(trailer.as_bytes()).await;
+        let _ = file_out.flush().await;
+    }
 }
 
 #[derive(Serialize)]
@@ -799,9 +1093,10 @@ async fn revoke_handler(
     let ip = addr.ip_string();
     let hostname = state.hostname.clone();
 
+    let keys = state.idp_keys.for_tokens(req.id_tokens()).await;
     let ctx = crate::revocation::RevocationCtx {
         config: &state.config,
-        jwks: &state.jwks,
+        jwks: &keys,
         trusted_roots: &state.trusted_roots,
         policy: &state.policy,
         hostname: &hostname,
@@ -836,7 +1131,20 @@ async fn revoke_handler(
     let now = time::OffsetDateTime::now_utc();
     if verified.keep_until > now {
         let remaining: std::time::Duration = (verified.keep_until - now).try_into().unwrap_or_default();
-        state.revocations.revoke(&revocation.request_id, remaining);
+        if let Err(e) = state.revocations.revoke(&revocation.request_id, remaining) {
+            crate::audit::log_audit(
+                "error",
+                format!("Failed to record revocation: {e}"),
+                revoker_user.clone(),
+                ip.clone(),
+                hostname.clone(),
+                revoke_ctx(),
+            );
+            return Err(ErrorResponse::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Error",
+            ));
+        }
     }
 
     // Forward to the central revocation service so a single submission
@@ -892,37 +1200,108 @@ async fn revoke_handler(
     }))
 }
 
+/// Record a read-only action (catalog, file list, logs) in the audit log.
+fn audit_view(
+    state: &AgentState,
+    addr: &crate::tls::PeerAddr,
+    event_type: &'static str,
+    decision: &'static str,
+    reason: impl Into<String>,
+    user: &str,
+    file: Option<serde_json::Value>,
+) {
+    crate::audit::log_audit(
+        decision,
+        reason.into(),
+        user.to_string(),
+        addr.ip_string(),
+        state.hostname.clone(),
+        crate::audit::AuditContext {
+            file,
+            event_type: Some(event_type),
+            ..Default::default()
+        },
+    );
+}
+
+/// Who is asking, for a read-only endpoint: their verified viewer claims
+/// and username. A missing or invalid login is audited as `event_type` and
+/// comes back as the response to send.
+async fn authenticate_viewer(
+    state: &AgentState,
+    addr: &crate::tls::PeerAddr,
+    headers: &axum::http::HeaderMap,
+    event_type: &'static str,
+    file: Option<serde_json::Value>,
+) -> Result<(serde_json::Value, String), Box<Response>> {
+    let Some(token) = bearer_token(headers) else {
+        audit_view(state, addr, event_type, "deny", "Missing bearer token", "unauthenticated", file);
+        return Err(Box::new((axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response()));
+    };
+    match verify_query_token(&token, state).await {
+        Ok(claims) => {
+            let user = claims_username(&claims);
+            Ok((claims, user))
+        }
+        Err((status, msg)) => {
+            audit_view(state, addr, event_type, "deny", msg, "unauthenticated", file);
+            Err(Box::new((status, msg).into_response()))
+        }
+    }
+}
+
+/// Whether policy lets `viewer` see what this agent offers (`view_docs`):
+/// the command catalog and the list of files. A refusal is audited as
+/// `event_type` and comes back as the response to send.
+async fn require_view_docs(
+    state: &AgentState,
+    addr: &crate::tls::PeerAddr,
+    event_type: &'static str,
+    claims: serde_json::Value,
+    user: &str,
+) -> Result<(), Box<Response>> {
+    use axum::http::StatusCode;
+    let viewer = crate::policy::Identity {
+        username: user.to_string(),
+        claims,
+    };
+    match state.policy.allows_viewing(&crate::policy::ViewInput::ViewDocs { viewer }).await {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            audit_view(state, addr, event_type, "deny", "Denied by policy", user, None);
+            Err(Box::new((StatusCode::FORBIDDEN, "Policy does not allow you to view this").into_response()))
+        }
+        Err(e) => {
+            audit_view(state, addr, event_type, "error", format!("Policy evaluation failed: {e}"), user, None);
+            Err(Box::new((StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable").into_response()))
+        }
+    }
+}
+
 /// The command catalog: what can be requested here and what each command
 /// needs (published requirements from OPA). Viewer-token auth; policy
 /// decides who may see it.
-async fn catalog_handler(State(state): State<AgentState>, headers: axum::http::HeaderMap) -> Response {
-    use axum::http::StatusCode;
-    let Some(token) = bearer_token(&headers) else {
-        return (StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
+async fn catalog_handler(
+    State(state): State<AgentState>,
+    ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    const EVENT: &str = "catalog_access";
+    let (claims, user) = match authenticate_viewer(&state, &addr, &headers, EVENT, None).await {
+        Ok(v) => v,
+        Err(response) => return *response,
     };
-    let claims = match verify_query_token(&token, &state) {
-        Ok(c) => c,
-        Err((status, msg)) => return (status, msg).into_response(),
-    };
-    let viewer = crate::policy::Identity {
-        username: claims_username(&claims),
-        claims: claims.clone(),
-    };
-    match state.policy.allows_viewing(&crate::policy::ViewInput::ViewDocs { viewer }).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (StatusCode::FORBIDDEN, "Policy does not allow you to view commands").into_response();
-        }
-        Err(e) => {
-            tracing::warn!("Policy view_docs check failed: {e}");
-            return (StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable").into_response();
-        }
+    if let Err(response) = require_view_docs(&state, &addr, EVENT, claims, &user).await {
+        return *response;
     }
     match state.policy.requirements().await {
-        Ok(published) => Json(crate::catalog::build(&state.config, &state.hostname, &published)).into_response(),
+        Ok(published) => {
+            audit_view(&state, &addr, EVENT, "allow", "Catalog served", &user, None);
+            Json(crate::catalog::build(&state.config, &state.hostname, &published)).into_response()
+        }
         Err(e) => {
-            tracing::warn!("Fetching published requirements failed: {e}");
-            (StatusCode::SERVICE_UNAVAILABLE, "Could not load published requirements").into_response()
+            audit_view(&state, &addr, EVENT, "error", format!("Fetching published requirements failed: {e}"), &user, None);
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Could not load published requirements").into_response()
         }
     }
 }
@@ -934,64 +1313,37 @@ async fn stream_logs_handler(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    const EVENT: &str = "execution_log_access";
+
     // Path traversal guard: only allow canonical UUIDs through.
     if uuid::Uuid::parse_str(&id).is_err() {
+        audit_view(&state, &addr, EVENT, "deny", "Invalid log id", "unauthenticated", None);
         return (axum::http::StatusCode::BAD_REQUEST, "Invalid log id").into_response();
     }
+    let exec_info = Some(serde_json::json!({ "execution_id": id }));
 
     // Execution output can contain anything the command printed, so it gets
-    // the same bearer-token + OPA gate as file streaming.
-    let token = match bearer_token(&headers) {
-        Some(t) => t,
-        None => return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response(),
+    // the same bearer-token + policy gate as file streaming.
+    let (claims, user) = match authenticate_viewer(&state, &addr, &headers, EVENT, exec_info.clone()).await {
+        Ok(v) => v,
+        Err(response) => return *response,
     };
-    let claims = match verify_query_token(&token, &state) {
-        Ok(c) => c,
-        Err((status, msg)) => return (status, msg).into_response(),
-    };
-    let user = claims
-        .get("username")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
 
     let allowed = policy_allows(
         &state,
         &crate::policy::ViewInput::ViewExecution {
             viewer: crate::policy::Identity {
-                username: claims_username(&claims),
-                claims: claims.clone(),
+                username: user.clone(),
+                claims,
             },
             execution_id: id.to_string(),
         },
     ).await;
-    let exec_info = Some(serde_json::json!({ "execution_id": id }));
     if !allowed {
-        crate::audit::log_audit(
-            "deny",
-            "Execution log access denied by OPA".into(),
-            user,
-            addr.ip_string(),
-            state.hostname.clone(),
-            crate::audit::AuditContext {
-                file: exec_info,
-                event_type: Some("execution_log_access"),
-                ..Default::default()
-            },
-        );
-        return (axum::http::StatusCode::FORBIDDEN, "OPA Denied").into_response();
+        audit_view(&state, &addr, EVENT, "deny", "Denied by policy", &user, exec_info);
+        return (axum::http::StatusCode::FORBIDDEN, "Denied by policy").into_response();
     }
-    crate::audit::log_audit(
-        "allow",
-        "Execution Log Stream Started".into(),
-        user,
-        addr.ip_string(),
-        state.hostname.clone(),
-        crate::audit::AuditContext {
-            file: exec_info,
-            ..Default::default()
-        },
-    );
+    audit_view(&state, &addr, EVENT, "allow", "Execution Log Stream Started", &user, exec_info);
 
     let log_path = PathBuf::from(&state.config.logs_dir).join(format!("{}.log", id));
     ws.on_upgrade(move |socket| tail_file(socket, log_path, None))
@@ -1018,18 +1370,23 @@ async fn policy_allows(state: &AgentState, input: &crate::policy::ViewInput) -> 
     })
 }
 
+/// The files this agent will show. Like the catalog, it says what the
+/// machine offers, so the same `view_docs` decision covers it.
 async fn list_files_handler(
     State(state): State<AgentState>,
+    ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    // Same auth posture as `/api/files/stream` — bearer ID token required.
-    let Some(token) = bearer_token(&headers) else {
-        return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
+    const EVENT: &str = "file_list_access";
+    let (claims, user) = match authenticate_viewer(&state, &addr, &headers, EVENT, None).await {
+        Ok(v) => v,
+        Err(response) => return *response,
     };
-    match verify_query_token(&token, &state) {
-        Ok(_claims) => Json(files::list_available_files(&state.config.files)).into_response(),
-        Err((status, msg)) => (status, msg).into_response(),
+    if let Err(response) = require_view_docs(&state, &addr, EVENT, claims, &user).await {
+        return *response;
     }
+    audit_view(&state, &addr, EVENT, "allow", "File list served", &user, None);
+    Json(files::list_available_files(&state.config.files)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1073,7 +1430,7 @@ async fn stream_file_handler(
         log_audit("deny", "Missing bearer token".into(), "unknown".into(), None);
         return (axum::http::StatusCode::UNAUTHORIZED, "Missing bearer token").into_response();
     };
-    let claims = match verify_query_token(&token, &state) {
+    let claims = match verify_query_token(&token, &state).await {
         Ok(c) => c,
         Err((status, msg)) => {
             log_audit("deny", msg.into(), "unknown".into(), None);
@@ -1097,7 +1454,7 @@ async fn stream_file_handler(
         return (axum::http::StatusCode::BAD_REQUEST, "Missing name or path").into_response();
     };
 
-    let file_info_json = match &identifier {
+    let mut file_info_json = match &identifier {
         files::FileIdentifier::Name(n) => serde_json::json!({ "name": n }),
         files::FileIdentifier::Path(p) => serde_json::json!({ "path": p }),
     };
@@ -1109,6 +1466,10 @@ async fn stream_file_handler(
              return (axum::http::StatusCode::FORBIDDEN, "File Access Denied").into_response();
         }
     };
+    // What was asked for can be spelled many ways (`..`, relative paths);
+    // policy and the audit log also get the one file it resolved to, as
+    // the file list shows it.
+    file_info_json["resolved_path"] = serde_json::Value::String(file_path.to_string_lossy().into_owned());
 
     // 3. Check OPA
     let allowed = policy_allows(
@@ -1153,37 +1514,14 @@ async fn tail_file(mut socket: WebSocket, path: PathBuf, tail_lines: Option<usiz
             return;
         }
     };
-    
-    // Seek logic for tailing
+
+    // Start near the end: roughly the last `tail_lines` lines, estimated at
+    // 200 bytes each rather than counted, so the first line sent may be a
+    // partial one. If seeking fails, the stream starts from the top.
     if let Some(n) = tail_lines {
-        // This is complex for variable length lines.
-        // Simplified: read valid utf8 from end?
-        // Or just read whole file and take last N lines if file is small?
-        // For strict correctness on huge files, we need to seek from end.
-        // Let's implement a simple buffer approach: Read entire file (if manageable) or last X bytes.
-        // Given complexity, maybe just read from start if not excessively large, or seek to file_len - (avg_line_len * N)?
-        
-        // Strategy: 
-        // 1. Get file size.
-        // 2. If small (< 1MB), read all, take last N lines.
-        // 3. If large, seek to end - (N * 200 bytes?), read, split lines, take last N.
-        
         let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-        
-        // Arbitrary buffer size estimate: 200 chars per line?
-        let est_bytes = (n as u64) * 200;
-        let start_pos = if len > est_bytes { len - est_bytes } else { 0 };
-        
-        use std::io::SeekFrom;
-        if let Err(_) = file.seek(SeekFrom::Start(start_pos)).await {
-            // ignore error, read from start
-        }
-        
-        // We might start in middle of line.
-        // Since we are just streaming text, send it? Clients might see partial first line.
-        // If we want clean lines, we should read and find first newline.
-        // Leaving as simple byte stream for now, client handles display.
-        // Wait, current logic sends chunks.
+        let wanted = u64::try_from(n).unwrap_or(u64::MAX).saturating_mul(200);
+        let _ = file.seek(std::io::SeekFrom::Start(len.saturating_sub(wanted))).await;
     }
 
     // Stream until the client goes away. Watching the socket matters: at EOF

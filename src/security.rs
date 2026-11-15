@@ -24,7 +24,7 @@
 //! Signatures must still be low-S and canonical lowercase hex.
 
 use crate::tsa;
-use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePublicKey;
@@ -153,6 +153,17 @@ pub struct RequestBundle {
 pub struct RevocationBundle {
     pub request: RequestBundle,
     pub revoker: Approval,
+}
+
+impl RevocationBundle {
+    /// Every ID token the bundle carries: the approvals' and the revoker's.
+    pub fn id_tokens(&self) -> impl Iterator<Item = &str> {
+        self.request
+            .approvals
+            .iter()
+            .chain(std::iter::once(&self.revoker))
+            .map(|a| a.id_token.as_str())
+    }
 }
 
 pub struct VerifierConfig {
@@ -574,7 +585,7 @@ fn whole_secs(d: time::Duration) -> u64 {
     d.whole_seconds().max(0) as u64
 }
 
-/// Decode and verify a JWT's signature and issuer against the pinned JWKS,
+/// Decode and verify a JWT's signature and issuer against the IdP's keys,
 /// plus the strict audience rule. `validate_exp` controls whether `exp` is
 /// checked against the wall clock.
 fn decode_verified(
@@ -586,6 +597,14 @@ fn decode_verified(
 ) -> Result<serde_json::Value, ValidationError> {
     let header =
         decode_header(token).map_err(|e| ValidationError::InvalidJwtHeader(e.to_string()))?;
+    // The algorithm is the token's choice, so rule out the family that
+    // would turn a published key into a shared secret. (The key's own type
+    // must match the algorithm as well; jsonwebtoken checks that.)
+    if matches!(header.alg, Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512) {
+        return Err(ValidationError::InvalidJwtHeader(
+            "Symmetric signing algorithms are not accepted".into(),
+        ));
+    }
     let kid = header
         .kid
         .ok_or_else(|| ValidationError::InvalidJwtHeader("Missing kid".into()))?;

@@ -290,9 +290,10 @@ async fn sign(
     .await?;
     let started_at = time::OffsetDateTime::from_unix_timestamp(entry.started_at_unix)
         .map_err(|_| "Invalid start time".to_string())?;
+    let keys = state.idp_keys.for_tokens([id_token.as_str()]).await;
     let claims = crate::oidc_client::validate_id_token(
         &id_token,
-        &state.jwks,
+        &keys,
         &state.config.oidc.issuer_url,
         client_id,
         &crate::security::key_binding(&entry.public_key_pem),

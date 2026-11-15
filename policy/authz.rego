@@ -26,7 +26,10 @@ default allow := false
 #
 #   input.viewer:       object  who is looking, from their login session:
 #                               { username, claims } (claims verified by the agent)
-#   input.file:         object  (read_file) { name } or { path }
+#   input.file:         object  (read_file) { name } or { path } as asked for,
+#                               plus resolved_path: the one file that names,
+#                               as the file list shows it. Match on
+#                               resolved_path; a path can be spelled many ways.
 #   input.execution_id: string  (view_execution)
 #
 # The agent verifies every signature, token and freshness window before

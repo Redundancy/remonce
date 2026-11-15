@@ -84,6 +84,8 @@ async fn security_headers(
 /// Data fetched from the OIDC provider's .well-known endpoint.
 #[derive(Clone, Debug, Deserialize)]
 pub struct OidcMetadata {
+    /// The issuer the IdP says it is; must be the one configured.
+    pub issuer: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub jwks_uri: String,
@@ -95,7 +97,8 @@ pub struct AppState {
     pub http_client: Client,
     pub config: Config,
     pub oidc_metadata: OidcMetadata,
-    pub jwks: jsonwebtoken::jwk::JwkSet,
+    /// The IdP's token-signing keys, refreshed as it rotates them.
+    pub idp_keys: crate::idp_keys::IdpKeys,
     pub hostname: String,
     /// HTTP client for agent calls — trusts `agent_ca_path` in addition to
     /// system roots.
@@ -178,21 +181,9 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
 
     // Create shared HTTP client and AppState
     let http_client = crate::http_client();
-    let discovery_url = format!("{}/.well-known/openid-configuration", config.oidc.issuer_url);
-    let discovery_response_text = http_client.get(&discovery_url).send().await?.text().await?;
-
-    tracing::info!("Discovery URL: {}", discovery_url);
-    
-    // Attempt to parse OIDC metadata, but don't crash if it fails (yet), though unwrapping effectively crashes
-    let oidc_metadata: OidcMetadata = serde_json::from_str(&discovery_response_text)?;
-
-    // TODO: this is good enough for now, but should be refreshed as needed (demand based)
-    let jwks = http_client
-        .get(&oidc_metadata.jwks_uri)
-        .send()
-        .await?
-        .json()
-        .await?;
+    let (oidc_metadata, idp_keys) = crate::idp_keys::IdpKeys::discover(&http_client, &config.oidc.issuer_url)
+        .await
+        .map_err(AppError::Config)?;
 
     let addr: SocketAddr = config
         .listen_address
@@ -235,7 +226,7 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         http_client: http_client.clone(),
         config: config.clone(),
         oidc_metadata,
-        jwks,
+        idp_keys,
         hostname,
         agent_http,
         agent_tls,
@@ -488,9 +479,10 @@ async fn callback_handler(
     )
     .await
     .map_err(AppError::Auth)?;
+    let keys = state.idp_keys.for_tokens([id_token.as_str()]).await;
     let claims = crate::oidc_client::validate_id_token(
         &id_token,
-        &state.jwks,
+        &keys,
         &state.config.oidc.issuer_url,
         viewer_client_id,
         &flow.nonce,

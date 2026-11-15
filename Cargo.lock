@@ -2603,6 +2603,7 @@ dependencies = [
  "humantime-serde",
  "hyper-util",
  "jsonwebtoken",
+ "libc",
  "notify",
  "num-traits",
  "p256",
@@ -2638,6 +2639,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "x509-parser 0.18.0",
 ]
 
@@ -3434,6 +3436,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

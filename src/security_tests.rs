@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::security::{
         Approval, AuthorizedRevocation, CACHE_SLACK, MAX_APPROVALS, MAX_FUTURE_SKEW, RequestBundle,
         RevocationBundle, ValidationError, VerifiedRequest, VerifierConfig, canonical_request_payload,
@@ -28,18 +28,18 @@ mod tests {
 
     // --- Key helpers ---
 
-    struct TestKeys {
+    pub(crate) struct TestKeys {
         signing_key: SigningKey,
-        kid: String,
-        public_key_pem: String,
+        pub(crate) kid: String,
+        pub(crate) public_key_pem: String,
     }
 
-    struct TsaKeys {
-        cert_der: Vec<u8>,
+    pub(crate) struct TsaKeys {
+        pub(crate) cert_der: Vec<u8>,
         signing_key: SigningKey,
     }
 
-    fn setup_keys(kid: &str) -> TestKeys {
+    pub(crate) fn setup_keys(kid: &str) -> TestKeys {
         let signing_key = SigningKey::random(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
 
@@ -54,7 +54,7 @@ mod tests {
         }
     }
 
-    fn keys_to_jwk(keys: &TestKeys) -> Jwk {
+    pub(crate) fn keys_to_jwk(keys: &TestKeys) -> Jwk {
         let verifying_key = keys.signing_key.verifying_key();
         let j = serde_json::json!({
             "kty": "EC",
@@ -72,7 +72,7 @@ mod tests {
     /// before `signed_at`, authenticated 10s before that, and — to prove the
     /// lifetime no longer matters — valid for a whole day. `extra_claims`
     /// overrides any claim; a `null` value removes it.
-    fn create_valid_jwt(
+    pub(crate) fn create_valid_jwt(
         keys: &TestKeys,
         issuer: &str,
         audience: &str,
@@ -316,22 +316,27 @@ mod tests {
 
     // --- Request builders ---
 
-    const ISSUER: &str = "https://issuer.example";
-    const CLIENT: &str = "remonce";
-    const ALICE: usize = 0;
-    const BOB: usize = 1;
+    pub(crate) const ISSUER: &str = "https://issuer.example";
+    pub(crate) const CLIENT: &str = "remonce";
+    pub(crate) const ALICE: usize = 0;
+    pub(crate) const BOB: usize = 1;
     const CAROL: usize = 2;
     const PEOPLE: [&str; 3] = ["alice", "bob", "carol"];
 
-    struct Env {
-        tsa_keys: TsaKeys,
+    pub(crate) struct Env {
+        pub(crate) tsa_keys: TsaKeys,
         /// The IdP's token-signing key.
-        idp: TestKeys,
-        jwks: JwkSet,
+        pub(crate) idp: TestKeys,
+        pub(crate) jwks: JwkSet,
     }
 
-    fn new_env() -> Env {
-        let idp = setup_keys("idp-kid");
+    pub(crate) fn new_env() -> Env {
+        new_env_with_kid("idp-kid")
+    }
+
+    /// An IdP whose signing key has this id (and its own TSA).
+    pub(crate) fn new_env_with_kid(kid: &str) -> Env {
+        let idp = setup_keys(kid);
         let jwks = JwkSet {
             keys: vec![keys_to_jwk(&idp)],
         };
@@ -391,7 +396,7 @@ mod tests {
         sign(env, who, |_| payload.as_bytes().to_vec(), signed_at, claims)
     }
 
-    fn approve(env: &Env, who: usize, command: &serde_json::Value, signed_at: OffsetDateTime) -> Approval {
+    pub(crate) fn approve(env: &Env, who: usize, command: &serde_json::Value, signed_at: OffsetDateTime) -> Approval {
         approve_with(env, who, command, signed_at, json!({ "groups": ["webapp-users"] }))
     }
 
@@ -410,7 +415,7 @@ mod tests {
         )
     }
 
-    fn revoke_sig(env: &Env, who: usize, request_id: &str, signed_at: OffsetDateTime) -> Approval {
+    pub(crate) fn revoke_sig(env: &Env, who: usize, request_id: &str, signed_at: OffsetDateTime) -> Approval {
         let id = request_id.to_string();
         sign(env, who, |pem| revocation_payload(&id, pem), signed_at, json!({}))
     }
@@ -1092,5 +1097,26 @@ mod tests {
         let v = verify(&env, &bundle(vec![a])).unwrap();
         assert_eq!(v.approvers[0].key_binding, expected);
         assert_eq!(v.approvers[0].claims["nonce"], expected);
+    }
+
+    #[test]
+    fn symmetric_algorithm_tokens_rejected() {
+        // A token that picks HS256 and names the IdP's key id must not get
+        // as far as trying that key as a shared secret.
+        let env = new_env();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let header = jsonwebtoken::Header {
+            alg: jsonwebtoken::Algorithm::HS256,
+            kid: Some(env.idp.kid.clone()),
+            ..Default::default()
+        };
+        let claims = json!({
+            "sub": "alice", "iss": ISSUER, "aud": "remonce-viewer",
+            "iat": now, "exp": now + 3600,
+        });
+        let secret = jsonwebtoken::EncodingKey::from_secret(env.idp.public_key_pem.as_bytes());
+        let token = jsonwebtoken::encode(&header, &claims, &secret).unwrap();
+        let err = verify_bearer_token(&token, &env.jwks, ISSUER, "remonce-viewer").unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidJwtHeader(_)), "{err}");
     }
 }
