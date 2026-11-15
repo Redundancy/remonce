@@ -215,7 +215,7 @@ pub(crate) mod tests {
 
         let msg_imprint = MessageImprint {
             hash_algorithm: alg_id,
-            hashed_message: OctetString::from(hash.as_slice().to_vec()),
+            hashed_message: OctetString::from(hash.to_vec()),
         };
 
         let unix_timestamp = gen_time.unix_timestamp();

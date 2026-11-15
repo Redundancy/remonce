@@ -2,7 +2,6 @@
 //! ephemeral key per signature, and the low-S sign + TSA timestamp step.
 
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::generic_array::GenericArray;
 use p256::pkcs8::EncodePublicKey;
 use rand::rngs::OsRng;
 
@@ -39,7 +38,7 @@ pub fn key_from_hex(hex_str: &str) -> Result<SigningKey, String> {
     if bytes.len() != 32 {
         return Err("Invalid signing key length".into());
     }
-    SigningKey::from_bytes(GenericArray::from_slice(&bytes))
+    SigningKey::from_slice(&bytes)
         .map_err(|_| "Invalid signing key bytes".to_string())
 }
 

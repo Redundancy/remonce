@@ -161,7 +161,7 @@ pub async fn request_timestamp(
 
     let msg_imprint = MessageImprint {
         hash_algorithm: alg_id,
-        hashed_message: OctetString::from(hash.as_slice().to_vec()),
+        hashed_message: OctetString::from(hash.to_vec()),
     };
 
     // 3. Build TimeStampReq
@@ -356,7 +356,7 @@ fn verify_message_imprint(imprint: &MessageImprint, data: &[u8]) -> Result<(), T
         return Err(TsaError::Verification("Unsupported hash algorithm".into()));
     }
 
-    if imprint.hashed_message.as_ref() != hash.as_slice() {
+    if imprint.hashed_message.as_ref() != &hash[..] {
         return Err(TsaError::Verification(
             "Message imprint mismatch. Token was not issued for this data.".into(),
         ));
@@ -457,7 +457,7 @@ fn verify_cms_signature(
                     let digest: OctetString =
                         rasn::ber::decode(val.as_bytes()).map_err(TsaError::Asn1Decode)?;
                     let content_hash = Sha256::digest(tst_info_bytes);
-                    if digest.as_ref() != content_hash.as_slice() {
+                    if digest.as_ref() != &content_hash[..] {
                         return Err(TsaError::Verification(
                             "SignedAttributes messageDigest mismatch".into(),
                         ));
