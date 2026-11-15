@@ -35,7 +35,7 @@ A request is a command plus any number of independent approvals, each one person
     -   **Time window**: `not_before` / `not_after` enforced if present; a present but malformed bound denies.
     -   **Parameters**: signed `params` validated against `[[commands.params]]`, fail-closed.
 6.  **Revocation**: the **request id** (hex SHA-256 of the signed payload) must not be on the agent's revocation list, nor (when configured) on the central revocation service's — an unreachable service denies execution.
-7.  **Policy authorization** (Rego, embedded or on an OPA server): input is the command, request id, every approver (`username`, full claims, `signed_at`), the executor (`username`, claims) and the host. The shipped policy allows when the command's published requirement document is satisfied — every slot filled by a different approver, and the executor accepted — and no extra rule denies. Deny-by-default.
+7.  **Policy authorization** (Rego, embedded or on an OPA server): input is the command, request id, every approver (`username`, full claims, `signed_at`), the executor (`username`, claims), the host, and the command's requirement from the agent's config. The shipped policy allows when that requirement is satisfied — every slot filled by a different approver, and the executor accepted — and no extra rule denies. Deny-by-default.
 8.  **Replay cache**: last, just before spawning. The request id is recorded until every approval that could run it has expired; first-seen wins, and if spawning fails the entry is released so the request can be retried. With `[agent] state_dir` set, the record is on disk and survives a restart; a run that can't be recorded doesn't start.
 
 ## Threat Model
@@ -222,7 +222,7 @@ Remonce shares the "keyless" signing philosophy of [Sigstore](https://www.sigsto
 
 ### OpenPubkey's MFA Cosigner
 
-OpenPubkey's **MFA Cosigner** is a second attestation intended to eliminate the IdP as a single point of compromise. Remonce's multiple approvals are a different thing: several people, all vouched for by the same IdP, agree to one request. They limit what one compromised *account* can do, not a compromised IdP. A requirement document can ask for an MFA claim (e.g. `amr`) on an approval slot, and a future enhancement could accept approvals from several IdPs.
+OpenPubkey's **MFA Cosigner** is a second attestation intended to eliminate the IdP as a single point of compromise. Remonce's multiple approvals are a different thing: several people, all vouched for by the same IdP, agree to one request. They limit what one compromised *account* can do, not a compromised IdP. A command can ask for an MFA claim (e.g. `amr`) on an approval slot, with a predicate, and a future enhancement could accept approvals from several IdPs.
 
 ### Privacy Considerations
 

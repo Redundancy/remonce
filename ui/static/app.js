@@ -471,8 +471,8 @@ function takeHandOff() {
 }
 
 // ---------------------------------------------------------------------------
-// Requirements, as the agent publishes them from policy. A slot arrives as
-// {slot, description}: the predicate as written, and policy's words for
+// Requirements, as the agent publishes them from its config. A slot arrives
+// as {slot, description}: the predicate as written, and policy's words for
 // it. What a predicate means is policy's to say, so which people a slot
 // would accept is asked of the agent. All of this is for display only: the
 // agent verifies every approval and policy decides.
@@ -531,9 +531,8 @@ function matchSlots(accepted, approvers) {
 }
 
 function requirementSummary(info) {
-    if (info.requirements_error) return 'Published requirements are unreadable';
     const r = info.requirements;
-    if (!r) return 'No published requirements';
+    if (!r) return 'No approvers or executors set';
     const needs = effectiveSlots(r).map(slotText).join(' + ');
     return `Needs ${needs} · run by ${slotText(r.executors)}` + (r.additional_policy ? ' · plus further policy' : '');
 }
@@ -585,12 +584,11 @@ function approvalFacts(st) {
     });
 }
 
-// The command's published requirements; with a status, which are met.
+// What the command needs, as its agent says; with a status, which are met.
 function requirementFacts(info, st) {
     if (!info) return [];
-    if (info.requirements_error) return [['Requirements', 'Published, but unreadable: ' + info.requirements_error]];
     const r = info.requirements;
-    if (!r) return [['Requirements', 'None published for this command; the agent\'s policy decides']];
+    if (!r) return [['Requirements', 'None set for this command on this agent; its policy decides']];
     const rows = [];
     const matched = st && st.bySlot;
     effectiveSlots(r).forEach((slot, j) => {

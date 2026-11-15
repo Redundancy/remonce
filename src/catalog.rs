@@ -4,7 +4,7 @@
 //! policy rule).
 
 use crate::config::Config;
-use crate::requirements::{self, Slot};
+use crate::requirements::Slot;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -21,11 +21,8 @@ pub struct CommandView {
     pub params: Vec<ParamView>,
     /// How long each approval stays usable.
     pub approval_validity_secs: u64,
-    /// The published requirements, if policy has any for this command.
+    /// What the command needs before it runs, if its config says.
     pub requirements: Option<RequirementView>,
-    /// Set when a document is published but doesn't parse, so the UI can
-    /// say so rather than show no requirements.
-    pub requirements_error: Option<String>,
 }
 
 /// A command's requirement as people see it: each slot with policy's
@@ -67,39 +64,41 @@ pub struct ParamView {
     pub max: Option<i64>,
 }
 
-/// `published` holds each command's requirement document, and
-/// `descriptions` policy's words for its slots (`Policy::describe_slots`).
+/// Every configured command's requirement, by command name, as policy
+/// reads them.
+pub fn requirements(config: &Config) -> serde_json::Map<String, serde_json::Value> {
+    config
+        .commands
+        .iter()
+        .filter_map(|c| Some((c.name.clone(), serde_json::to_value(c.requirement()?).ok()?)))
+        .collect()
+}
+
+/// `descriptions` holds policy's words for each command's slots
+/// (`Policy::describe_slots` of `requirements`).
 pub fn build(
     config: &Config,
     host: &str,
-    published: &serde_json::Map<String, serde_json::Value>,
     descriptions: &serde_json::Map<String, serde_json::Value>,
 ) -> Catalog {
     let commands = config
         .commands
         .iter()
         .map(|c| {
-            let (requirements, requirements_error) = match published.get(&c.name) {
-                None => (None, None),
-                Some(doc) => match requirements::parse(doc) {
-                    Ok(doc) => {
-                        let described = descriptions.get(&c.name);
-                        let approvals = described.and_then(|d| d.get("approvals"));
-                        let view = RequirementView {
-                            approvals: doc
-                                .approvals
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, slot)| slot_view(slot, approvals.and_then(|a| a.get(i))))
-                                .collect(),
-                            executors: slot_view(doc.executors, described.and_then(|d| d.get("executors"))),
-                            additional_policy: doc.additional_policy,
-                        };
-                        (Some(view), None)
-                    }
-                    Err(e) => (None, Some(e)),
-                },
-            };
+            let requirements = c.requirement().map(|req| {
+                let described = descriptions.get(&c.name);
+                let approvals = described.and_then(|d| d.get("approvals"));
+                RequirementView {
+                    approvals: req
+                        .approvals
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, slot)| slot_view(slot, approvals.and_then(|a| a.get(i))))
+                        .collect(),
+                    executors: slot_view(req.executors, described.and_then(|d| d.get("executors"))),
+                    additional_policy: req.additional_policy,
+                }
+            });
             CommandView {
                 name: c.name.clone(),
                 description: c.description.clone(),
@@ -118,7 +117,6 @@ pub fn build(
                     .collect(),
                 approval_validity_secs: c.approval_validity_or_default().as_secs(),
                 requirements,
-                requirements_error,
             }
         })
         .collect();
@@ -148,6 +146,9 @@ mod tests {
             name = "other"
             opa_rule = "data.x"
             approval_validity = "2h"
+            approvals = [{ groups_in = "dba" }, { made_up = 1 }]
+            executors = { anyone = true }
+            additional_policy = "Only on db-* hosts"
             "#,
         )
         .unwrap()
@@ -155,8 +156,7 @@ mod tests {
 
     #[test]
     fn never_exposes_how_a_command_runs() {
-        let json =
-            serde_json::to_string(&build(&config(), "host-a", &Default::default(), &Default::default())).unwrap();
+        let json = serde_json::to_string(&build(&config(), "host-a", &Default::default())).unwrap();
         for secret in ["SECRET_BINARY", "ARG_SECRET", "SECRET_DIR", "ENV_SECRET", "hidden.rule"] {
             assert!(!json.contains(secret), "catalog leaks {secret}: {json}");
         }
@@ -164,22 +164,21 @@ mod tests {
     }
 
     #[test]
-    fn attaches_requirements_by_name() {
-        let mut published = serde_json::Map::new();
-        published.insert(
-            "other".into(),
-            serde_json::json!({ "approvals": [{ "groups_in": "dba" }, { "made_up": 1 }], "executors": { "anyone": true } }),
-        );
-        published.insert("secret-thing".into(), serde_json::json!({ "approvals": "bad" }));
+    fn shows_each_requirement_with_policys_words() {
+        // What policy is asked to describe: only commands that say.
+        let reqs = requirements(&config());
+        assert_eq!(reqs.keys().collect::<Vec<_>>(), ["other"]);
+        assert_eq!(reqs["other"]["approvals"][0], serde_json::json!({ "groups_in": "dba" }));
+
         let mut descriptions = serde_json::Map::new();
         descriptions.insert(
             "other".into(),
             serde_json::json!({ "approvals": ["someone in the dba group", ""], "executors": "anyone" }),
         );
-        let c = build(&config(), "host-a", &published, &descriptions);
+        let c = build(&config(), "host-a", &descriptions);
         assert_eq!(c.host, "host-a");
         let secret = &c.commands[0];
-        assert!(secret.requirements.is_none() && secret.requirements_error.is_some());
+        assert!(secret.requirements.is_none());
         assert_eq!(secret.approval_validity_secs, 3600);
         let other = &c.commands[1];
         assert_eq!(other.approval_validity_secs, 7200);
@@ -189,6 +188,7 @@ mod tests {
         assert_eq!(req.approvals[1].description, None);
         assert_eq!(req.approvals[1].slot.predicate, "made_up");
         assert_eq!(req.executors.description.as_deref(), Some("anyone"));
+        assert_eq!(req.additional_policy.as_deref(), Some("Only on db-* hosts"));
         let json = serde_json::to_value(req).unwrap();
         assert_eq!(json["approvals"][0]["slot"], serde_json::json!({ "groups_in": "dba" }));
     }

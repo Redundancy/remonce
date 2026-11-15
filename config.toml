@@ -40,11 +40,19 @@ redirect_uri = "http://localhost:8080/oidc/callback"
 #ca_path = "./tsa_chain.pem"
 #trust_system_store = false   # set true only with `--insecure`
 
+# Each command says who must approve it and who may run it. A slot names a
+# predicate from policy/predicates.rego and gives it an argument:
+# `groups_in` accepts someone whose `groups` claim includes the group.
+# `approvals` has one slot per approval, each filled by a different person.
 [[commands]]
 name = "test"
 description = "A basic test command to verify connectivity."
 approval_validity = "1d" # Optional: how long each approval stays usable (default 1h)
+approvals = [{ groups_in = "webapp-users" }]
+executors = { groups_in = "webapp-users" }
 
+# No approvals or executors: this machine offers it, but nobody may run it
+# until someone says who.
 [[commands]]
 name = "fail"
 description = "A command designed to fail for testing error handling."
@@ -55,6 +63,8 @@ description = "Pings localhost a configurable number of times to test execution 
 executable = "ping"
 # {{count}} is substituted from the signed `params` after validation.
 args = ["-n", "{{count}}", "127.0.0.1"]
+approvals = [{ groups_in = "webapp-users" }]
+executors = { groups_in = "webapp-users" }
 
 # Declared parameters. Validation is fail-closed: a param with no `allowed`,
 # `pattern`, or `min`/`max` rule gets a conservative default pattern
@@ -66,13 +76,15 @@ default = "10"
 min = 1
 max = 100
 
-# Same as ping-test, but policy/requirements.json requires approvals from two
-# different people. Try it with the dev users webapp and webapp2.
+# Same as ping-test, but with two approval slots, so it needs approvals from
+# two different people. Try it with the dev users webapp and webapp2.
 [[commands]]
 name = "ping-pair"
 description = "Pings localhost; needs two people to approve."
 executable = "ping"
 args = ["-n", "{{count}}", "127.0.0.1"]
+approvals = [{ groups_in = "webapp-users" }, { groups_in = "webapp-users" }]
+executors = { groups_in = "webapp-users" }
 
 [[commands.params]]
 name = "count"

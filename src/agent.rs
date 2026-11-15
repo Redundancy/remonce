@@ -434,7 +434,7 @@ fn check_command(
 
 /// Run a request. In order: who is executing (a viewer login session,
 /// always — never anonymous), the bundle, the command, every approval, the
-/// command's own constraints, revocation, policy (published requirements +
+/// command's own constraints, revocation, policy (the command's requirement +
 /// executor), and replay — last, so a rejection earlier doesn't use up the
 /// request.
 async fn execute_handler(
@@ -596,6 +596,7 @@ async fn execute_handler(
             .collect(),
         executor,
         host: hostname.clone(),
+        requirement: cmd_config.requirement(),
     };
     let decision = state.policy.decide(&cmd_config.opa_rule, &input).await.map_err(|e| {
         audit("error", format!("Policy evaluation failed: {e}"), &user, full_ctx());
@@ -1280,7 +1281,7 @@ async fn require_view_docs(
 }
 
 /// The command catalog: what can be requested here and what each command
-/// needs (published requirements from OPA). Viewer-token auth; policy
+/// needs (from its config, in policy's words). Viewer-token auth; policy
 /// decides who may see it.
 async fn catalog_handler(
     State(state): State<AgentState>,
@@ -1295,19 +1296,15 @@ async fn catalog_handler(
     if let Err(response) = require_view_docs(&state, &addr, EVENT, claims, &user).await {
         return *response;
     }
-    let catalog = async {
-        let published = state.policy.requirements().await?;
-        let descriptions = state.policy.describe_slots(&published).await?;
-        Ok::<_, String>(crate::catalog::build(&state.config, &state.hostname, &published, &descriptions))
-    };
-    match catalog.await {
-        Ok(catalog) => {
+    let requirements = crate::catalog::requirements(&state.config);
+    match state.policy.describe_slots(&requirements).await {
+        Ok(descriptions) => {
             audit_view(&state, &addr, EVENT, "allow", "Catalog served", &user, None);
-            Json(catalog).into_response()
+            Json(crate::catalog::build(&state.config, &state.hostname, &descriptions)).into_response()
         }
         Err(e) => {
-            audit_view(&state, &addr, EVENT, "error", format!("Fetching published requirements failed: {e}"), &user, None);
-            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Could not load published requirements").into_response()
+            audit_view(&state, &addr, EVENT, "error", format!("Describing requirements failed: {e}"), &user, None);
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Policy could not describe the requirements").into_response()
         }
     }
 }
@@ -1353,16 +1350,20 @@ async fn match_handler(
     if req.people.len() > crate::security::MAX_APPROVALS {
         return (StatusCode::BAD_REQUEST, "Too many people").into_response();
     }
-    let rows = async {
-        let published = state.policy.requirements().await?;
-        match published.get(&req.command) {
-            Some(requirement) => state.policy.accepted(requirement, &req.people).await,
-            None => Ok(None),
-        }
+    let requirement = state
+        .config
+        .commands
+        .iter()
+        .find(|c| c.name == req.command)
+        .and_then(|c| c.requirement())
+        .and_then(|r| serde_json::to_value(r).ok());
+    let rows = match &requirement {
+        Some(requirement) => state.policy.accepted(requirement, &req.people).await,
+        None => Ok(None),
     };
-    match rows.await {
+    match rows {
         Ok(Some(accepted)) => Json(MatchResponse { accepted }).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "No published requirements to match against").into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "No requirements to match against").into_response(),
         Err(e) => {
             tracing::warn!("Matching a requirement failed: {e}");
             (StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable").into_response()

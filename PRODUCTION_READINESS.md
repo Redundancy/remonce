@@ -24,7 +24,7 @@ This document tracks known security gaps, "TODO" items, and requirements for mov
 - **Caveat**: a custom `pattern` that admits values starting with `-` re-opens argv flag injection. Review patterns accordingly.
 
 ### Multi-party Approval
-- **Status**: **Implemented**. A request collects independent approvals (up to 16), each a different person. Policy publishes per-command requirement documents (approval slots and allowed executors) that the agent serves in its catalog and enforces through a shared Rego helper; the executor is identified by their login. See [ARCHITECTURE.md](ARCHITECTURE.md#requests-and-approvals).
+- **Status**: **Implemented**. A request collects independent approvals (up to 16), each a different person. Each command's config says what it needs (approval slots and allowed executors, as predicates defined in Rego); the agent serves that in its catalog and enforces it through a shared Rego helper; the executor is identified by their login. See [ARCHITECTURE.md](ARCHITECTURE.md#requests-and-approvals).
 - **Caveat**: the executor's credential is a viewer bearer token with no proof of possession. Keep viewer-token lifetimes short, and use `executors` to limit who can run what.
 
 ### Request Revocation

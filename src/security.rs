@@ -9,7 +9,7 @@
 //!   one-time key — so approvals can be collected in any order, on any
 //!   machine. A bundle is the request plus the approvals gathered so far.
 //! - How many approvals, from whom, and who may execute is **policy**
-//!   (OPA with published requirement documents), not something the request
+//!   (Rego, checking the requirement in the agent's config), not something the request
 //!   says. This module only establishes who approved, and that each
 //!   approval is genuine and fresh; distinct people are enforced here.
 //!

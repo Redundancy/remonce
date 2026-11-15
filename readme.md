@@ -28,7 +28,7 @@ Checking a new VM's cloud-init output, restarting a service at 3am, or tailing a
 
 - A host offers a list of named commands with validated parameters. Nothing outside that list can run, and nothing runs through a shell.
 - A host can also offer files, such as logs. They are streamed read-only.
-- Who may approve a command and who may run it is policy, kept on the host. For most commands that is a few lines of JSON. Anything more is [Rego](https://www.openpolicyagent.org/docs/latest/policy-language/).
+- Who may approve a command and who may run it is set on the host, in two lines next to the command. Anything more is [Rego](https://www.openpolicyagent.org/docs/latest/policy-language/).
 - A command can need more than one person, and two approvals have to come from two different people.
 - A request is a file. You can email it, attach it to a ticket or carry it across a remote desktop session.
 
@@ -169,6 +169,8 @@ description = "Restart one of this host's services"
 executable = "systemctl"
 args = ["restart", "{{service}}"]
 env = { PATH = "/usr/bin:/bin" }  # commands start with an empty environment
+approvals = [{ groups_in = "sre" }]   # one slot per approval, each a different person
+executors = { groups_in = "sre" }     # who may run it once approved
 
 [[commands.params]]
 name = "service"
@@ -184,24 +186,22 @@ The agent only speaks HTTPS. With `mode = "files"` it picks up a renewed certifi
 
 A request only ever names a command. The executable and its arguments stay in this file, and a parameter value is checked against its rule before anything runs.
 
-The agent also reads every `.toml` file in a `config.d` directory beside `config.toml`. Commands and files from all of them add up, so you can keep one command per file and give a machine the files for its role, with a `config.toml` that is the same everywhere. A setting given in two files is an error; nothing overrides anything. See [Splitting it up](CONFIGURATION.md#splitting-it-up-configd).
+The agent also reads every `.toml` file in a `config.d` directory beside `config.toml`. Commands and files from all of them add up, so you can keep one command per file, holding what it runs and who may use it, and give a machine the files for its role. `config.toml` can then be the same everywhere. A setting given in two files is an error; nothing overrides anything. See [Splitting it up](CONFIGURATION.md#splitting-it-up-configd).
 
 ### 3. Say who may use each command
 
-`policy/requirements.json` holds one entry per command:
+That is the two lines in the example above:
 
-```json
-"restart-service": {
-  "approvals": [ { "groups_in": "sre" } ],
-  "executors":   { "groups_in": "sre" }
-}
+```toml
+approvals = [{ groups_in = "sre" }]
+executors = { groups_in = "sre" }
 ```
 
-Each entry in `approvals` is a slot that needs its own person. `executors` says who may submit the approved request. A slot names a predicate and gives it an argument: `groups_in` accepts someone whose `groups` claim includes the group. The shipped predicates are `groups_in`, `claim_equals`, `claim_contains` and `anyone`. They are Rego functions that carry their own descriptions, so you can [add your own](CONFIGURATION.md#predicates) and share them between hosts.
+Each entry in `approvals` is a slot that needs its own person, so two slots means two people. `executors` says who may submit the approved request. A slot names a predicate and gives it an argument: `groups_in` accepts someone whose `groups` claim includes the group. The shipped predicates are `groups_in`, `claim_equals`, `claim_contains` and `anyone`. They are Rego functions that carry their own descriptions, so you can [add your own](CONFIGURATION.md#predicates) and share them between hosts.
 
-The UI shows what each command needs, in the predicates' words, so people can see it before they ask.
+The UI shows what each command needs, in the predicates' words, so people can see it before they ask. A command that sets neither line is offered but refused.
 
-A command with no entry is refused. Edits to anything in `policy/` take effect on the next request, with no restart.
+Since a command's entry says both what it runs and who may use it, the `policy/` directory can be the same on every machine. These lines are read when the agent starts, like the rest of its config. Edits to anything in `policy/` take effect on the next request.
 
 The shipped `policy/authz.rego` also decides who may see the catalog, read files and watch runs, and who may revoke a request they didn't approve. It allows the tutorial's group, `webapp-users`, for all of these. Change that to a group of your own.
 
@@ -328,7 +328,7 @@ Each of these opens your browser for the login.
 - Hosts hold no SSH keys or long-lived secrets for this. The agent accepts only signed, approved requests, over TLS.
 - Every signature needs its own login, which must re-authenticate you, and a one-time key bound to the identity token. This is the [OpenPubkey](https://github.com/openpubkey/openpubkey) technique. Each signature also carries an RFC 3161 timestamp.
 - Approvals expire, a request runs once, and two approvals must be two different people.
-- With the shipped policy, a command that has no published requirements doesn't run.
+- With the shipped policy, a command that doesn't say who may approve and run it doesn't run.
 - The person running a request is identified by an ordinary login token, which is a bearer credential. Keep that client's token lifetime short.
 
 [SECURITY.md](SECURITY.md) has the threat model, [ARCHITECTURE.md](ARCHITECTURE.md) the signing protocol, and [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) the known gaps.
@@ -346,7 +346,7 @@ Each of these opens your browser for the login.
 ## Documentation
 
 - [Getting started](GETTING_STARTED.md): the step-by-step tutorial.
-- [Configuration](CONFIGURATION.md): every setting, requirement documents, the CLI and revocation.
+- [Configuration](CONFIGURATION.md): every setting, drop-in files, predicates, the CLI and revocation.
 - [Use cases](USECASES.md): solo VM checks, CI pipelines, NOC handoff, cross-team access, two-person rules.
 - [Architecture](ARCHITECTURE.md): the signing protocol and the design decisions behind it.
 - [Security model](SECURITY.md): the verification chain and the threat model.

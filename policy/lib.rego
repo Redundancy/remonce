@@ -1,7 +1,9 @@
 # Checks a request against a command's requirement.
 #
 # A requirement says which approvals a command needs — one per slot, each
-# from a different person — and who may execute it:
+# from a different person — and who may execute it. It comes from the
+# command's entry in the agent's config (`approvals`, `executors`), and the
+# agent sends it with each execution as input.requirement:
 #
 #   {
 #     "approvals": [ {"groups_in": "dba"}, {"groups_in": "security"} ],

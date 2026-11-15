@@ -96,7 +96,7 @@ Existing rules read `input.viewer` or `input.executor`, so an AI agent is denied
 ## Scope
 
 1. **Read-only.** `view_docs`, `read_file` and `view_execution`. This covers the debugging case.
-2. **Executor, opt-in per command.** An AI agent submits a request that people have already approved. The requirement document's `executors` would name which AI agents may.
+2. **Executor, opt-in per command.** An AI agent submits a request that people have already approved. The command's `executors` would name which AI agents may.
 3. **Never an approver.** Approving stays a fresh login by a person.
 
 ## Work this implies
@@ -124,7 +124,7 @@ These do not depend on the rest:
 
 [LIVE_APPROVAL.md](LIVE_APPROVAL.md) is a separate proposal: policy can answer "needs approval by" and the agent can collect that approval through a central service. Neither proposal depends on the other.
 
-If both existed, an AI agent's interaction would be one more held request. A policy could then ask the person to approve each access in place of a standing grant, with a slot naming them: `{"op": "equals", "claim": "username", "value": input.on_behalf_of.username}`.
+If both existed, an AI agent's interaction would be one more held request. A policy could then ask the person to approve each access in place of a standing grant, with a slot naming them: `{"claim_equals": ["username", input.on_behalf_of.username]}`.
 
 ## Open questions
 

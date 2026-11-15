@@ -15,6 +15,10 @@ default allow := false
 #   input.executor:   object  who is submitting it, from their login session:
 #                             { username, claims }
 #   input.host:       string  the agent's hostname
+#   input.requirement: object what the agent's config says this command needs:
+#                             { approvals: [slot], executors: slot,
+#                               additional_policy (optional) }
+#                             Absent when the command's config says nothing.
 #
 # Revoking a request (action "revoke") — asked only when the revoker is not
 # one of the request's approvers (approvers may always revoke):
@@ -35,12 +39,13 @@ default allow := false
 # The agent verifies every signature, token and freshness window before
 # asking. Policy decides whether the approvals and the executor are enough.
 
-# --- Executing: published requirements ---
+# --- Executing: the command's requirement ---
 
-# Each command's requirements are published in requirements.json. The same
-# document is shown to people in the UI, so allowing through it keeps what
-# they see and what is enforced the same.
-requirement := data.remonce.requirements[input.command.command]
+# Each command says who must approve it and who may run it in the agent's
+# config (`approvals` and `executors`), and the agent sends that with the
+# request. The same requirement is shown to people in the UI, so allowing
+# through it keeps what they see and what is enforced the same.
+requirement := input.requirement
 
 allow if {
 	input.action == "execute"
@@ -49,7 +54,7 @@ allow if {
 }
 
 # Further restrictions go here as messages. When a command has one, set its
-# "additional_policy" in requirements.json so the UI says so.
+# `additional_policy` in the agent's config so the UI says so.
 extra_denials contains "restart-db may only run on db-* hosts" if {
 	input.action == "execute"
 	input.command.command == "restart-db"
@@ -91,8 +96,8 @@ reason := "Authorized" if {
 } else := msg if {
 	input.action == "execute"
 	not requirement
-	msg := sprintf("No published requirements for '%s'", [input.command.command])
-} else := "The approvals do not meet the published requirements" if {
+	msg := sprintf("No approvals and executors are set for '%s'", [input.command.command])
+} else := "The approvals do not meet this command's requirements" if {
 	input.action == "execute"
 	not lib.approvals_satisfied(requirement, input.approvers)
 } else := "You are not allowed to execute this command" if {

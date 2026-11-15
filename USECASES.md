@@ -7,7 +7,7 @@ The primitives in play across all of these:
 - **Request** — a command (what, where, with which parameters, and a unique `id`) handed around as a file.
 - **Approval** — one person's signature over a request, each with its own fresh login and one-time key. Valid for the command's `approval_validity` (default 1 hour). A request collects as many as it needs, in any order, from different people.
 - **Executor** — whoever submits the approved request, identified by their ordinary (viewer) login. Never anonymous, and subject to policy like everyone else.
-- **Requirement document** — policy's statement of what a command needs: which approvals (one slot per person) and who may execute. The agent publishes it in its catalog, so the UI shows it next to the command.
+- **Requirement** — what a command needs: which approvals (one slot per person) and who may execute. It is two settings in the command's entry in the agent's config, `approvals` and `executors`. The agent enforces it through policy and publishes it in its catalog, so the UI shows it next to the command.
 - **Signer + agent** — the signer (`remonce web`) runs on each person's workstation; the agent (`remonce agent`) runs on the target and serves its catalog.
 
 ---
@@ -43,13 +43,11 @@ name = "cloud-init"
 description = "Cloud-init log"
 ```
 
-**Requirement document.**
+**Who may approve and run it**, in the same entry:
 
-```json
-"check-cloud-init": {
-  "approvals": [ { "groups_in": "vm-deployers" } ],
-  "executors":   { "groups_in": "vm-deployers" }
-}
+```toml
+approvals = [{ groups_in = "vm-deployers" }]
+executors = { groups_in = "vm-deployers" }
 ```
 
 File reads are a separate policy decision (`read_file`) on the viewer token's claims.
@@ -87,14 +85,12 @@ env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 approval_validity = "1d"
 ```
 
-**Requirement document** plus an extra rule, because a slot names one predicate and this needs two claims to hold together:
+**Who may approve and run it**, in the same entry, plus an extra rule, because a slot names one predicate and this needs two claims to hold together:
 
-```json
-"restart-app-tier": {
-  "approvals": [ { "groups_in": "release-approvers" } ],
-  "executors":   { "claim_equals": ["workflow", "deploy-prod"] },
-  "additional_policy": "Only from the acme/webapp repository"
-}
+```toml
+approvals = [{ groups_in = "release-approvers" }]
+executors = { claim_equals = ["workflow", "deploy-prod"] }
+additional_policy = "Only from the acme/webapp repository"
 ```
 
 ```rego
@@ -135,14 +131,12 @@ executable = "/usr/local/bin/db-failover"
 approval_validity = "12h"
 ```
 
-**Requirement document** plus a separation-of-duties rule:
+**Who may approve and run it**, in the same entry, plus a separation-of-duties rule:
 
-```json
-"db-failover": {
-  "approvals": [ { "groups_in": "oncall-managers" } ],
-  "executors":   { "groups_in": "noc-l2" },
-  "additional_policy": "The executor can't be one of the approvers"
-}
+```toml
+approvals = [{ groups_in = "oncall-managers" }]
+executors = { groups_in = "noc-l2" }
+additional_policy = "The executor can't be one of the approvers"
 ```
 
 ```rego
@@ -177,38 +171,28 @@ Comparing `sub` across the signing and viewer clients works when the IdP issues 
 ```toml
 [[commands]]
 name = "restart-webapp"
-opa_rule = "data.remonce.authz.decision"
 executable = "/usr/local/bin/restart-webapp"
 command_timeout = "2m"
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+approvals = [{ groups_in = ["webapp-team", "platform-ops"] }]
+executors = { groups_in = ["webapp-team", "platform-ops"] }
 
 [[commands]]
 name = "collect-diagnostics"
-opa_rule = "data.remonce.authz.decision"
 executable = "/usr/local/bin/collect-webapp-diag"
 command_timeout = "5m"
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+approvals = [{ groups_in = ["webapp-team", "platform-ops"] }]
+executors = { groups_in = ["webapp-team", "platform-ops"] }
 
 [[commands]]
 name = "rotate-logs"
-opa_rule = "data.remonce.authz.decision"
 executable = "/usr/local/bin/rotate-webapp-logs"
+approvals = [{ groups_in = "webapp-team" }]
+executors = { groups_in = "webapp-team" }
 ```
 
-**Requirement documents** (with the webapp team's policy bundle):
-
-```json
-"restart-webapp": {
-  "approvals": [ { "groups_in": ["webapp-team", "platform-ops"] } ],
-  "executors": { "groups_in": ["webapp-team", "platform-ops"] }
-},
-"rotate-logs": {
-  "approvals": [ { "groups_in": "webapp-team" } ],
-  "executors":   { "groups_in": "webapp-team" }
-}
-```
-
-`collect-diagnostics` is the same as `restart-webapp`. Platform-ops get a *subset*: they can restart and diagnose, but not rotate logs (which needs awareness of log shipping). The documents are the contract, and the Commands page shows each person what they'd need.
+Each command says who may approve and run it. Platform-ops get a *subset*: they can restart and diagnose, but not rotate logs (which needs awareness of log shipping). These lines are the contract, and the Commands page shows each person what they'd need.
 
 **UI status.** ✅ Fully supported.
 
@@ -224,17 +208,11 @@ executable = "/usr/local/bin/rotate-webapp-logs"
 2. Security opens it under **Sign a request**, sees the DBA's approval and what's missing, and approves. (The same person approving twice is refused.)
 3. The on-call SRE opens the file on **Execute** and runs it.
 
-**Requirement document.**
+**Who may approve and run it**, in the command's entry:
 
-```json
-"restart-db": {
-  "description": "A DBA and security must both agree",
-  "approvals": [
-    { "groups_in": "dba" },
-    { "groups_in": "security" }
-  ],
-  "executors": { "groups_in": "sre-oncall" }
-}
+```toml
+approvals = [{ groups_in = "dba" }, { groups_in = "security" }]
+executors = { groups_in = "sre-oncall" }
 ```
 
 Each slot needs a *different* person. Someone in both `dba` and `security` still fills only one slot, and policy finds a valid assignment whatever order the approvals arrive in.
@@ -247,7 +225,7 @@ Each slot needs a *different* person. Someone in both `dba` and `security` still
 
 - **One approval is the common case.** Cases 1 and 4: approve, execute, done. More approvals are for commands where one compromised or mistaken account shouldn't be enough.
 - **Executing is separate from approving.** Whoever holds a complete request can submit it from any machine, but they are always identified, and `executors` decides who that may be. Hand a request to the person who'll run it; don't make them re-approve. Approvers may execute their own requests by default (the one-person case needs it); where you want separation of duties, add it per command as in use case 3.
-- **Requirements belong to policy, not the requester.** Nothing in a request says what it needs, so nobody can weaken it by editing the file. Change a command's requirements in one place (the document) and every agent's catalog shows it.
+- **Requirements belong to the host, not the requester.** Nothing in a request says what it needs, so nobody can weaken it by editing the file. A command's requirement sits in its entry in the agent's config, and that agent's catalog shows it.
 - **Keep extra Rego visible.** Anything the shipped predicates can't express is either a predicate of your own, which then describes itself in the catalog, or a rule in `extra_denials`, with `additional_policy` set so people see that more applies.
 - **Replay safety is automatic.** A request runs once per agent; set `[agent] state_dir` so that holds across agent restarts too. Running the same thing again is a new request (new `id`), approved again.
 - **The wire format is portable.** Requests are plain JSON. Email them, attach them to tickets, paste them into chat — the signatures protect them, not the channel.

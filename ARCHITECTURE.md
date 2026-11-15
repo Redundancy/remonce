@@ -73,7 +73,7 @@ JWTs are short-lived, but a request may run some time after it is approved. We m
 
 Signing *is* approving. A **request** is a command — what to run, where, with which parameters, and a unique `id` — and each **approval** is one person's independent signature over it, made with their own fresh login and one-time key. Approvals can be added in any order, on any machine; nobody signs "for" anyone else.
 
-How many approvals a command needs, from whom, and who may run it is **policy's** decision, not the requester's: nothing in a request says what it needs. Policy publishes that as a *requirement document* per command, which the agent serves in its catalog so anyone looking at a command can see what it takes.
+How many approvals a command needs, from whom, and who may run it is the **host's** decision, enforced by policy, not the requester's: nothing in a request says what it needs. Each command's entry in the agent's config says it (`approvals` and `executors`). The agent hands that *requirement* to policy with every execution, and serves it in its catalog so anyone looking at a command can see what it takes.
 
 ### Bundle shape
 
@@ -89,7 +89,7 @@ Every approval signs the same bytes: the command wrapped with a domain tag, as c
 
 ### The executor
 
-Whoever submits a complete bundle to an agent is the **executor**. Submitting needs an ordinary login to the *viewer* client, whose token goes with the request as a bearer credential. The executor is never anonymous: they are recorded in the audit log and the run log, and passed to policy as `input.executor`, where the requirement document's `executors` rule (and any other policy) restricts them like any other identity. An executor doesn't need to be an approver and doesn't sign anything; their viewer token can't sign or approve, and approvals' tokens (signing client) are rejected as executor credentials.
+Whoever submits a complete bundle to an agent is the **executor**. Submitting needs an ordinary login to the *viewer* client, whose token goes with the request as a bearer credential. The executor is never anonymous: they are recorded in the audit log and the run log, and passed to policy as `input.executor`, where the command's `executors` rule (and any other policy) restricts them like any other identity. An executor doesn't need to be an approver and doesn't sign anything; their viewer token can't sign or approve, and approvals' tokens (signing client) are rejected as executor credentials.
 
 ### Verification (agent)
 
@@ -106,27 +106,27 @@ In this order; each step's failure is audited and stops the request.
     Then **no two approvals may share a `sub`**: two approvals are always two people. Errors name the approval's index.
 4.  **Command checks**: this host is in `target_machines`, `not_before` / `not_after` hold, and parameters validate against the config.
 5.  **Revocation**: the request id against the local revocation set, then the central service if one is configured (fail-closed).
-6.  **Policy**: OPA gets `action = "execute"`, the command, the request id, every approver (`username`, `claims`, `signed_at`), the executor and the host.
+6.  **Policy**: OPA gets `action = "execute"`, the command, the request id, every approver (`username`, `claims`, `signed_at`), the executor, the host and the command's requirement.
 7.  **Replay**: the request id is recorded, and a second submission is refused. This is last, so a request refused for another reason isn't used up.
 
-### Requirement documents
+### Requirements
 
-Policy data at `data.remonce.requirements[<command>]` (shipped in [policy/requirements.json](policy/requirements.json)):
+Part of each command's entry in the agent's config, and sent to policy as `input.requirement`:
 
-```json
-{
-  "approvals": [ { "groups_in": "dba" }, { "groups_in": "security" } ],
-  "executors": { "groups_in": "sre-oncall" },
-  "additional_policy": "Not during the Friday change freeze"
-}
+```toml
+approvals = [{ groups_in = "dba" }, { groups_in = "security" }]
+executors = { groups_in = "sre-oncall" }
+additional_policy = "Not during the Friday change freeze"
 ```
 
--   Each entry in `approvals` is a **slot** that needs its own approver: the request is satisfied when every slot can be given a *different* approver whose claims it accepts. This is checked with Hall's condition over subsets of slots (at most 8), not greedily, so a valid assignment is always found if one exists. With no slots, one approval from anyone is enough (an agent never runs a request without at least one).
+-   Each entry in `approvals` is a **slot** that needs its own approver: the request is satisfied when every slot can be given a *different* approver whom it accepts. This is checked with Hall's condition over subsets of slots (at most 8), not greedily, so a valid assignment is always found if one exists. With no slots, one approval from anyone is enough (an agent never runs a request without at least one).
 -   `executors` says who may submit it.
 -   A slot is one predicate and its argument. A slot naming a predicate nobody has defined accepts no one.
--   `additional_policy` is a description, shown to people, of rules the policy adds beyond the document.
+-   `additional_policy` is a description, shown to people, of rules the policy adds beyond these.
 
-The shared Rego helper [policy/lib.rego](policy/lib.rego) evaluates a document (`lib.satisfied(requirement, input)`), so what the catalog shows and what policy enforces come from the same data. [policy/authz.rego](policy/authz.rego) denies a command with no published document; a test in `policy_test/` checks that meeting a document is enough to be allowed unless the document declares `additional_policy`, so the two can't silently drift apart.
+The shared Rego helper [policy/lib.rego](policy/lib.rego) evaluates it (`lib.satisfied(input.requirement, input)`), so what the catalog shows and what policy enforces come from the same data. [policy/authz.rego](policy/authz.rego) denies a command that sets no requirement.
+
+The requirement lives beside the command so that one file can say everything about one action: what runs and who may use it. That file can be dropped onto a machine as it is, and the policy directory can be identical everywhere. The requirement comes from the agent's config and travels in the policy input, never in the request, so a requester can't change it, and it works the same with the embedded engine and with an OPA server, which needs no per-host data. A policy that would rather own these rules centrally can ignore `input.requirement` and use its own.
 
 Predicates are Rego functions, not a language of their own. Each is a `holds(name, argument, person)` clause saying who it accepts and a `describe(name, argument)` clause saying so in words; [policy/predicates/core.rego](policy/predicates/core.rego) ships `groups_in`, `claim_equals`, `claim_contains` and `anyone`. Because the description comes from the same place as the test, what people read is what is enforced, and a deployment can add predicates, or share them as libraries, without any change to remonce. [policy/predicates.rego](policy/predicates.rego) lists the libraries an agent uses.
 
@@ -134,7 +134,7 @@ Predicates are evaluated at **execution time** against the approvers' and execut
 
 ### The catalog
 
-`GET /api/commands` on the agent (viewer bearer; policy's `view_docs` decides who may see it) lists what can be requested there: each command's name, description, parameters, `approval_validity`, and its requirement document fetched from OPA with policy's description of each slot, plus the agent's hostname. It never includes how a command runs (executable, arguments, working directory, environment, policy rule). The signer's UI reads the catalog of whichever agent is selected.
+`GET /api/commands` on the agent (viewer bearer; policy's `view_docs` decides who may see it) lists what can be requested there: each command's name, description, parameters, `approval_validity`, and its requirement with policy's description of each slot, plus the agent's hostname. It never includes how a command runs (executable, arguments, working directory, environment, policy rule). The signer's UI reads the catalog of whichever agent is selected.
 
 The browser can't evaluate a predicate, so to show which slots a request's approvals fill it asks the agent: `POST /api/requirements/match` takes a command name and a list of people (`username` and `claims`, as read from the approvals in the file) and returns, for each approval slot, whether it would accept each of them. It has the same access rule as the catalog, verifies nothing and decides nothing; it exists only so the page can say "1 of 2 needed".
 

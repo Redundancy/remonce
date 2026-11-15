@@ -1,3 +1,4 @@
+use crate::requirements::{MAX_SLOTS, Requirement, Slot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -337,6 +338,20 @@ pub struct CommandConfig {
     /// alphanumeric-ish). See `crate::params`.
     #[serde(default)]
     pub params: Vec<ParamConfig>,
+
+    /// Who must approve a request for this command: one slot per approval,
+    /// each filled by a different person. A slot names a policy predicate
+    /// and its argument, as in `{ groups_in = "dba" }`. Set together with
+    /// `executors`. A command with neither has no requirement, and the
+    /// shipped policy refuses it.
+    pub approvals: Option<Vec<Slot>>,
+
+    /// Who may run (submit) an approved request for this command: one slot.
+    pub executors: Option<Slot>,
+
+    /// A description, shown to people, of rules policy adds beyond
+    /// `approvals` and `executors`.
+    pub additional_policy: Option<String>,
 }
 
 /// A declared, validated parameter for a command.
@@ -381,6 +396,17 @@ pub const DEFAULT_APPROVAL_VALIDITY: std::time::Duration = std::time::Duration::
 pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 impl CommandConfig {
+    /// What this command needs before it may run, if it says: its approval
+    /// slots and who may run it. Policy gets this with every execution
+    /// decision and the catalog shows it.
+    pub fn requirement(&self) -> Option<Requirement> {
+        Some(Requirement {
+            approvals: self.approvals.clone()?,
+            executors: self.executors.clone()?,
+            additional_policy: self.additional_policy.clone(),
+        })
+    }
+
     pub fn approval_validity_or_default(&self) -> std::time::Duration {
         self.approval_validity.unwrap_or(DEFAULT_APPROVAL_VALIDITY)
     }
@@ -483,13 +509,50 @@ fn check_duplicate_commands(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// A command says who may approve it and who may run it together, or says
+/// neither: half a requirement is a mistake, not a default.
+fn check_requirements(config: &Config) -> Result<(), String> {
+    for c in &config.commands {
+        let name = &c.name;
+        match (&c.approvals, &c.executors) {
+            (Some(_), None) => {
+                return Err(format!("command '{name}': `approvals` is set without `executors`; set both"));
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "command '{name}': `executors` is set without `approvals`; set both \
+                     (`approvals = []` means one approval from anyone)"
+                ));
+            }
+            (None, None) if c.additional_policy.is_some() => {
+                return Err(format!(
+                    "command '{name}': `additional_policy` describes rules beyond `approvals` and `executors`; set those too"
+                ));
+            }
+            (Some(slots), Some(_)) if slots.len() > MAX_SLOTS => {
+                return Err(format!(
+                    "command '{name}': {} approval slots (at most {MAX_SLOTS})",
+                    slots.len()
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate(config: &Config) -> Result<(), String> {
+    check_duplicate_commands(config)?;
+    check_requirements(config)
+}
+
 /// Parse configuration text.
 pub fn parse(text: &str) -> Result<Config, String> {
     if let Ok(table) = text.parse::<toml::Table>() {
         check_removed_keys(&table)?;
     }
     let config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
-    check_duplicate_commands(&config)?;
+    validate(&config)?;
     Ok(config)
 }
 
@@ -548,6 +611,7 @@ pub fn load(path: &str) -> Result<Config, String> {
         }
         format!("Failed to parse {path} with the files in {}: {e}", drop_in_dir(main).display())
     })?;
+    validate(&config)?;
     tracing::info!(
         files = drop_ins.len(),
         dir = %drop_in_dir(main).display(),
@@ -665,6 +729,56 @@ mod tests {
         );
         let other = cfg.commands.iter().find(|c| c.name == "fail").unwrap();
         assert_eq!(other.approval_validity_or_default(), DEFAULT_APPROVAL_VALIDITY);
+        // `fail` says nothing about who may use it; `ping-pair` asks for two people.
+        assert_eq!(other.requirement(), None);
+        let pair = cfg.commands.iter().find(|c| c.name == "ping-pair").unwrap();
+        assert_eq!(pair.requirement().unwrap().approvals.len(), 2);
+    }
+
+    #[test]
+    fn a_command_says_who_may_approve_and_run_it() {
+        let cfg = parse(
+            r#"
+            [[commands]]
+            name = "restart-db"
+            approvals = [{ groups_in = "dba" }, { claim_equals = ["team", "security"] }]
+            executors = { groups_in = ["sre", "oncall"] }
+            additional_policy = "Only on db-* hosts"
+
+            [[commands.params]]
+            name = "service"
+            "#,
+        )
+        .unwrap();
+        let req = cfg.commands[0].requirement().unwrap();
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({
+                "approvals": [{ "groups_in": "dba" }, { "claim_equals": ["team", "security"] }],
+                "executors": { "groups_in": ["sre", "oncall"] },
+                "additional_policy": "Only on db-* hosts",
+            })
+        );
+    }
+
+    #[test]
+    fn half_a_requirement_is_rejected() {
+        let command = |body: &str| format!("[[commands]]\nname = \"x\"\n{body}\n");
+        for (body, expect) in [
+            ("approvals = [{ anyone = true }]", "without `executors`"),
+            ("executors = { anyone = true }", "without `approvals`"),
+            ("additional_policy = \"more\"", "additional_policy"),
+        ] {
+            let err = parse(&command(body)).unwrap_err();
+            assert!(err.contains("'x'") && err.contains(expect), "{body}: {err}");
+        }
+        let nine = ["{ anyone = true }"; 9].join(", ");
+        let err = parse(&command(&format!("approvals = [{nine}]\nexecutors = {{ anyone = true }}"))).unwrap_err();
+        assert!(err.contains("9 approval slots"), "{err}");
+        // A slot is one predicate; the old form says what replaced it.
+        assert!(parse(&command("approvals = [{}]\nexecutors = { anyone = true }")).is_err());
+        let err = parse(&command("approvals = [{ any_of = [] }]\nexecutors = { anyone = true }")).unwrap_err();
+        assert!(err.contains("any_of"), "{err}");
     }
 
     #[test]

@@ -254,6 +254,9 @@ mod tests {
             max_output_bytes: None,
             env: Default::default(),
             params: vec![],
+            approvals: None,
+            executors: None,
+            additional_policy: None,
         }
     }
 

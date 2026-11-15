@@ -69,8 +69,8 @@ fn sleep_command() -> (String, Vec<&'static str>, String) {
     }
 }
 
-/// An agent config with runnable commands the shipped policy publishes
-/// requirements for (approvers and an executor in `webapp-users`):
+/// An agent config with runnable commands that need approvers and an
+/// executor in `webapp-users`:
 /// `ping-test` echoes its `count`; `test` runs far longer than its
 /// one-second timeout; and `ping-pair` (two approvals) runs for 30 seconds
 /// and keeps only the first 10 bytes of its output. The run logs are also
@@ -91,7 +91,8 @@ viewer_client_id = "{VIEWER_CLIENT}"
 
 [[commands]]
 name = "ping-test"
-opa_rule = "data.remonce.authz.decision"
+approvals = [{{ groups_in = "webapp-users" }}]
+executors = {{ groups_in = "webapp-users" }}
 executable = {executable:?}
 args = {args:?}
 
@@ -102,7 +103,8 @@ max = 100
 
 [[commands]]
 name = "test"
-opa_rule = "data.remonce.authz.decision"
+approvals = [{{ groups_in = "webapp-users" }}]
+executors = {{ groups_in = "webapp-users" }}
 executable = {sleep_executable:?}
 args = {sleep_args:?}
 command_timeout = "1s"
@@ -110,7 +112,8 @@ command_timeout = "1s"
 
 [[commands]]
 name = "ping-pair"
-opa_rule = "data.remonce.authz.decision"
+approvals = [{{ groups_in = "webapp-users" }}, {{ groups_in = "webapp-users" }}]
+executors = {{ groups_in = "webapp-users" }}
 executable = {sleep_executable:?}
 args = {sleep_args:?}
 max_output_bytes = 10

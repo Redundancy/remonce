@@ -15,22 +15,21 @@ Everything runs locally: a development Vault stands in for your identity provide
 
 ## How the pieces fit
 
-Each host's owner controls three things, all in files on that host:
+Each host's owner controls two things, both in files on that host:
 
 | File | Says | Changes apply |
 |---|---|---|
-| `config.toml` | **What this machine offers**: the commands it can run (and exactly how), their parameters, the files it will show, and its TLS. | On agent restart |
-| `policy/requirements.json` | **Who must approve each command, and who may run it**, as plain data. Most setups only ever edit this. | On the next request |
-| `policy/*.rego` | **The decisions themselves**, in [Rego](https://www.openpolicyagent.org/docs/latest/policy-language/). The shipped `authz.rego` turns requirement documents into decisions; add your own rules here when data isn't enough. | On the next request |
+| `config.toml`, and the files in `config.d/` | **What this machine offers, and to whom**: the commands it can run (and exactly how), their parameters, who must approve each one and who may run it, the files it will show, and its TLS. Most setups only ever edit this. | On agent restart |
+| `policy/*.rego` | **The decisions themselves**, in [Rego](https://www.openpolicyagent.org/docs/latest/policy-language/). The shipped `authz.rego` checks each request against what its command asks for, and `predicates/` defines what a command can ask for; add your own rules here when that isn't enough. | On the next request |
 
 When someone submits an approved request, the agent:
 
 1. checks every approval's signature, login and timestamp, and that the approvers are different people;
 2. checks the request is for this machine and its parameters are valid (from `config.toml`);
-3. asks the policy for a decision: it evaluates the shipped decision rule, `data.remonce.authz.decision`, unless the command names another with `opa_rule`, with the request, the approvers' verified claims and the executor's as `input`;
+3. asks the policy for a decision: it evaluates the shipped decision rule, `data.remonce.authz.decision`, unless the command names another with `opa_rule`, with the request, what the command asks for, the approvers' verified claims and the executor's as `input`;
 4. runs the command if the decision is `{"allow": true}`, and otherwise returns the decision's `reason`.
 
-The shipped decision is: *allow if the command's requirement document is satisfied, unless an extra rule denies it*. A command with no requirement document is denied. So a new command does nothing until you say who may use it — which is the point.
+The shipped decision is: *allow if the command's `approvals` and `executors` are satisfied, unless an extra rule denies it*. A command that sets neither is denied. So a new command does nothing until you say who may use it — which is the point.
 
 Policy is evaluated inside the agent (the embedded [Regorus](https://github.com/microsoft/regorus) engine); nothing else needs to run. If you'd rather use an [OPA](https://www.openpolicyagent.org/) server, point `opa_url` at it: the same files work unchanged. See [CONFIGURATION.md](CONFIGURATION.md#authorization-policy).
 
@@ -136,7 +135,7 @@ executable = "hostname"
 
 You can also put the command in a file of its own, such as `config.d/show-host.toml`, with the same three lines: the agent reads every `.toml` file in `config.d` after `config.toml` ([CONFIGURATION.md](CONFIGURATION.md#splitting-it-up-configd)).
 
-Restart the agent (configuration is read at startup) and reload the Commands page. `show-host` appears with **No published requirements**, and approving and running it would be refused with `No published requirements for 'show-host'`. The machine offers it, but nobody has said who may use it.
+Restart the agent (configuration is read at startup) and reload the Commands page. `show-host` appears with **No approvers or executors set**, and approving and running it would be refused with `No approvals and executors are set for 'show-host'`. The machine offers it, but nobody has said who may use it.
 
 **Parameters** work the same way: declared in `config.toml`, validated before anything runs, substituted into `args`. The sample `ping-test` shows one (it's written for Windows `ping`; on Linux and macOS use `-c` instead of `-n`):
 
@@ -152,21 +151,26 @@ max = 100
 
 ## 6. Say who may approve it, and who may run it
 
-Open `policy/requirements.json` and add an entry for `show-host` under `requirements`:
+Add two lines to `show-host`:
 
-```json
-"show-host": {
-  "approvals": [ { "groups_in": "webapp-users" } ],
-  "executors": { "groups_in": "webapp-users" }
-}
+```toml
+[[commands]]
+name = "show-host"
+description = "Print this machine's name."
+executable = "hostname"
+approvals = [{ groups_in = "webapp-users" }]
+executors = { groups_in = "webapp-users" }
 ```
 
 - **`approvals`** is a list of slots. Each slot needs its own approver, a different person per slot.
 - **`executors`** says who may submit the approved request.
-- **A slot names a predicate and gives it an argument.** `{"groups_in": "webapp-users"}` accepts anyone whose `groups` claim includes `webapp-users`. The shipped predicates are `groups_in`, `claim_equals`, `claim_contains` and `anyone`.
+- **A slot names a predicate and gives it an argument.** `{ groups_in = "webapp-users" }` accepts anyone whose `groups` claim includes `webapp-users`. The shipped predicates are `groups_in`, `claim_equals`, `claim_contains` and `anyone`.
 - **Predicates are Rego functions**, in `policy/predicates/core.rego`, and each one carries the description people see. You can add your own; see [Predicates](CONFIGURATION.md#predicates).
+- **Keep both lines above any `[[commands.params]]`.** In TOML, whatever follows that heading belongs to the parameter.
 
-Save, and reload the Commands page — no restart. `show-host` now reads *Needs someone in the webapp-users group · run by someone in the webapp-users group*.
+So a command's entry says what it runs and who may use it, and a file in `config.d` can hold all of one command.
+
+Restart the agent and reload the Commands page. `show-host` now reads *Needs someone in the webapp-users group · run by someone in the webapp-users group*.
 
 ## 7. Approve it and run it
 
@@ -180,22 +184,22 @@ The same request can't run twice, and the approval expires after an hour (`appro
 
 Change `show-host`'s `approvals` to two slots:
 
-```json
-"approvals": [ { "groups_in": "webapp-users" }, { "groups_in": "webapp-users" } ]
+```toml
+approvals = [{ groups_in = "webapp-users" }, { groups_in = "webapp-users" }]
 ```
 
-Now:
+Restart the agent. Now:
 
 1. Prepare and approve `show-host` as `webapp`. The result says **1 of 2 needed** and names what's missing.
 2. Click **Save file**. In real use you'd send this file to the second approver, by any route a file can take.
 3. Open **Sign a request**, drop the file in, and click **Approve** — logging in as `webapp2` this time. (Try `webapp` again: it's refused, because two approvals must be two people.)
 4. Click **Execute now**.
 
-Slots can ask for different things — `{"groups_in": "dba"}` plus `{"groups_in": "security"}` — and policy finds a fair assignment whatever order the approvals arrive in.
+Slots can ask for different things — `{ groups_in = "dba" }` plus `{ groups_in = "security" }` — and policy finds a fair assignment whatever order the approvals arrive in.
 
 ## 9. Write a rule of your own
 
-Requirement documents cover *who*. For anything else — parameter values, hosts, times, combinations of claims — write Rego. Add this to `policy/authz.rego`:
+`approvals` and `executors` cover *who*. For anything else — parameter values, hosts, times, combinations of claims — write Rego. Add this to `policy/authz.rego`:
 
 ```rego
 # More than 20 pings needs an approval from someone in the "sre" group.
@@ -221,12 +225,13 @@ What a rule can use (`input` for an execution):
 | `input.command` | The signed request: `command`, `id`, `target_machines`, `params`, `not_before`/`not_after` |
 | `input.approvers` | One entry per approval: `username`, `claims` (verified ID token claims), `signed_at` |
 | `input.executor` | Who's submitting it: `username`, `claims` |
+| `input.requirement` | What the command asks for, from this agent's config: `approvals`, `executors`, `additional_policy` |
 | `input.host` | This agent's hostname |
 | `input.request_id` | The request's id |
 
 Two habits worth keeping:
 
-- **Say so in the requirement document.** Add `"additional_policy": "More than 20 pings needs an SRE approval"` to `ping-test`'s document, so the Commands page tells people there's more to it than the slots.
+- **Say so on the command.** Add `additional_policy = "More than 20 pings needs an SRE approval"` to `ping-test` in `config.toml`, so the Commands page tells people there's more to it than the slots.
 - **Test your rules.** `policy_test/` has the tests for the shipped policy; `cargo test` runs them on the embedded engine (and `opa test policy policy_test` on OPA). Add yours alongside.
 
 When one command needs a decision entirely its own, write a rule that returns `{"allow": …, "reason": …}` in your own package and point the command's `opa_rule` at it.

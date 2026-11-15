@@ -18,13 +18,30 @@ After `config.toml`, every mode reads each `.toml` file in a `config.d` director
 name = "restart-service"
 executable = "systemctl"
 args = ["restart", "{{service}}"]
+approvals = [{ groups_in = "sre" }]
+executors = { groups_in = "sre" }
 
 [[commands.params]]
 name = "service"
 allowed = ["nginx", "postgres"]
 ```
 
-This lets a machine be set up by choosing files instead of templating one: a `config.toml` that is the same on every machine, and one file per command or log for what this machine offers. With cloud-init, that is one `write_files` entry per file.
+That one file says what the command runs, who must approve it and who may run it.
+
+This lets a machine be set up by choosing files instead of templating one: a `config.toml` and a `policy/` directory that are the same on every machine, and one file per command or log for what this machine offers. With cloud-init, that is one `write_files` entry per file:
+
+```yaml
+#cloud-config
+write_files:
+  - path: /etc/remonce/config.toml                      # the same on every machine
+    content: |
+      ...
+  - path: /etc/remonce/config.d/restart-service.toml    # what this machine offers
+    content: |
+      [[commands]]
+      name = "restart-service"
+      ...
+```
 
 How files combine:
 
@@ -283,8 +300,8 @@ Every decision is Rego policy, evaluated one of two interchangeable ways. The sa
 
 ```toml
 # Directory of .rego modules and .json/.yaml data, laid out as for `opa run`:
-# data files mount at their directory's path (policy/requirements.json at
-# `data`, policy/teams/db/owners.yaml at `data.teams.db`).
+# data files mount at their directory's path (policy/teams/db/owners.yaml
+# at `data.teams.db`).
 # Default: "policy".
 policy_dir = "policy"
 ```
@@ -305,15 +322,15 @@ Policy decisions requested by the agent (`input.action`):
 
 | Action | When | Input |
 |--------|------|-------|
-| `execute` | Running an approved request | `command`, `request_id`, `approvers` (each `username`, `claims`, `signed_at`), `executor` (`username`, `claims`), `host` |
+| `execute` | Running an approved request | `command`, `request_id`, `approvers` (each `username`, `claims`, `signed_at`), `executor` (`username`, `claims`), `host`, and `requirement`: the command's `approvals`, `executors` and `additional_policy` from this agent's config, absent when it sets none |
 | `revoke` | Someone who didn't approve a request revokes it | `command`, `request_id`, `approvers`, `revoker`, `host` |
 | `read_file` | Streaming an allowed file | `viewer` (`username`, `claims`), `file` (`name` or `path` as asked for, and `resolved_path`: the file that names, as the file list shows it — match on this one, since a path can be spelled many ways) |
 | `view_execution` | Streaming an execution's output log | `viewer`, `execution_id` |
 | `view_docs` | Reading the agent's command catalog, or its list of files | `viewer` |
 
-Execution and revocation decisions come from each command's `opa_rule` (the shipped policy's is `data.remonce.authz.decision`, returning `{allow, reason}`); viewing decisions from `data.remonce.authz.allow`. The agent also reads `data.remonce.requirements` (see [Requirement documents](#requirement-documents)) to publish in its catalog, and asks two display helpers in the shipped `lib.rego`: `data.remonce.lib.descriptions` for the words that go with each slot, and `data.remonce.lib.accepted` for which people a slot would accept. A policy without them still decides; the catalog then shows slots as written.
+Execution and revocation decisions come from each command's `opa_rule` (the shipped policy's is `data.remonce.authz.decision`, returning `{allow, reason}`); viewing decisions from `data.remonce.authz.allow`. For its catalog, the agent asks two display helpers in the shipped `lib.rego`: `data.remonce.lib.descriptions` for the words that go with each slot, and `data.remonce.lib.accepted` for which people a slot would accept. A policy without them still decides; the catalog then shows slots as written.
 
-**Extending it.** Requirement documents cover the common cases without writing Rego. Beyond them, policy is ordinary Rego: add modules and data to the policy directory, add rules to `extra_denials` in `authz.rego`, or point a command's `opa_rule` at a decision rule of your own. Keep the command's `additional_policy` set so people see that more applies.
+**Extending it.** A command's `approvals` and `executors` cover the common cases without writing Rego. Beyond them, policy is ordinary Rego: add modules and data to the policy directory, add rules to `extra_denials` in `authz.rego`, or point a command's `opa_rule` at a decision rule of your own. Keep the command's `additional_policy` set so people see that more applies.
 
 The agent's catalog, file and log-stream endpoints, and `/execute`, take the caller's **viewer** ID token as an `Authorization: Bearer` header (never a query parameter), and reject tokens for any other audience. The signer attaches it when proxying.
 
@@ -382,6 +399,16 @@ env = { PATH = "/usr/bin:/bin" }
 # Every approval in a request must still be valid when it runs. Default: 1h;
 # above 7d needs --insecure.
 approval_validity = "1h"
+
+# Who must approve a request for this command, and who may run it. Set
+# both, or neither: a command with neither is offered, but the shipped
+# policy refuses it. See "Who may approve and run a command" below.
+approvals = [{ groups_in = "sre" }]
+executors = { groups_in = "sre" }
+
+# Optional: a description, shown to people, of rules your policy adds
+# beyond those two.
+# additional_policy = "Only on db-* hosts"
 ```
 
 ### Command parameters (`[[commands.params]]`)
@@ -438,34 +465,35 @@ Each approval is usable for the command's `approval_validity` (default 1 hour), 
 
 When a request needs several approvals, **all** of them must be valid when it runs, so the first approver's clock is the one that matters: collect approvals within the window, or set a longer one for commands whose approvals take time to gather. The replay cache remembers a run for the same window, so a longer validity also means more memory held per run.
 
-### Requirement documents
+### Who may approve and run a command
 
-What a command needs before it runs — how many approvals, from whom, and who may submit it — is published by policy, as OPA data at `data.remonce.requirements[<command>]`. The shipped policy loads it from [policy/requirements.json](policy/requirements.json) (OPA mounts JSON files in the policy directory under their `data` path):
+What a command needs before it runs is part of its entry: `approvals`, with one slot per approval, and `executors`, saying who may submit it.
 
-```json
-{
-  "remonce": {
-    "requirements": {
-      "restart-db": {
-        "approvals": [ { "groups_in": "dba" }, { "groups_in": "security" } ],
-        "executors": { "groups_in": "sre-oncall" },
-        "additional_policy": "Only on db-* hosts"
-      }
-    }
-  }
-}
+```toml
+[[commands]]
+name = "restart-db"
+executable = "/usr/local/bin/restart-db"
+approvals = [{ groups_in = "dba" }, { groups_in = "security" }]
+executors = { groups_in = "sre-oncall" }
+additional_policy = "Only on db-* hosts"
 ```
 
-| Field | Meaning |
+| Setting | Meaning |
 |---|---|
 | `approvals` | Up to 8 **slots**. Each needs its own approver, a different person per slot, whom the slot accepts. `[]` means one approval from anyone. |
 | `executors` | Who may submit the request (their viewer login's claims): one slot. |
-| A slot | One predicate and its argument, such as `{"groups_in": "dba"}`. See [Predicates](#predicates). |
-| `additional_policy` | A description of rules the policy adds beyond the document (optional). Set it whenever `authz.rego` denies more than the document says. |
+| A slot | One predicate and its argument, such as `{ groups_in = "dba" }`. See [Predicates](#predicates). |
+| `additional_policy` | A description of rules the policy adds beyond these two (optional). Set it whenever `authz.rego` denies more than they say. |
 
-The agent serves each command's document in its catalog (`GET /api/commands`), with policy's description of every slot, so the UI can show what a command needs. To show which slots a request's approvals already fill, the UI asks the agent (`POST /api/requirements/match`), since only policy knows what a predicate means; that answer is for display and decides nothing. The shipped [policy/authz.rego](policy/authz.rego) allows an execution exactly when `lib.satisfied(requirement, input)` holds and no `extra_denials` rule fires, and denies a command with no document. The agent verifies every approval before asking, and rejects two approvals from the same person outright.
+Set `approvals` and `executors` together. A command with neither still appears in the catalog, and the shipped policy refuses it, so a new command does nothing until its owner says who may use it. Put these lines above any `[[commands.params]]` in the entry: TOML reads whatever follows that heading as part of the parameter.
 
-`cargo test` runs the policy tests in `policy_test/` on the embedded engine (`opa test policy policy_test` runs them on OPA). One of them checks that meeting each published document is enough to be allowed (unless it declares `additional_policy`), so the documents can't silently drift from the rules.
+The agent sends this to policy with every execution, as `input.requirement`. The shipped [policy/authz.rego](policy/authz.rego) allows an execution exactly when `lib.satisfied(input.requirement, input)` holds and no `extra_denials` rule fires. The requirement comes from the agent's own config and never from the request, so nobody can weaken it by editing a request file. Because it travels in the input, it works the same with the embedded engine and with an OPA server, which needs no per-host data; a policy that would rather own the rules centrally can ignore it. The agent verifies every approval before asking, and rejects two approvals from the same person outright.
+
+The agent serves each command's requirement in its catalog (`GET /api/commands`), with policy's description of every slot, so the UI can show what a command needs. To show which slots a request's approvals already fill, the UI asks the agent (`POST /api/requirements/match`), since only policy knows what a predicate means; that answer is for display and decides nothing.
+
+These are settings, so a change takes effect when the agent restarts. Rego in the policy directory is still picked up on the next request.
+
+`cargo test` runs the policy tests in `policy_test/` on the embedded engine (`opa test policy policy_test` runs them on OPA).
 
 ### Predicates
 
@@ -473,11 +501,11 @@ A slot says who can fill it by naming a predicate and giving it an argument. The
 
 | Slot | Accepts | Shown as |
 |---|---|---|
-| `{"groups_in": "dba"}` | Someone whose `groups` claim includes `dba` | someone in the dba group |
-| `{"groups_in": ["dba", "sre"]}` | Someone in at least one of the groups | someone in one of the groups dba, sre |
-| `{"claim_equals": ["workflow", "deploy-prod"]}` | Someone whose `workflow` claim is exactly `deploy-prod` | someone whose workflow is deploy-prod |
-| `{"claim_contains": ["roles", "admin"]}` | Someone whose `roles` claim is a list that includes `admin` | someone whose roles include admin |
-| `{"anyone": true}` | Any logged-in person | anyone |
+| `{ groups_in = "dba" }` | Someone whose `groups` claim includes `dba` | someone in the dba group |
+| `{ groups_in = ["dba", "sre"] }` | Someone in at least one of the groups | someone in one of the groups dba, sre |
+| `{ claim_equals = ["workflow", "deploy-prod"] }` | Someone whose `workflow` claim is exactly `deploy-prod` | someone whose workflow is deploy-prod |
+| `{ claim_contains = ["roles", "admin"] }` | Someone whose `roles` claim is a list that includes `admin` | someone whose roles include admin |
+| `{ anyone = true }` | Any logged-in person | anyone |
 
 A predicate is two Rego clauses: `holds` says who it accepts, and `describe` says the same in words. The catalog shows the description, so what people read comes from the rule that is enforced.
 
@@ -522,11 +550,11 @@ describe(name, argument) := core.describe(name, argument)
 describe(name, argument) := oncall.describe(name, argument)
 ```
 
-A slot can now say `{"oncall_sre": true}`. The argument is yours to define: a string, a list, an object, or nothing you look at.
+A slot can now say `{ oncall_sre = true }`. The argument is yours to define: a string, a list, an object, or nothing you look at.
 
 - **Libraries.** A file like `oncall.rego` is self-contained, so it can be shared between hosts or teams and dropped into the policy directory, or put in a bundle for an OPA server. `policy/predicates.rego` is the list of libraries this agent uses.
 - **One file per package.** Keep each library's clauses in a single file and give each library its own package. The embedded engine can't resolve a function whose clauses are spread over several files.
-- **Unknown predicates accept no one.** A slot naming a predicate that no listed library defines is shown in the catalog as written, marked as not defined, and nobody can fill it. A slot with no predicate, or with two, is rejected as unreadable.
+- **Unknown predicates accept no one.** A slot naming a predicate that no listed library defines is shown in the catalog as written, marked as not defined, and nobody can fill it. A slot with no predicate, or with two, stops the agent at startup.
 - **Two libraries defining the same name** both apply to who is accepted, and their descriptions conflict, which makes the description an error. Give predicates distinct names.
 - **Test them.** Add tests beside the shipped ones in `policy_test/`.
 
@@ -632,7 +660,7 @@ This release changes what agents accept, with no compatibility mode:
 This release replaces approver/operator bundles, again with no compatibility mode:
 
 1. **Requests, not delegation.** A request is `{command, approvals}`; each approval is an independent signature over the same payload. `operator_requires`, co-signing and `remonce cosign` are gone. Signers, CLIs and agents reject each other's formats across versions, and name the old one when they see it. Re-create outstanding requests.
-2. **Move rules into requirement documents.** What `operator_requires` said (who may run it) and any four-eyes rules (`not input.self_executed`) become a command's `executors` and `approvals` in `policy/requirements.json`; see [Requirement documents](#requirement-documents). OPA input changed: `input.approver` / `input.operator` / `input.self_executed` are replaced by `input.approvers`, `input.executor` and `input.request_id`. The shipped policy denies commands with no document.
+2. **Move rules into requirement documents.** What `operator_requires` said (who may run it) and any four-eyes rules (`not input.self_executed`) become a command's `executors` and `approvals` (since moved into the command's own entry; see [Who may approve and run a command](#who-may-approve-and-run-a-command)). OPA input changed: `input.approver` / `input.operator` / `input.self_executed` are replaced by `input.approvers`, `input.executor` and `input.request_id`. The shipped policy denies commands with no document.
 3. **Replace validity settings.** `approver_max_validity` and `operator_max_validity` are replaced by `approval_validity`; the old keys are rejected with a hint.
 4. **Agents need `viewer_client_id`.** Submitting a request now requires a viewer login, which identifies the executor.
 5. **Upgrade agents and the revocation service together**, and archive the revocation log. Revocations are now by request id at `/v2/revoked/{request_id}`, and the service refuses to start on an older `revocations.jsonl`.
@@ -644,21 +672,23 @@ Policy is now evaluated inside remonce by default:
 1. **No `opa_url` means embedded.** It used to default to `http://localhost:8181`; now, without `opa_url`, the agent and revocation service read `policy_dir` (default `policy/`) themselves. Keep a running OPA by setting `opa_url` explicitly.
 2. **Viewing input carries verified claims.** `read_file`, `view_execution` and `view_docs` decisions now get `input.viewer` (`username` and the agent-verified `claims`) instead of the raw viewer token as `input.jwt`, so policies don't need `io.jwt.decode` and bearer tokens stay out of OPA's decision logs. Replace `io.jwt.decode(input.jwt)` payload lookups with `input.viewer.claims`.
 
-## Upgrading to predicates in requirement documents
+## Upgrading to predicates and requirements in the command's entry
 
-Slots no longer use the `any_of` predicate language; they name a predicate defined in Rego. There is no compatibility mode: a document in the old form is shown in the catalog as unreadable, and its command is refused.
+Two things changed together, with no compatibility mode. Slots no longer use the `any_of` predicate language; they name a predicate defined in Rego. And a command's requirement is no longer a document in `policy/requirements.json`; it is two settings on the command.
 
-1. **Rewrite the slots.**
+1. **Move each requirement onto its command.** For every entry in `policy/requirements.json`, add `approvals` and `executors` (and `additional_policy`, if set) to that command in `config.toml` or a `config.d` file, above any `[[commands.params]]`. Then delete `requirements.json`: `data.remonce.requirements` is no longer read. A command left without the two settings is refused.
+2. **Rewrite the slots as you move them.**
 
-   | Before | After |
+   | Before (JSON) | After (TOML) |
    |---|---|
-   | `{"any_of": [{"op": "contains", "claim": "groups", "value": "dba"}]}` | `{"groups_in": "dba"}` |
-   | Two `contains` predicates on `groups` in one `any_of` | `{"groups_in": ["dba", "sre"]}` |
-   | `{"any_of": [{"op": "equals", "claim": "team", "value": "db"}]}` | `{"claim_equals": ["team", "db"]}` |
-   | `{"any_of": [{"op": "contains", "claim": "roles", "value": "admin"}]}` | `{"claim_contains": ["roles", "admin"]}` |
-   | `{"any_of": []}` | `{"anyone": true}` |
+   | `{"any_of": [{"op": "contains", "claim": "groups", "value": "dba"}]}` | `{ groups_in = "dba" }` |
+   | Two `contains` predicates on `groups` in one `any_of` | `{ groups_in = ["dba", "sre"] }` |
+   | `{"any_of": [{"op": "equals", "claim": "team", "value": "db"}]}` | `{ claim_equals = ["team", "db"] }` |
+   | `{"any_of": [{"op": "contains", "claim": "roles", "value": "admin"}]}` | `{ claim_contains = ["roles", "admin"] }` |
+   | `{"any_of": []}` | `{ anyone = true }` |
 
-   A slot's `description`, and the document's, are gone: the words come from the predicate. For wording of your own, write a predicate ([Predicates](#predicates)).
-2. **Take the new policy files.** `policy/lib.rego` changed, and `policy/predicates.rego` and `policy/predicates/core.rego` are new. Put them in your policy directory, and in the bundle if you use an OPA server.
-3. **Check your own Rego.** `lib.accepts(slot, person)` now takes the person (`{username, claims}`) where it took their claims.
-4. **Upgrade signers and agents together.** The catalog's shape changed, and the signer now asks the agent which slots a request's approvals fill.
+   A slot's `description`, and the document's, are gone: the words come from the predicate. For wording of your own, write a predicate ([Predicates](#predicates)). A slot still in the old form stops the agent at startup with a message naming the replacement.
+3. **Take the new policy files.** `policy/authz.rego` and `policy/lib.rego` changed, and `policy/predicates.rego` and `policy/predicates/core.rego` are new. Put them in your policy directory, and in the bundle if you use an OPA server. An OPA server no longer needs any per-command data.
+4. **Check your own Rego.** The requirement is `input.requirement` where it was `data.remonce.requirements[input.command.command]`, and `lib.accepts(slot, person)` takes the person (`{username, claims}`) where it took their claims.
+5. **Expect a restart to change who may use a command.** These are settings now, read when the agent starts. Rego is still picked up on the next request.
+6. **Upgrade signers and agents together.** The catalog's shape changed, and the signer now asks the agent which slots a request's approvals fill.

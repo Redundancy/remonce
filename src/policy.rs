@@ -4,8 +4,8 @@
 //!   in-process with [Regorus](https://github.com/microsoft/regorus), so
 //!   there is no OPA server to run. The directory is laid out as for
 //!   `opa run`: every `.rego` file is a module, and every `.json` or
-//!   `.yaml` file is data mounted at its directory's path (`policy/requirements.json` at
-//!   `data`, `policy/x/y.json` at `data.x`). Edits are picked up on the
+//!   `.yaml` file is data mounted at its directory's path (`policy/x/y.json` at
+//!   `data.x`). Edits are picked up on the
 //!   next decision.
 //! - **Remote**: an OPA server at `opa_url`, asked through its data API.
 //!
@@ -37,13 +37,17 @@ pub struct Identity {
 #[derive(Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RequestInput {
-    /// Run a request: the approvers so far and who is submitting it.
+    /// Run a request: the approvers so far, who is submitting it, and what
+    /// the agent's config says the command needs (left out when it says
+    /// nothing, so policy sees no requirement rather than a null one).
     Execute {
         command: serde_json::Value,
         request_id: String,
         approvers: Vec<Signer>,
         executor: Identity,
         host: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requirement: Option<crate::requirements::Requirement>,
     },
     /// Cancel someone else's request.
     Revoke {
@@ -73,8 +77,6 @@ pub struct Decision {
 
 /// Where viewing decisions come from.
 const VIEW_RULE: &str = "data.remonce.authz.allow";
-/// Where requirement documents are published.
-const REQUIREMENTS: &str = "data.remonce.requirements";
 /// The display helpers in the shipped `lib.rego`: words for a requirement's
 /// slots, and which people each approval slot would accept.
 const DESCRIPTIONS: &str = "data.remonce.lib.descriptions";
@@ -133,16 +135,6 @@ impl Policy {
     /// Whether `data.remonce.authz.allow` permits a viewing action.
     pub async fn allows_viewing(&self, input: &ViewInput) -> Result<bool, String> {
         Ok(self.eval(input, VIEW_RULE).await? == serde_json::Value::Bool(true))
-    }
-
-    /// The published requirement documents, by command name. None published
-    /// is an empty map.
-    pub async fn requirements(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-        match self.eval(&serde_json::json!({}), REQUIREMENTS).await? {
-            serde_json::Value::Null => Ok(Default::default()),
-            serde_json::Value::Object(m) => Ok(m),
-            _ => Err(format!("{REQUIREMENTS} is not an object")),
-        }
     }
 
     /// Policy's words for the slots of each requirement in `requirements`
@@ -383,6 +375,14 @@ mod tests {
         }
     }
 
+    /// The commands in the shipped `config.toml`, which say who may approve
+    /// and run each of them.
+    fn shipped_config() -> crate::config::Config {
+        crate::config::parse(include_str!("../config.toml")).expect("shipped config parses")
+    }
+
+    /// An execution of one of the shipped commands, with its requirement
+    /// as the agent would send it.
     fn execute(command: &str, approvers: Vec<Signer>, executor_groups: &[&str]) -> RequestInput {
         RequestInput::Execute {
             command: serde_json::json!({ "command": command }),
@@ -393,6 +393,11 @@ mod tests {
                 claims: serde_json::json!({ "sub": "carol", "groups": executor_groups }),
             },
             host: "agent-01".into(),
+            requirement: shipped_config()
+                .commands
+                .iter()
+                .find(|c| c.name == command)
+                .and_then(|c| c.requirement()),
         }
     }
 
@@ -409,6 +414,10 @@ mod tests {
         assert_eq!(v["approvers"][1]["username"], "bob");
         assert_eq!(v["executor"]["claims"]["sub"], "carol");
         assert_eq!(v["request_id"], "ab");
+        assert_eq!(v["requirement"]["approvals"], serde_json::json!([{ "groups_in": "webapp-users" }]));
+        // A command that says nothing sends no requirement at all.
+        let v = serde_json::to_value(execute("fail", vec![], &[])).unwrap();
+        assert!(v.get("requirement").is_none(), "{v}");
     }
 
     #[test]
@@ -435,7 +444,7 @@ mod tests {
 
         let d = p.decide(rule, &execute("ping-pair", vec![signer("alice", &users)], &users)).await.unwrap();
         assert!(!d.allow);
-        assert_eq!(d.reason, "The approvals do not meet the published requirements");
+        assert_eq!(d.reason, "The approvals do not meet this command's requirements");
 
         let two = vec![signer("alice", &users), signer("bob", &users)];
         assert!(p.decide(rule, &execute("ping-pair", two, &users)).await.unwrap().allow);
@@ -444,7 +453,7 @@ mod tests {
         assert_eq!(d.reason, "You are not allowed to execute this command");
 
         let d = p.decide(rule, &execute("fail", vec![signer("alice", &users)], &users)).await.unwrap();
-        assert_eq!(d.reason, "No published requirements for 'fail'");
+        assert_eq!(d.reason, "No approvals and executors are set for 'fail'");
 
         let d = p.decide("data.remonce.nothing.here", &execute("test", vec![], &[])).await.unwrap();
         assert!(!d.allow, "an undefined decision denies");
@@ -461,12 +470,12 @@ mod tests {
         assert!(!p.allows_viewing(&ViewInput::ViewDocs { viewer: viewer(&[]) }).await.unwrap());
         assert!(!p.allows_viewing(&ViewInput::ReadFile { viewer: viewer(&["other"]), file: serde_json::json!({}) }).await.unwrap());
 
-        let reqs = p.requirements().await.unwrap();
+        let reqs = crate::catalog::requirements(&shipped_config());
         assert!(reqs.contains_key("ping-pair"));
         assert_eq!(reqs["ping-pair"]["approvals"].as_array().unwrap().len(), 2);
 
-        // Every slot of every shipped requirement has words, so none names
-        // a predicate the shipped libraries don't define.
+        // Every slot of every shipped command has words, so none names a
+        // predicate the shipped libraries don't define.
         let described = p.describe_slots(&reqs).await.unwrap();
         for (name, req) in &reqs {
             let d = &described[name];
@@ -659,8 +668,7 @@ describe("groups_in", team) := sprintf("someone on team %s", [team])
                 remote.allows_viewing(&ViewInput::ViewDocs { viewer: viewer() }).await.unwrap()
             );
         }
-        let reqs = embedded.requirements().await.unwrap();
-        assert_eq!(reqs, remote.requirements().await.unwrap());
+        let reqs = crate::catalog::requirements(&shipped_config());
         assert_eq!(embedded.describe_slots(&reqs).await.unwrap(), remote.describe_slots(&reqs).await.unwrap());
         let people = || {
             [&["webapp-users"][..], &["other"][..]].map(|groups| Identity {
@@ -687,8 +695,9 @@ x := 1
   - alice
 ").unwrap();
         let p = Policy::Embedded(Box::new(Embedded::load(&dir).unwrap()));
-        assert!(p.requirements().await.unwrap().contains_key("a"));
         let Policy::Embedded(e) = &p else { unreachable!() };
+        let root = e.eval(&serde_json::json!({}), "data.remonce.requirements").unwrap();
+        assert_eq!(root, serde_json::json!({ "a": {} }));
         let owners = e.eval(&serde_json::json!({}), "data.teams.db.owners").unwrap();
         assert_eq!(owners, serde_json::json!(["alice"]));
         let _ = std::fs::remove_dir_all(&dir);

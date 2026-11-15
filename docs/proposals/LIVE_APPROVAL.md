@@ -22,23 +22,22 @@ A decision is `{ allow, reason }` today. The proposal adds an optional third fie
 ```json
 {
   "allow": false,
-  "reason": "The approvals do not meet the published requirements",
+  "reason": "The approvals do not meet this command's requirements",
   "needs": [
-    { "description": "a DBA",
-      "any_of": [{ "op": "contains", "claim": "groups", "value": "dba" }] }
+    { "slot": { "groups_in": "dba" }, "description": "someone in the dba group" }
   ]
 }
 ```
 
-- `needs` lists approval slots in the shape requirement documents already use, so the UI and the approval server can show and route them with no new vocabulary.
+- `needs` lists approval slots as the catalog already shows them, each with its predicate and policy's words for it, so the UI and the approval server can show and route them with no new vocabulary.
 - It means: denied now, and approvals filling these slots would change that.
 - A denial without `needs` is final. An executor who is not allowed, or a host restriction, never causes a callout.
-- Rego can name one person: a slot with `{"op": "equals", "claim": "username", "value": "alice"}` asks for Alice.
+- Rego can name one person: a slot with `{"claim_equals": ["username", "alice"]}` asks for Alice.
 - `needs` only routes. After approvals arrive the agent verifies them and evaluates the whole policy again, so a wrong `needs` wastes a prompt and nothing more.
 
 `needs` is useful with no approval server at all: the CLI and the UI can say "still needs: a DBA" in place of today's general reason.
 
-The shipped `lib.rego` would compute the unfilled slots for requirement documents. Policies written directly in Rego set `needs` themselves. Viewing actions are a plain boolean `allow` today and would need the decision object to take part.
+The shipped `lib.rego` would compute the unfilled slots of a command's requirement. Policies written directly in Rego set `needs` themselves. Viewing actions are a plain boolean `allow` today and would need the decision object to take part.
 
 ## Flow
 
@@ -76,7 +75,7 @@ Like remote OPA, it is a deployment choice, made per agent in config, and the al
 
 One measure keeps the choice per agent. The approval server gets its own signing client at the IdP, and an agent accepts approvals for that client only if its config says so. Without that, an approval signed at the approval server would be accepted by every agent that shares the IdP, including ones that never chose to trust it. The agent would take a list of signing clients where it takes one today.
 
-The token's audience then also records where each approval was signed. A policy that wants the local signer for particular commands can check it; nothing new is needed in requirement documents.
+The token's audience then also records where each approval was signed. A policy that wants the local signer for particular commands can check it; nothing new is needed in a command's requirement.
 
 ## Notifications and plugins
 
