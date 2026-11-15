@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// Application configuration structure, verified against `config.toml` at startup.
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -288,7 +290,9 @@ pub struct CommandConfig {
     /// A human-readable description of what this command does.
     pub description: Option<String>,
 
-    /// The OPA rule path to query for authorization (e.g., "data.remonce.authz.decision").
+    /// The policy rule asked whether a request for this command may run.
+    /// Defaults to the shipped policy's decision, `DEFAULT_OPA_RULE`.
+    #[serde(default = "default_opa_rule")]
     pub opa_rule: String,
 
     /// The actual executable binary to run.
@@ -365,6 +369,14 @@ pub struct ParamConfig {
     pub max: Option<i64>,
 }
 
+/// The shipped policy's decision rule: what a command's `opa_rule` is when it
+/// doesn't set one.
+pub const DEFAULT_OPA_RULE: &str = "data.remonce.authz.decision";
+
+fn default_opa_rule() -> String {
+    DEFAULT_OPA_RULE.to_string()
+}
+
 pub const DEFAULT_APPROVAL_VALIDITY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -437,27 +449,196 @@ const REMOVED_COMMAND_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Parse configuration text.
-pub fn parse(text: &str) -> Result<Config, String> {
-    if let Ok(table) = text.parse::<toml::Table>()
-        && let Some(commands) = table.get("commands").and_then(|c| c.as_array())
-    {
-        for cmd in commands {
-            let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-            for (key, hint) in REMOVED_COMMAND_KEYS {
-                if cmd.get(*key).is_some() {
-                    return Err(format!("command '{name}': `{key}` is no longer supported: {hint}"));
-                }
+/// The directory of drop-in files, beside the main configuration file.
+pub const DROP_IN_DIR: &str = "config.d";
+
+/// Top-level lists that add up across files. Every other setting may be set
+/// in one file only.
+const ADDITIVE_LISTS: &[&str] = &["commands", "files"];
+
+fn check_removed_keys(table: &toml::Table) -> Result<(), String> {
+    let Some(commands) = table.get("commands").and_then(|c| c.as_array()) else {
+        return Ok(());
+    };
+    for cmd in commands {
+        let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        for (key, hint) in REMOVED_COMMAND_KEYS {
+            if cmd.get(*key).is_some() {
+                return Err(format!("command '{name}': `{key}` is no longer supported: {hint}"));
             }
         }
     }
-    toml::from_str(text).map_err(|e| e.to_string())
+    Ok(())
 }
 
-/// Read and parse a configuration file.
+/// A command name may be offered once: requests name a command, and two
+/// definitions would leave which one runs to the order of the files.
+fn check_duplicate_commands(config: &Config) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for c in &config.commands {
+        if !seen.insert(c.name.as_str()) {
+            return Err(format!("command '{}' is defined more than once", c.name));
+        }
+    }
+    Ok(())
+}
+
+/// Parse configuration text.
+pub fn parse(text: &str) -> Result<Config, String> {
+    if let Ok(table) = text.parse::<toml::Table>() {
+        check_removed_keys(&table)?;
+    }
+    let config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+    check_duplicate_commands(&config)?;
+    Ok(config)
+}
+
+/// Read the configuration: the file at `path`, then every `.toml` file in
+/// the `config.d` directory beside it, in name order.
+///
+/// Drop-in files use the same settings as the main file. `[[commands]]` and
+/// `[[files]]` add up across files, so one file can hold one command. Tables
+/// such as `[agent]` may be filled in from several files. Any single setting
+/// given in two files is an error naming both, as is a command name defined
+/// twice: nothing overrides anything.
 pub fn load(path: &str) -> Result<Config, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("Failed to read {path}: {e}"))?;
-    parse(&text).map_err(|e| format!("Failed to parse {path}: {e}"))
+    let main = Path::new(path);
+    let text = read(main)?;
+    let drop_ins = drop_in_files(main)?;
+    if drop_ins.is_empty() {
+        return parse(&text).map_err(|e| format!("Failed to parse {path}: {e}"));
+    }
+
+    let mut merged = toml::Table::new();
+    let mut origins = BTreeMap::new();
+    let mut command_origins: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut texts = vec![(main.to_path_buf(), text)];
+    for file in &drop_ins {
+        texts.push((file.clone(), read(file)?));
+    }
+    for (file, text) in &texts {
+        let table: toml::Table = text
+            .parse()
+            .map_err(|e| format!("Failed to parse {}: {e}", file.display()))?;
+        check_removed_keys(&table).map_err(|e| format!("{}: {e}", file.display()))?;
+        for cmd in table.get("commands").and_then(|c| c.as_array()).into_iter().flatten() {
+            let Some(name) = cmd.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            if let Some(first) = command_origins.insert(name.to_string(), file.clone()) {
+                return Err(format!(
+                    "command '{name}' is defined in both {} and {}",
+                    first.display(),
+                    file.display()
+                ));
+            }
+        }
+        merge_tables(&mut merged, table, "", file, &mut origins)?;
+    }
+
+    let config: Config = merged.try_into().map_err(|e: toml::de::Error| {
+        // The merged tables have lost their line numbers. If one file is
+        // wrong by itself, say which and where.
+        for (file, text) in &texts {
+            if let Err(own) = toml::from_str::<Config>(text)
+                && own.message().starts_with("unknown field")
+            {
+                return format!("Failed to parse {}: {own}", file.display());
+            }
+        }
+        format!("Failed to parse {path} with the files in {}: {e}", drop_in_dir(main).display())
+    })?;
+    tracing::info!(
+        files = drop_ins.len(),
+        dir = %drop_in_dir(main).display(),
+        "Read configuration drop-ins"
+    );
+    Ok(config)
+}
+
+fn read(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))
+}
+
+fn drop_in_dir(main: &Path) -> PathBuf {
+    main.parent().unwrap_or(Path::new("")).join(DROP_IN_DIR)
+}
+
+/// The `.toml` files in the drop-in directory, in name order. No directory
+/// means no drop-ins; other files in it (backups, editor swap files) are
+/// ignored.
+fn drop_in_files(main: &Path) -> Result<Vec<PathBuf>, String> {
+    let dir = drop_in_dir(main);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Failed to read {}: {e}", dir.display())),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|e| format!("Failed to read {}: {e}", dir.display()))?.path();
+        let hidden = path.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if path.is_file() && !hidden && path.extension().is_some_and(|e| e == "toml") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Record which file set every value under `value`, by dotted path.
+fn record_origins(value: &toml::Value, path: &str, file: &Path, origins: &mut BTreeMap<String, PathBuf>) {
+    match value {
+        toml::Value::Table(t) => {
+            for (k, v) in t {
+                record_origins(v, &format!("{path}.{k}"), file, origins);
+            }
+        }
+        _ => {
+            origins.insert(path.to_string(), file.to_path_buf());
+        }
+    }
+}
+
+/// Merge `from` (read from `file`) into `into`. Tables merge key by key and
+/// the additive lists are appended to; anything else already present is a
+/// conflict.
+fn merge_tables(
+    into: &mut toml::Table,
+    from: toml::Table,
+    prefix: &str,
+    file: &Path,
+    origins: &mut BTreeMap<String, PathBuf>,
+) -> Result<(), String> {
+    for (key, value) in from {
+        let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+        match (into.get_mut(&key), value) {
+            (None, value) => {
+                record_origins(&value, &path, file, origins);
+                into.insert(key, value);
+            }
+            (Some(toml::Value::Array(have)), toml::Value::Array(more))
+                if prefix.is_empty() && ADDITIVE_LISTS.contains(&key.as_str()) =>
+            {
+                have.extend(more);
+            }
+            (Some(toml::Value::Table(have)), toml::Value::Table(more)) => {
+                merge_tables(have, more, &path, file, origins)?;
+            }
+            (Some(_), _) => {
+                let first = origins
+                    .iter()
+                    .find(|(p, _)| *p == &path || p.starts_with(&format!("{path}.")))
+                    .map(|(_, f)| f.display().to_string())
+                    .unwrap_or_else(|| "an earlier file".into());
+                return Err(format!(
+                    "`{path}` is set in both {first} and {}; a setting may be given in one file only",
+                    file.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Config {
@@ -504,6 +685,102 @@ issuer_url = \"https://idp.example\"
             let err = parse(&text).unwrap_err();
             assert!(err.contains(key) && err.contains("approval_validity"), "{err}");
         }
+    }
+
+    #[test]
+    fn opa_rule_defaults_to_the_shipped_decision() {
+        let cfg = parse("[[commands]]\nname = \"x\"\n").unwrap();
+        assert_eq!(cfg.commands[0].opa_rule, DEFAULT_OPA_RULE);
+    }
+
+    #[test]
+    fn a_command_defined_twice_is_rejected() {
+        let err = parse("[[commands]]\nname = \"x\"\n\n[[commands]]\nname = \"x\"\n").unwrap_err();
+        assert!(err.contains("'x'") && err.contains("more than once"), "{err}");
+    }
+
+    /// A fresh directory holding `config.toml` and the given drop-ins.
+    fn config_dir(tag: &str, main: &str, drop_ins: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("remonce-config-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), main).unwrap();
+        if !drop_ins.is_empty() {
+            std::fs::create_dir_all(dir.join(DROP_IN_DIR)).unwrap();
+        }
+        for (name, text) in drop_ins {
+            std::fs::write(dir.join(DROP_IN_DIR).join(name), text).unwrap();
+        }
+        dir
+    }
+
+    fn load_dir(dir: &Path) -> Result<Config, String> {
+        let result = load(&dir.join("config.toml").to_string_lossy());
+        let _ = std::fs::remove_dir_all(dir);
+        result
+    }
+
+    const MAIN: &str = "[oidc]\nissuer_url = \"https://idp.example\"\nsigning_client_id = \"s\"\n\n\
+        [[commands]]\nname = \"base\"\n";
+
+    #[test]
+    fn drop_ins_add_commands_and_files_in_name_order() {
+        let dir = config_dir(
+            "adds",
+            MAIN,
+            &[
+                ("20-restart.toml", "[[commands]]\nname = \"restart\"\nexecutable = \"systemctl\"\n\n[[commands.params]]\nname = \"service\"\n"),
+                ("10-logs.toml", "[[files]]\npath = \"/var/log/*.log\"\n\n[[commands]]\nname = \"tail\"\n"),
+                ("notes.txt", "not configuration"),
+                (".hidden.toml", "[[commands]]\nname = \"hidden\"\n"),
+            ],
+        );
+        let cfg = load_dir(&dir).unwrap();
+        let names: Vec<_> = cfg.commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["base", "tail", "restart"]);
+        assert_eq!(cfg.commands[2].params[0].name, "service");
+        assert_eq!(cfg.files.len(), 1);
+        assert_eq!(cfg.oidc.signing_client_id, "s");
+    }
+
+    #[test]
+    fn a_table_can_be_filled_in_from_several_files() {
+        let dir = config_dir(
+            "tables",
+            "[agent]\nlisten_address = \"0.0.0.0:443\"\n",
+            &[("tls.toml", "[agent.tls]\nmode = \"files\"\nchain = \"c.pem\"\nkey = \"k.pem\"\n")],
+        );
+        let agent = load_dir(&dir).unwrap().agent.unwrap();
+        assert_eq!(agent.listen_address, "0.0.0.0:443");
+        assert!(matches!(agent.tls, TlsConfig::Files { .. }));
+    }
+
+    #[test]
+    fn a_setting_given_in_two_files_is_rejected() {
+        let dir = config_dir("conflict", MAIN, &[("oidc.toml", "[oidc]\nissuer_url = \"https://other.example\"\n")]);
+        let err = load_dir(&dir).unwrap_err();
+        assert!(err.contains("`oidc.issuer_url`"), "{err}");
+        assert!(err.contains("config.toml") && err.contains("oidc.toml"), "{err}");
+    }
+
+    #[test]
+    fn a_command_defined_in_two_files_is_rejected() {
+        let dir = config_dir("dup", MAIN, &[("again.toml", "[[commands]]\nname = \"base\"\n")]);
+        let err = load_dir(&dir).unwrap_err();
+        assert!(err.contains("'base'") && err.contains("again.toml"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelled_setting_in_a_drop_in_names_the_file() {
+        let dir = config_dir("typo", MAIN, &[("typo.toml", "[[commands]]\nname = \"x\"\nexecutible = \"ls\"\n")]);
+        let err = load_dir(&dir).unwrap_err();
+        assert!(err.contains("typo.toml") && err.contains("executible"), "{err}");
+    }
+
+    #[test]
+    fn no_drop_in_directory_is_just_the_main_file() {
+        let dir = config_dir("plain", MAIN, &[]);
+        assert_eq!(load_dir(&dir).unwrap().commands.len(), 1);
     }
 
     #[test]

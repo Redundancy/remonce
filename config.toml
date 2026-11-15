@@ -43,18 +43,15 @@ redirect_uri = "http://localhost:8080/oidc/callback"
 [[commands]]
 name = "test"
 description = "A basic test command to verify connectivity."
-opa_rule = "data.remonce.authz.decision"
 approval_validity = "1d" # Optional: how long each approval stays usable (default 1h)
 
 [[commands]]
 name = "fail"
 description = "A command designed to fail for testing error handling."
-opa_rule = "data.remonce.authz.decision"
 
 [[commands]]
 name = "ping-test"
 description = "Pings localhost a configurable number of times to test execution streaming."
-opa_rule = "data.remonce.authz.decision"
 executable = "ping"
 # {{count}} is substituted from the signed `params` after validation.
 args = ["-n", "{{count}}", "127.0.0.1"]
@@ -74,7 +71,6 @@ max = 100
 [[commands]]
 name = "ping-pair"
 description = "Pings localhost; needs two people to approve."
-opa_rule = "data.remonce.authz.decision"
 executable = "ping"
 args = ["-n", "{{count}}", "127.0.0.1"]
 

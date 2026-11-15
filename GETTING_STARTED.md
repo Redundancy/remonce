@@ -27,7 +27,7 @@ When someone submits an approved request, the agent:
 
 1. checks every approval's signature, login and timestamp, and that the approvers are different people;
 2. checks the request is for this machine and its parameters are valid (from `config.toml`);
-3. asks the policy for a decision: it evaluates the command's `opa_rule` — `data.remonce.authz.decision` for all the shipped commands — with the request, the approvers' verified claims and the executor's as `input`;
+3. asks the policy for a decision: it evaluates the shipped decision rule, `data.remonce.authz.decision`, unless the command names another with `opa_rule`, with the request, the approvers' verified claims and the executor's as `input`;
 4. runs the command if the decision is `{"allow": true}`, and otherwise returns the decision's `reason`.
 
 The shipped decision is: *allow if the command's requirement document is satisfied, unless an extra rule denies it*. A command with no requirement document is denied. So a new command does nothing until you say who may use it — which is the point.
@@ -129,13 +129,14 @@ Add to `config.toml`, alongside the other `[[commands]]`:
 [[commands]]
 name = "show-host"
 description = "Print this machine's name."
-opa_rule = "data.remonce.authz.decision"
 executable = "hostname"
 ```
 
 `name` is all a request ever mentions; `executable` and `args` stay on the host, so nobody can make it run anything else. (Commands start with an empty environment; on Linux or macOS, if `hostname` isn't found, add `env = { PATH = "/usr/bin:/bin" }`.)
 
-Restart the agent (`config.toml` is read at startup) and reload the Commands page. `show-host` appears with **No published requirements**, and approving and running it would be refused with `No published requirements for 'show-host'`. The machine offers it, but nobody has said who may use it.
+You can also put the command in a file of its own, such as `config.d/show-host.toml`, with the same three lines: the agent reads every `.toml` file in `config.d` after `config.toml` ([CONFIGURATION.md](CONFIGURATION.md#splitting-it-up-configd)).
+
+Restart the agent (configuration is read at startup) and reload the Commands page. `show-host` appears with **No published requirements**, and approving and running it would be refused with `No published requirements for 'show-host'`. The machine offers it, but nobody has said who may use it.
 
 **Parameters** work the same way: declared in `config.toml`, validated before anything runs, substituted into `args`. The sample `ping-test` shows one (it's written for Windows `ping`; on Linux and macOS use `-c` instead of `-n`):
 

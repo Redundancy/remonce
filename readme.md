@@ -128,7 +128,7 @@ None of these is imposed from outside. Each agent's own config says what that ag
 
 This is the short version. [CONFIGURATION.md](CONFIGURATION.md) has every setting, and [GETTING_STARTED.md](GETTING_STARTED.md) walks through a working setup on one machine.
 
-Every mode reads `config.toml` from the directory it is started in, and ignores the sections it doesn't use. A misspelled setting stops startup.
+Every mode reads `config.toml` from the directory it is started in, then any files in `config.d` beside it, and ignores the sections it doesn't use. A misspelled setting stops startup.
 
 ### 1. Register two clients with your identity provider
 
@@ -166,7 +166,6 @@ key = "certs/agent-key.pem"
 [[commands]]
 name = "restart-service"
 description = "Restart one of this host's services"
-opa_rule = "data.remonce.authz.decision"
 executable = "systemctl"
 args = ["restart", "{{service}}"]
 env = { PATH = "/usr/bin:/bin" }  # commands start with an empty environment
@@ -184,6 +183,8 @@ description = "nginx access and error logs"
 The agent only speaks HTTPS. With `mode = "files"` it picks up a renewed certificate without a restart. With `mode = "acme"` it gets and renews its own; see [the ACME section](CONFIGURATION.md#mode-acme-production) for the ports that needs.
 
 A request only ever names a command. The executable and its arguments stay in this file, and a parameter value is checked against its rule before anything runs.
+
+The agent also reads every `.toml` file in a `config.d` directory beside `config.toml`. Commands and files from all of them add up, so you can keep one command per file and give a machine the files for its role, with a `config.toml` that is the same everywhere. A setting given in two files is an error; nothing overrides anything. See [Splitting it up](CONFIGURATION.md#splitting-it-up-configd).
 
 ### 3. Say who may use each command
 

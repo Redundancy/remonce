@@ -8,6 +8,34 @@ Both `remonce web` (the signer) and `remonce agent` (the executor) read the same
 
 Unknown keys are rejected at startup: a misspelled setting (say `approval_valid` instead of `approval_validity`) fails loudly instead of silently falling back to a default.
 
+### Splitting it up (`config.d`)
+
+After `config.toml`, every mode reads each `.toml` file in a `config.d` directory beside it, in name order. Drop-in files use the same settings as `config.toml`, so nothing new has to be learned:
+
+```toml
+# config.d/restart-service.toml
+[[commands]]
+name = "restart-service"
+executable = "systemctl"
+args = ["restart", "{{service}}"]
+
+[[commands.params]]
+name = "service"
+allowed = ["nginx", "postgres"]
+```
+
+This lets a machine be set up by choosing files instead of templating one: a `config.toml` that is the same on every machine, and one file per command or log for what this machine offers. With cloud-init, that is one `write_files` entry per file.
+
+How files combine:
+
+- `[[commands]]` and `[[files]]` add up across files.
+- A table such as `[agent]` can be filled in from several files: `[agent]` in `config.toml` and `[agent.tls]` in `config.d/tls.toml`, say.
+- A single setting given in two files is an error that names both. Nothing overrides anything, so the order of the files never changes what a setting means.
+- A command name defined twice is an error, in one file or across several.
+- Files that don't end in `.toml`, and files whose names start with a dot, are ignored. There is no `config.d` inside `config.d`.
+
+Like `config.toml`, drop-ins are read at startup; restart the agent after adding or changing one.
+
 ### Deployment model
 
 Remonce is designed around a split:
@@ -325,9 +353,12 @@ Define the commands that can be executed by the agent.
 [[commands]]
 name = "ping-test"
 description = "Pings localhost for connectivity check."
-opa_rule = "data.remonce.authz.decision" # The OPA rule to query for authorization
 executable = "ping"
 args = ["-n", "4", "127.0.0.1"]
+
+# Optional: the policy rule asked whether a request for this command may
+# run. Default: the shipped policy's decision.
+opa_rule = "data.remonce.authz.decision"
 
 # Optional: wall-clock timeout. Once exceeded, the agent kills the command,
 # along with every process it started, and writes a TIMEOUT trailer into
@@ -363,7 +394,6 @@ after approval.
 ```toml
 [[commands]]
 name = "restart-service"
-opa_rule = "data.remonce.authz.decision"
 executable = "systemctl"
 args = ["restart", "{{service}}"]
 

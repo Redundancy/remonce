@@ -38,9 +38,6 @@ pub struct RevocationCtx<'a> {
     pub allow_unknown_commands: bool,
 }
 
-/// Default OPA rule for revocations of commands this process doesn't know.
-const DEFAULT_OPA_RULE: &str = "data.remonce.authz.decision";
-
 pub struct VerifiedRevocation {
     pub authorized: crate::security::AuthorizedRevocation,
     /// Until when to keep the revocation.
@@ -79,7 +76,7 @@ pub async fn verify_and_authorize(
         Some(c) => (c.approval_validity_or_default(), c.opa_rule.clone()),
         None if ctx.allow_unknown_commands => (
             crate::config::DEFAULT_APPROVAL_VALIDITY,
-            DEFAULT_OPA_RULE.to_string(),
+            crate::config::DEFAULT_OPA_RULE.to_string(),
         ),
         None => {
             deny(
