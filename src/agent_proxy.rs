@@ -194,6 +194,42 @@ pub async fn commands_proxy(
     passthrough(resp).await
 }
 
+#[derive(Deserialize)]
+pub struct MatchProxyRequest {
+    #[serde(default)]
+    pub agent_url: Option<String>,
+    pub command: String,
+    pub people: Vec<serde_json::Value>,
+}
+
+/// POST /api/agent/match — ask the selected agent which approval slots of
+/// a command would accept which people (`{username, claims}` each), so the
+/// page can show how far a request has got. Nothing is decided by it.
+pub async fn match_proxy(
+    State(state): State<AppState>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<MatchProxyRequest>,
+) -> Result<Response, AppError> {
+    require_same_origin(&headers)?;
+    let profile = crate::web::require_profile(&session).await?;
+
+    let url = resolve_agent_url(&state, req.agent_url.as_deref())?
+        .join("api/requirements/match")
+        .map_err(|e| AppError::Internal(format!("URL join: {e}")))?;
+
+    let resp = state
+        .agent_http
+        .post(url)
+        .bearer_auth(&profile.viewer_id_token)
+        .json(&serde_json::json!({ "command": req.command, "people": req.people }))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Agent unreachable: {}", e.without_url())))?;
+
+    passthrough(resp).await
+}
+
 /// GET /api/agent/files — list the agent's readable files. The session's
 /// viewer token is attached server-side; it never appears in a browser URL.
 pub async fn files_proxy(

@@ -605,6 +605,54 @@ async fn what_the_agent_offers_is_shown_only_as_policy_allows_and_audited() {
 }
 
 #[tokio::test]
+async fn the_catalog_describes_slots_and_the_agent_matches_people_to_them() {
+    let agent = TestAgent::start().await;
+    let token = agent.viewer_token("carol");
+    let outsider_token = agent.viewer_token_in("mallory", &["someone-else"]);
+
+    // The catalog shows each slot as written, with policy's words for it.
+    let catalog: serde_json::Value = agent.get("/api/commands", Some(&token)).await.json().await.unwrap();
+    let pair = catalog["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "ping-pair")
+        .expect("ping-pair is offered");
+    let slots = pair["requirements"]["approvals"].as_array().unwrap();
+    assert_eq!(slots.len(), 2);
+    assert_eq!(slots[0]["slot"], json!({ "groups_in": "webapp-users" }));
+    assert_eq!(slots[0]["description"], "someone in the webapp-users group");
+    assert_eq!(pair["requirements"]["executors"]["description"], "someone in the webapp-users group");
+
+    // Matching asks policy which slots would take which people.
+    let ask = |token: Option<String>, body: serde_json::Value| {
+        let mut req = agent.http.post(format!("http://{}/api/requirements/match", agent.addr)).json(&body);
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        async move { req.send().await.unwrap() }
+    };
+    let people = json!([
+        { "username": "alice", "claims": { "groups": ["webapp-users"] } },
+        { "username": "bob", "claims": { "groups": ["guests"] } },
+    ]);
+    let body = json!({ "command": "ping-pair", "people": people });
+    let resp = ask(Some(token.clone()), body.clone()).await;
+    assert_eq!(resp.status(), 200);
+    let matched: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(matched["accepted"], json!([[true, false], [true, false]]));
+
+    // Same access as the catalog, and nothing to match for an unknown command.
+    assert_eq!(ask(None, body.clone()).await.status(), 401);
+    assert_eq!(ask(Some(outsider_token), body).await.status(), 403);
+    let unknown = json!({ "command": "no-such-command", "people": [] });
+    assert_eq!(ask(Some(token.clone()), unknown).await.status(), 404);
+    let crowd: Vec<_> = (0..17).map(|i| json!({ "username": format!("u{i}"), "claims": {} })).collect();
+    let too_many = json!({ "command": "ping-pair", "people": crowd });
+    assert_eq!(ask(Some(token), too_many).await.status(), 400);
+}
+
+#[tokio::test]
 async fn file_policy_and_audit_see_where_a_path_resolves() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 

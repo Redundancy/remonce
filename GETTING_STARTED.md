@@ -156,22 +156,17 @@ Open `policy/requirements.json` and add an entry for `show-host` under `requirem
 
 ```json
 "show-host": {
-  "description": "Anyone on the team can check which machine this is",
-  "approvals": [
-    { "description": "a Remonce user",
-      "any_of": [ { "op": "contains", "claim": "groups", "value": "webapp-users" } ] }
-  ],
-  "executors": { "description": "a Remonce user",
-    "any_of": [ { "op": "contains", "claim": "groups", "value": "webapp-users" } ] }
+  "approvals": [ { "groups_in": "webapp-users" } ],
+  "executors": { "groups_in": "webapp-users" }
 }
 ```
 
-- **`approvals`** is a list of slots. Each slot needs its own approver — a different person per slot — whose claims match one of its `any_of` predicates.
+- **`approvals`** is a list of slots. Each slot needs its own approver, a different person per slot.
 - **`executors`** says who may submit the approved request.
-- **Predicates** are `{"op": "contains", "claim", "value"}` (the claim is a list containing the value) or `{"op": "equals", "claim", "value"}`. `"any_of": []` means anyone.
-- **`description`** is what people see instead of the raw predicates.
+- **A slot names a predicate and gives it an argument.** `{"groups_in": "webapp-users"}` accepts anyone whose `groups` claim includes `webapp-users`. The shipped predicates are `groups_in`, `claim_equals`, `claim_contains` and `anyone`.
+- **Predicates are Rego functions**, in `policy/predicates/core.rego`, and each one carries the description people see. You can add your own; see [Predicates](CONFIGURATION.md#predicates).
 
-Save, and reload the Commands page — no restart. `show-host` now reads *Needs a Remonce user · run by a Remonce user*.
+Save, and reload the Commands page — no restart. `show-host` now reads *Needs someone in the webapp-users group · run by someone in the webapp-users group*.
 
 ## 7. Approve it and run it
 
@@ -186,12 +181,7 @@ The same request can't run twice, and the approval expires after an hour (`appro
 Change `show-host`'s `approvals` to two slots:
 
 ```json
-"approvals": [
-  { "description": "a Remonce user",
-    "any_of": [ { "op": "contains", "claim": "groups", "value": "webapp-users" } ] },
-  { "description": "another Remonce user",
-    "any_of": [ { "op": "contains", "claim": "groups", "value": "webapp-users" } ] }
-]
+"approvals": [ { "groups_in": "webapp-users" }, { "groups_in": "webapp-users" } ]
 ```
 
 Now:
@@ -201,7 +191,7 @@ Now:
 3. Open **Sign a request**, drop the file in, and click **Approve** — logging in as `webapp2` this time. (Try `webapp` again: it's refused, because two approvals must be two people.)
 4. Click **Execute now**.
 
-Slots can ask for different things — `"a DBA"` plus `"someone from security"` — and policy finds a fair assignment whatever order the approvals arrive in.
+Slots can ask for different things — `{"groups_in": "dba"}` plus `{"groups_in": "security"}` — and policy finds a fair assignment whatever order the approvals arrive in.
 
 ## 9. Write a rule of your own
 

@@ -4,7 +4,7 @@
 //! policy rule).
 
 use crate::config::Config;
-use crate::requirements::{self, RequirementDoc};
+use crate::requirements::{self, Slot};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -22,10 +22,38 @@ pub struct CommandView {
     /// How long each approval stays usable.
     pub approval_validity_secs: u64,
     /// The published requirements, if policy has any for this command.
-    pub requirements: Option<RequirementDoc>,
+    pub requirements: Option<RequirementView>,
     /// Set when a document is published but doesn't parse, so the UI can
     /// say so rather than show no requirements.
     pub requirements_error: Option<String>,
+}
+
+/// A command's requirement as people see it: each slot with policy's
+/// description of it.
+#[derive(Serialize)]
+pub struct RequirementView {
+    pub approvals: Vec<SlotView>,
+    pub executors: SlotView,
+    pub additional_policy: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SlotView {
+    /// The slot as written: one predicate and its argument.
+    pub slot: Slot,
+    /// What it asks for, in policy's words. None when no predicate library
+    /// describes it, which also means it accepts no one.
+    pub description: Option<String>,
+}
+
+fn slot_view(slot: Slot, description: Option<&serde_json::Value>) -> SlotView {
+    SlotView {
+        slot,
+        description: description
+            .and_then(|d| d.as_str())
+            .filter(|d| !d.is_empty())
+            .map(String::from),
+    }
 }
 
 #[derive(Serialize)]
@@ -39,10 +67,13 @@ pub struct ParamView {
     pub max: Option<i64>,
 }
 
+/// `published` holds each command's requirement document, and
+/// `descriptions` policy's words for its slots (`Policy::describe_slots`).
 pub fn build(
     config: &Config,
     host: &str,
     published: &serde_json::Map<String, serde_json::Value>,
+    descriptions: &serde_json::Map<String, serde_json::Value>,
 ) -> Catalog {
     let commands = config
         .commands
@@ -51,7 +82,21 @@ pub fn build(
             let (requirements, requirements_error) = match published.get(&c.name) {
                 None => (None, None),
                 Some(doc) => match requirements::parse(doc) {
-                    Ok(doc) => (Some(doc), None),
+                    Ok(doc) => {
+                        let described = descriptions.get(&c.name);
+                        let approvals = described.and_then(|d| d.get("approvals"));
+                        let view = RequirementView {
+                            approvals: doc
+                                .approvals
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, slot)| slot_view(slot, approvals.and_then(|a| a.get(i))))
+                                .collect(),
+                            executors: slot_view(doc.executors, described.and_then(|d| d.get("executors"))),
+                            additional_policy: doc.additional_policy,
+                        };
+                        (Some(view), None)
+                    }
                     Err(e) => (None, Some(e)),
                 },
             };
@@ -110,7 +155,8 @@ mod tests {
 
     #[test]
     fn never_exposes_how_a_command_runs() {
-        let json = serde_json::to_string(&build(&config(), "host-a", &Default::default())).unwrap();
+        let json =
+            serde_json::to_string(&build(&config(), "host-a", &Default::default(), &Default::default())).unwrap();
         for secret in ["SECRET_BINARY", "ARG_SECRET", "SECRET_DIR", "ENV_SECRET", "hidden.rule"] {
             assert!(!json.contains(secret), "catalog leaks {secret}: {json}");
         }
@@ -122,16 +168,28 @@ mod tests {
         let mut published = serde_json::Map::new();
         published.insert(
             "other".into(),
-            serde_json::json!({ "approvals": [], "executors": { "any_of": [] } }),
+            serde_json::json!({ "approvals": [{ "groups_in": "dba" }, { "made_up": 1 }], "executors": { "anyone": true } }),
         );
         published.insert("secret-thing".into(), serde_json::json!({ "approvals": "bad" }));
-        let c = build(&config(), "host-a", &published);
+        let mut descriptions = serde_json::Map::new();
+        descriptions.insert(
+            "other".into(),
+            serde_json::json!({ "approvals": ["someone in the dba group", ""], "executors": "anyone" }),
+        );
+        let c = build(&config(), "host-a", &published, &descriptions);
         assert_eq!(c.host, "host-a");
         let secret = &c.commands[0];
         assert!(secret.requirements.is_none() && secret.requirements_error.is_some());
         assert_eq!(secret.approval_validity_secs, 3600);
         let other = &c.commands[1];
-        assert!(other.requirements.is_some());
         assert_eq!(other.approval_validity_secs, 7200);
+        let req = other.requirements.as_ref().unwrap();
+        assert_eq!(req.approvals[0].description.as_deref(), Some("someone in the dba group"));
+        // A predicate nobody describes is shown as written, with no words.
+        assert_eq!(req.approvals[1].description, None);
+        assert_eq!(req.approvals[1].slot.predicate, "made_up");
+        assert_eq!(req.executors.description.as_deref(), Some("anyone"));
+        let json = serde_json::to_value(req).unwrap();
+        assert_eq!(json["approvals"][0]["slot"], serde_json::json!({ "groups_in": "dba" }));
     }
 }

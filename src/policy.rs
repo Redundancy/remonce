@@ -27,7 +27,7 @@ pub struct Signer {
 }
 
 /// Someone identified by their login session rather than a signature.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Identity {
     pub username: String,
     pub claims: serde_json::Value,
@@ -75,6 +75,10 @@ pub struct Decision {
 const VIEW_RULE: &str = "data.remonce.authz.allow";
 /// Where requirement documents are published.
 const REQUIREMENTS: &str = "data.remonce.requirements";
+/// The display helpers in the shipped `lib.rego`: words for a requirement's
+/// slots, and which people each approval slot would accept.
+const DESCRIPTIONS: &str = "data.remonce.lib.descriptions";
+const ACCEPTED: &str = "data.remonce.lib.accepted";
 
 /// Files that make up the policy, with what identifies their content.
 type Fingerprint = Vec<(PathBuf, Option<SystemTime>, u64)>;
@@ -138,6 +142,39 @@ impl Policy {
             serde_json::Value::Null => Ok(Default::default()),
             serde_json::Value::Object(m) => Ok(m),
             _ => Err(format!("{REQUIREMENTS} is not an object")),
+        }
+    }
+
+    /// Policy's words for the slots of each requirement in `requirements`
+    /// (by command name): `{ approvals: [text], executors: text }`, with ""
+    /// for a predicate no library describes. A policy without the helper
+    /// describes nothing.
+    pub async fn describe_slots(
+        &self,
+        requirements: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        let input = serde_json::json!({ "requirements": requirements });
+        match self.eval(&input, DESCRIPTIONS).await? {
+            serde_json::Value::Null => Ok(Default::default()),
+            serde_json::Value::Object(m) => Ok(m),
+            _ => Err(format!("{DESCRIPTIONS} is not an object")),
+        }
+    }
+
+    /// For each approval slot of `requirement`, whether it would accept
+    /// each of `people`. For display only: it decides nothing. None when
+    /// the policy has no such helper.
+    pub async fn accepted(
+        &self,
+        requirement: &serde_json::Value,
+        people: &[Identity],
+    ) -> Result<Option<Vec<Vec<bool>>>, String> {
+        let input = serde_json::json!({ "requirement": requirement, "people": people });
+        match self.eval(&input, ACCEPTED).await? {
+            serde_json::Value::Null => Ok(None),
+            rows => serde_json::from_value(rows)
+                .map(Some)
+                .map_err(|e| format!("{ACCEPTED} is not rows of booleans: {e}")),
         }
     }
 }
@@ -427,6 +464,127 @@ mod tests {
         let reqs = p.requirements().await.unwrap();
         assert!(reqs.contains_key("ping-pair"));
         assert_eq!(reqs["ping-pair"]["approvals"].as_array().unwrap().len(), 2);
+
+        // Every slot of every shipped requirement has words, so none names
+        // a predicate the shipped libraries don't define.
+        let described = p.describe_slots(&reqs).await.unwrap();
+        for (name, req) in &reqs {
+            let d = &described[name];
+            assert_eq!(d["approvals"].as_array().unwrap().len(), req["approvals"].as_array().unwrap().len());
+            for text in d["approvals"].as_array().unwrap().iter().chain([&d["executors"]]) {
+                assert!(!text.as_str().unwrap().is_empty(), "{name}: a slot has no description");
+            }
+        }
+        assert_eq!(described["ping-pair"]["executors"], "someone in the webapp-users group");
+
+        let people = [viewer(&["webapp-users"]), viewer(&["other"])];
+        let rows = p.accepted(&reqs["ping-pair"], &people).await.unwrap().unwrap();
+        assert_eq!(rows, vec![vec![true, false], vec![true, false]]);
+    }
+
+    #[tokio::test]
+    async fn a_policy_without_the_display_helpers_describes_nothing() {
+        let dir = std::env::temp_dir().join(format!("remonce-policy-bare-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("authz.rego"), "package remonce.authz\n\nallow := false\n").unwrap();
+        let p = Policy::Embedded(Box::new(Embedded::load(&dir).unwrap()));
+        let reqs = serde_json::json!({ "x": { "approvals": [{ "anyone": true }], "executors": { "anyone": true } } });
+        assert!(p.describe_slots(reqs.as_object().unwrap()).await.unwrap().is_empty());
+        assert_eq!(p.accepted(&reqs["x"], &[]).await.unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A copy of the shipped policy with one more predicate library,
+    /// `extra`, listed beside the shipped one.
+    fn shipped_with_library(tag: &str, library: &str) -> (Policy, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("remonce-policy-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("policy");
+        for file in policy_files(&shipped).unwrap() {
+            let to = dir.join(file.strip_prefix(&shipped).unwrap());
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(&file, &to).unwrap();
+        }
+        std::fs::write(dir.join("predicates").join("extra.rego"), library).unwrap();
+        let listed = r#"package remonce.predicates
+
+import data.remonce.predicates.core
+import data.remonce.predicates.extra
+
+holds(name, argument, person) if core.holds(name, argument, person)
+
+holds(name, argument, person) if extra.holds(name, argument, person)
+
+describe(name, argument) := core.describe(name, argument)
+
+describe(name, argument) := extra.describe(name, argument)
+"#;
+        std::fs::write(dir.join("predicates.rego"), listed).unwrap();
+        (Policy::Embedded(Box::new(Embedded::load(&dir).expect("policy with a library loads"))), dir)
+    }
+
+    fn person(claims: serde_json::Value) -> Identity {
+        Identity { username: "p".into(), claims }
+    }
+
+    #[tokio::test]
+    async fn a_predicate_library_of_your_own_is_listed_and_used() {
+        let (p, dir) = shipped_with_library(
+            "library",
+            r#"package remonce.predicates.extra
+
+holds("oncall_sre", _, person) if {
+	"sre" in object.get(person.claims, "groups", [])
+	person.claims.oncall == true
+}
+
+describe("oncall_sre", _) := "the on-call SRE"
+"#,
+        );
+        let requirement = serde_json::json!({
+            "approvals": [{ "oncall_sre": true }, { "groups_in": "dba" }, { "never_defined": 1 }],
+            "executors": { "oncall_sre": true },
+        });
+        let people = [
+            person(serde_json::json!({ "groups": ["sre"], "oncall": true })),
+            person(serde_json::json!({ "groups": ["sre", "dba"], "oncall": false })),
+        ];
+        let rows = p.accepted(&requirement, &people).await.unwrap().unwrap();
+        assert_eq!(rows, vec![vec![true, false], vec![false, true], vec![false, false]]);
+
+        let mut reqs = serde_json::Map::new();
+        reqs.insert("x".into(), requirement);
+        let described = p.describe_slots(&reqs).await.unwrap();
+        assert_eq!(
+            described["x"],
+            serde_json::json!({
+                "approvals": ["the on-call SRE", "someone in the dba group", ""],
+                "executors": "the on-call SRE",
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two libraries defining one name is a mistake to fix, not something
+    /// to guess about: describing it fails rather than picking one.
+    #[tokio::test]
+    async fn two_libraries_describing_one_predicate_is_an_error() {
+        let (p, dir) = shipped_with_library(
+            "clash",
+            r#"package remonce.predicates.extra
+
+holds("groups_in", team, person) if person.claims.team == team
+
+describe("groups_in", team) := sprintf("someone on team %s", [team])
+"#,
+        );
+        let mut reqs = serde_json::Map::new();
+        reqs.insert(
+            "x".into(),
+            serde_json::json!({ "approvals": [{ "groups_in": "dba" }], "executors": { "anyone": true } }),
+        );
+        assert!(p.describe_slots(&reqs).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Run the Rego test suite in `policy_test/` against the shipped policy,
@@ -501,7 +659,19 @@ mod tests {
                 remote.allows_viewing(&ViewInput::ViewDocs { viewer: viewer() }).await.unwrap()
             );
         }
-        assert_eq!(embedded.requirements().await.unwrap(), remote.requirements().await.unwrap());
+        let reqs = embedded.requirements().await.unwrap();
+        assert_eq!(reqs, remote.requirements().await.unwrap());
+        assert_eq!(embedded.describe_slots(&reqs).await.unwrap(), remote.describe_slots(&reqs).await.unwrap());
+        let people = || {
+            [&["webapp-users"][..], &["other"][..]].map(|groups| Identity {
+                username: "v".into(),
+                claims: serde_json::json!({ "groups": groups }),
+            })
+        };
+        assert_eq!(
+            embedded.accepted(&reqs["ping-pair"], &people()).await.unwrap(),
+            remote.accepted(&reqs["ping-pair"], &people()).await.unwrap()
+        );
     }
 
     #[tokio::test]

@@ -47,8 +47,8 @@ description = "Cloud-init log"
 
 ```json
 "check-cloud-init": {
-  "approvals": [ { "description": "a VM deployer", "any_of": [ { "op": "contains", "claim": "groups", "value": "vm-deployers" } ] } ],
-  "executors":   { "description": "a VM deployer", "any_of": [ { "op": "contains", "claim": "groups", "value": "vm-deployers" } ] }
+  "approvals": [ { "groups_in": "vm-deployers" } ],
+  "executors":   { "groups_in": "vm-deployers" }
 }
 ```
 
@@ -87,12 +87,12 @@ env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 approval_validity = "1d"
 ```
 
-**Requirement document** plus an extra rule, because `any_of` is OR and this needs two claims to hold together:
+**Requirement document** plus an extra rule, because a slot names one predicate and this needs two claims to hold together:
 
 ```json
 "restart-app-tier": {
-  "approvals": [ { "description": "a release approver", "any_of": [ { "op": "contains", "claim": "groups", "value": "release-approvers" } ] } ],
-  "executors":   { "description": "the deploy-prod workflow", "any_of": [ { "op": "equals", "claim": "workflow", "value": "deploy-prod" } ] },
+  "approvals": [ { "groups_in": "release-approvers" } ],
+  "executors":   { "claim_equals": ["workflow", "deploy-prod"] },
   "additional_policy": "Only from the acme/webapp repository"
 }
 ```
@@ -139,8 +139,8 @@ approval_validity = "12h"
 
 ```json
 "db-failover": {
-  "approvals": [ { "description": "an on-call manager", "any_of": [ { "op": "contains", "claim": "groups", "value": "oncall-managers" } ] } ],
-  "executors":   { "description": "NOC L2", "any_of": [ { "op": "contains", "claim": "groups", "value": "noc-l2" } ] },
+  "approvals": [ { "groups_in": "oncall-managers" } ],
+  "executors":   { "groups_in": "noc-l2" },
   "additional_policy": "The executor can't be one of the approvers"
 }
 ```
@@ -199,16 +199,12 @@ executable = "/usr/local/bin/rotate-webapp-logs"
 
 ```json
 "restart-webapp": {
-  "approvals": [ { "description": "webapp team or platform-ops", "any_of": [
-    { "op": "contains", "claim": "groups", "value": "webapp-team" },
-    { "op": "contains", "claim": "groups", "value": "platform-ops" } ] } ],
-  "executors": { "description": "webapp team or platform-ops", "any_of": [
-    { "op": "contains", "claim": "groups", "value": "webapp-team" },
-    { "op": "contains", "claim": "groups", "value": "platform-ops" } ] }
+  "approvals": [ { "groups_in": ["webapp-team", "platform-ops"] } ],
+  "executors": { "groups_in": ["webapp-team", "platform-ops"] }
 },
 "rotate-logs": {
-  "approvals": [ { "description": "the webapp team", "any_of": [ { "op": "contains", "claim": "groups", "value": "webapp-team" } ] } ],
-  "executors":   { "description": "the webapp team", "any_of": [ { "op": "contains", "claim": "groups", "value": "webapp-team" } ] }
+  "approvals": [ { "groups_in": "webapp-team" } ],
+  "executors":   { "groups_in": "webapp-team" }
 }
 ```
 
@@ -234,10 +230,10 @@ executable = "/usr/local/bin/rotate-webapp-logs"
 "restart-db": {
   "description": "A DBA and security must both agree",
   "approvals": [
-    { "description": "a DBA",    "any_of": [ { "op": "contains", "claim": "groups", "value": "dba" } ] },
-    { "description": "security", "any_of": [ { "op": "contains", "claim": "groups", "value": "security" } ] }
+    { "groups_in": "dba" },
+    { "groups_in": "security" }
   ],
-  "executors": { "description": "on-call SRE", "any_of": [ { "op": "contains", "claim": "groups", "value": "sre-oncall" } ] }
+  "executors": { "groups_in": "sre-oncall" }
 }
 ```
 
@@ -252,6 +248,6 @@ Each slot needs a *different* person. Someone in both `dba` and `security` still
 - **One approval is the common case.** Cases 1 and 4: approve, execute, done. More approvals are for commands where one compromised or mistaken account shouldn't be enough.
 - **Executing is separate from approving.** Whoever holds a complete request can submit it from any machine, but they are always identified, and `executors` decides who that may be. Hand a request to the person who'll run it; don't make them re-approve. Approvers may execute their own requests by default (the one-person case needs it); where you want separation of duties, add it per command as in use case 3.
 - **Requirements belong to policy, not the requester.** Nothing in a request says what it needs, so nobody can weaken it by editing the file. Change a command's requirements in one place (the document) and every agent's catalog shows it.
-- **Keep extra Rego visible.** Anything the predicate language can't express goes in `extra_denials`, with `additional_policy` set so people see that more applies.
+- **Keep extra Rego visible.** Anything the shipped predicates can't express is either a predicate of your own, which then describes itself in the catalog, or a rule in `extra_denials`, with `additional_policy` set so people see that more applies.
 - **Replay safety is automatic.** A request runs once per agent; set `[agent] state_dir` so that holds across agent restarts too. Running the same thing again is a new request (new `id`), approved again.
 - **The wire format is portable.** Requests are plain JSON. Email them, attach them to tickets, paste them into chat — the signatures protect them, not the channel.

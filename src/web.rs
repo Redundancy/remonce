@@ -255,6 +255,7 @@ pub async fn run(insecure: bool) -> Result<(), AppError> {
         .route("/api/sign/begin", post(crate::web_sign::begin_handler))
         .route("/api/sign/result/{id}", get(crate::web_sign::result_handler))
         .route("/api/agent/commands", get(crate::agent_proxy::commands_proxy))
+        .route("/api/agent/match", post(crate::agent_proxy::match_proxy))
         .route("/api/agent/execute", post(crate::agent_proxy::execute_proxy))
         .route("/api/agent/files", get(crate::agent_proxy::files_proxy))
         .route("/ws/exec", get(crate::agent_proxy::exec_stream_proxy))

@@ -115,35 +115,28 @@ Policy data at `data.remonce.requirements[<command>]` (shipped in [policy/requir
 
 ```json
 {
-  "description": "Two people must agree before this runs",
-  "approvals": [
-    { "description": "a DBA",       "any_of": [ { "op": "contains", "claim": "groups", "value": "dba" } ] },
-    { "description": "security",    "any_of": [ { "op": "contains", "claim": "groups", "value": "security" } ] }
-  ],
-  "executors": { "description": "on-call SRE", "any_of": [ { "op": "contains", "claim": "groups", "value": "sre-oncall" } ] },
+  "approvals": [ { "groups_in": "dba" }, { "groups_in": "security" } ],
+  "executors": { "groups_in": "sre-oncall" },
   "additional_policy": "Not during the Friday change freeze"
 }
 ```
 
 -   Each entry in `approvals` is a **slot** that needs its own approver: the request is satisfied when every slot can be given a *different* approver whose claims it accepts. This is checked with Hall's condition over subsets of slots (at most 8), not greedily, so a valid assignment is always found if one exists. With no slots, one approval from anyone is enough (an agent never runs a request without at least one).
 -   `executors` says who may submit it.
--   `any_of: []` means anyone; a missing `any_of` means no one.
+-   A slot is one predicate and its argument. A slot naming a predicate nobody has defined accepts no one.
 -   `additional_policy` is a description, shown to people, of rules the policy adds beyond the document.
 
 The shared Rego helper [policy/lib.rego](policy/lib.rego) evaluates a document (`lib.satisfied(requirement, input)`), so what the catalog shows and what policy enforces come from the same data. [policy/authz.rego](policy/authz.rego) denies a command with no published document; a test in `policy_test/` checks that meeting a document is enough to be allowed unless the document declares `additional_policy`, so the two can't silently drift apart.
 
-The predicate language is deliberately small; put anything more expressive in Rego and describe it in `additional_policy`:
-
-| Op | Shape | Matches when |
-|----|-------|-------------|
-| `equals`    | `{ "op": "equals", "claim": "team", "value": "webapp" }` | Claim equals `value` |
-| `contains`  | `{ "op": "contains", "claim": "groups", "value": "noc-l2" }` | Claim array contains `value` |
+Predicates are Rego functions, not a language of their own. Each is a `holds(name, argument, person)` clause saying who it accepts and a `describe(name, argument)` clause saying so in words; [policy/predicates/core.rego](policy/predicates/core.rego) ships `groups_in`, `claim_equals`, `claim_contains` and `anyone`. Because the description comes from the same place as the test, what people read is what is enforced, and a deployment can add predicates, or share them as libraries, without any change to remonce. [policy/predicates.rego](policy/predicates.rego) lists the libraries an agent uses.
 
 Predicates are evaluated at **execution time** against the approvers' and executor's verified claims, so a group change takes effect for requests not yet run.
 
 ### The catalog
 
-`GET /api/commands` on the agent (viewer bearer; policy's `view_docs` decides who may see it) lists what can be requested there: each command's name, description, parameters, `approval_validity`, and its requirement document fetched from OPA, plus the agent's hostname. It never includes how a command runs (executable, arguments, working directory, environment, policy rule). The signer's UI reads the catalog of whichever agent is selected.
+`GET /api/commands` on the agent (viewer bearer; policy's `view_docs` decides who may see it) lists what can be requested there: each command's name, description, parameters, `approval_validity`, and its requirement document fetched from OPA with policy's description of each slot, plus the agent's hostname. It never includes how a command runs (executable, arguments, working directory, environment, policy rule). The signer's UI reads the catalog of whichever agent is selected.
+
+The browser can't evaluate a predicate, so to show which slots a request's approvals fill it asks the agent: `POST /api/requirements/match` takes a command name and a list of people (`username` and `claims`, as read from the approvals in the file) and returns, for each approval slot, whether it would accept each of them. It has the same access rule as the catalog, verifies nothing and decides nothing; it exists only so the page can say "1 of 2 needed".
 
 ### Replay protection
 

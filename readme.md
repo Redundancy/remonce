@@ -192,12 +192,14 @@ The agent also reads every `.toml` file in a `config.d` directory beside `config
 
 ```json
 "restart-service": {
-  "approvals": [ { "description": "an SRE", "any_of": [ { "op": "contains", "claim": "groups", "value": "sre" } ] } ],
-  "executors":   { "description": "an SRE", "any_of": [ { "op": "contains", "claim": "groups", "value": "sre" } ] }
+  "approvals": [ { "groups_in": "sre" } ],
+  "executors":   { "groups_in": "sre" }
 }
 ```
 
-Each entry in `approvals` is a slot that needs its own person. `executors` says who may submit the approved request. The claims are whatever your identity provider puts in its tokens. The UI shows these entries next to each command, so people can see what a command needs before they ask for it.
+Each entry in `approvals` is a slot that needs its own person. `executors` says who may submit the approved request. A slot names a predicate and gives it an argument: `groups_in` accepts someone whose `groups` claim includes the group. The shipped predicates are `groups_in`, `claim_equals`, `claim_contains` and `anyone`. They are Rego functions that carry their own descriptions, so you can [add your own](CONFIGURATION.md#predicates) and share them between hosts.
+
+The UI shows what each command needs, in the predicates' words, so people can see it before they ask.
 
 A command with no entry is refused. Edits to anything in `policy/` take effect on the next request, with no restart.
 

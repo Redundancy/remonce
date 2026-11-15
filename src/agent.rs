@@ -284,6 +284,7 @@ pub fn build_router(state: AgentState, cors_allowed_origins: &[String]) -> Route
         .route("/execute", post(execute_handler))
         .route("/revoke", post(revoke_handler))
         .route("/api/commands", get(catalog_handler))
+        .route("/api/requirements/match", post(match_handler))
         .route("/stream/{id}", get(stream_logs_handler))
         .route("/api/files", get(list_files_handler))
         .route("/api/files/stream", get(stream_file_handler))
@@ -1294,14 +1295,77 @@ async fn catalog_handler(
     if let Err(response) = require_view_docs(&state, &addr, EVENT, claims, &user).await {
         return *response;
     }
-    match state.policy.requirements().await {
-        Ok(published) => {
+    let catalog = async {
+        let published = state.policy.requirements().await?;
+        let descriptions = state.policy.describe_slots(&published).await?;
+        Ok::<_, String>(crate::catalog::build(&state.config, &state.hostname, &published, &descriptions))
+    };
+    match catalog.await {
+        Ok(catalog) => {
             audit_view(&state, &addr, EVENT, "allow", "Catalog served", &user, None);
-            Json(crate::catalog::build(&state.config, &state.hostname, &published)).into_response()
+            Json(catalog).into_response()
         }
         Err(e) => {
             audit_view(&state, &addr, EVENT, "error", format!("Fetching published requirements failed: {e}"), &user, None);
             (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Could not load published requirements").into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MatchRequest {
+    /// The command whose requirement to match against.
+    command: String,
+    /// Who to try against its approval slots: `{username, claims}` each.
+    people: Vec<crate::policy::Identity>,
+}
+
+#[derive(Serialize)]
+struct MatchResponse {
+    /// One row per approval slot, in the catalog's order: whether the slot
+    /// would accept each of the people, in the order given.
+    accepted: Vec<Vec<bool>>,
+}
+
+/// Which approval slots of a command's requirement would accept which
+/// people. The UI uses it to show how far a request has got, since what a
+/// predicate means is policy's to say and the browser can't evaluate Rego.
+///
+/// For display only. The claims are whatever the caller sends, nothing is
+/// verified and nothing is decided: an execution verifies every approval
+/// and asks policy afresh. Open to whoever may see the catalog, and it
+/// tells them nothing the catalog doesn't, so only refusals are audited.
+async fn match_handler(
+    State(state): State<AgentState>,
+    ConnectInfo(addr): ConnectInfo<crate::tls::PeerAddr>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<MatchRequest>,
+) -> Response {
+    use axum::http::StatusCode;
+    const EVENT: &str = "catalog_access";
+    let (claims, user) = match authenticate_viewer(&state, &addr, &headers, EVENT, None).await {
+        Ok(v) => v,
+        Err(response) => return *response,
+    };
+    if let Err(response) = require_view_docs(&state, &addr, EVENT, claims, &user).await {
+        return *response;
+    }
+    if req.people.len() > crate::security::MAX_APPROVALS {
+        return (StatusCode::BAD_REQUEST, "Too many people").into_response();
+    }
+    let rows = async {
+        let published = state.policy.requirements().await?;
+        match published.get(&req.command) {
+            Some(requirement) => state.policy.accepted(requirement, &req.people).await,
+            None => Ok(None),
+        }
+    };
+    match rows.await {
+        Ok(Some(accepted)) => Json(MatchResponse { accepted }).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "No published requirements to match against").into_response(),
+        Err(e) => {
+            tracing::warn!("Matching a requirement failed: {e}");
+            (StatusCode::SERVICE_UNAVAILABLE, "Policy engine unavailable").into_response()
         }
     }
 }

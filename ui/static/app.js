@@ -173,11 +173,6 @@ function displayPath(p) {
     return String(p).replace(/^\\\\\?\\/, '');
 }
 
-function fmtPredicate(p) {
-    const v = typeof p.value === 'string' ? p.value : JSON.stringify(p.value);
-    return `${p.claim} ${p.op === 'contains' ? 'contains' : '='} ${v}`;
-}
-
 // ---------------------------------------------------------------------------
 // Request files: JSON (base64 accepted for pages handing over)
 // ---------------------------------------------------------------------------
@@ -476,48 +471,51 @@ function takeHandOff() {
 }
 
 // ---------------------------------------------------------------------------
-// Requirements, as the agent publishes them from policy. Matching here is
-// for display only: the agent verifies every approval and policy decides.
+// Requirements, as the agent publishes them from policy. A slot arrives as
+// {slot, description}: the predicate as written, and policy's words for
+// it. What a predicate means is policy's to say, so which people a slot
+// would accept is asked of the agent. All of this is for display only: the
+// agent verifies every approval and policy decides.
 // ---------------------------------------------------------------------------
 
-function sameJson(a, b) {
-    return JSON.stringify(a) === JSON.stringify(b);
-}
-
-function claimMatches(p, claims) {
-    const v = claims ? claims[p.claim] : undefined;
-    if (p.op === 'equals') return v !== undefined && sameJson(v, p.value);
-    if (p.op === 'contains') return Array.isArray(v) && v.some(x => sameJson(x, p.value));
-    return false;
-}
-
-// "any_of": [] means anyone; a slot without it accepts no one.
-function slotAccepts(slot, claims) {
-    if (!slot || !Array.isArray(slot.any_of)) return false;
-    return slot.any_of.length === 0 || slot.any_of.some(p => claimMatches(p, claims));
-}
-
-function slotText(slot) {
-    if (!slot || !Array.isArray(slot.any_of)) return 'no one';
-    if (slot.description) return slot.description;
-    return slot.any_of.length === 0 ? 'anyone' : slot.any_of.map(fmtPredicate).join(' or ');
+function slotText(view) {
+    if (!view) return 'no one';
+    if (view.description) return view.description;
+    // No predicate library on the agent defines it, so it accepts no one.
+    return JSON.stringify(view.slot) + ' (not defined by the agent\'s policy)';
 }
 
 // An agent never runs a request without at least one approval.
+const ANYONE_SLOT = { slot: null, description: 'anyone' };
 function effectiveSlots(r) {
-    return r.approvals.length ? r.approvals : [{ description: 'anyone', any_of: [] }];
+    return r.approvals.length ? r.approvals : [ANYONE_SLOT];
+}
+
+// For each slot, whether it would accept each of `people`, as the selected
+// agent's policy sees them.
+async function acceptedBySlot(command, slots, people) {
+    if (slots.length === 1 && slots[0] === ANYONE_SLOT) return [people.map(() => true)];
+    if (people.length === 0) return slots.map(() => []);
+    const res = await postJson('/api/agent/match', {
+        agent_url: agentUrl(),
+        command,
+        people: people.map(p => ({ username: p.name, claims: p.claims })),
+    });
+    return res.accepted;
 }
 
 // Give each slot its own approver where possible (augmenting paths, so a
 // fit is found whenever one exists). Free approvers are tried before
 // reassigning a taken one, so slots fill in approval order where they can.
-// Returns, per slot, an approver index or -1.
-function matchSlots(slots, approvers) {
+// `accepted[s][i]` says whether slot s would take approver i. Returns, per
+// slot, an approver index or -1.
+function matchSlots(accepted, approvers) {
+
     const slotOf = approvers.map(() => -1);
     const assign = (s, seen) => {
         const order = approvers.map((_, i) => i).sort((a, b) => (slotOf[a] !== -1) - (slotOf[b] !== -1));
         for (const i of order) {
-            if (seen.has(i) || !slotAccepts(slots[s], approvers[i].claims)) continue;
+            if (seen.has(i) || !accepted[s][i]) continue;
             seen.add(i);
             if (slotOf[i] === -1 || assign(slotOf[i], seen)) {
                 slotOf[i] = s;
@@ -526,8 +524,8 @@ function matchSlots(slots, approvers) {
         }
         return false;
     };
-    slots.forEach((_, s) => assign(s, new Set()));
-    const bySlot = slots.map(() => -1);
+    accepted.forEach((_, s) => assign(s, new Set()));
+    const bySlot = accepted.map(() => -1);
     slotOf.forEach((s, i) => { if (s !== -1) bySlot[s] = i; });
     return bySlot;
 }
@@ -542,8 +540,9 @@ function requirementSummary(info) {
 
 // What a request's approvals claim, checked against the catalog entry
 // (`info`, may be null): which have expired, repeat a person, and which
-// requirement slots they fill.
-function requestStatus(req, info) {
+// requirement slots they fill. When the agent can't say which slots they
+// fill, `slots` is null and `unmatched` says why.
+async function requestStatus(req, info) {
     const now = Date.now() / 1000;
     const seen = new Set();
     const approvers = req.approvals.map((a) => {
@@ -558,7 +557,13 @@ function requestStatus(req, info) {
     const r = info && info.requirements;
     if (!r) return { approvers, live, slots: null, bySlot: null, complete: null };
     const slots = effectiveSlots(r);
-    const bySlot = matchSlots(slots, live);
+    let accepted;
+    try {
+        accepted = await acceptedBySlot(info.name, slots, live);
+    } catch (e) {
+        return { approvers, live, slots: null, bySlot: null, complete: null, unmatched: e.message };
+    }
+    const bySlot = matchSlots(accepted, live);
     return { approvers, live, slots, bySlot, complete: bySlot.every(i => i !== -1) };
 }
 
@@ -587,12 +592,15 @@ function requirementFacts(info, st) {
     const r = info.requirements;
     if (!r) return [['Requirements', 'None published for this command; the agent\'s policy decides']];
     const rows = [];
-    if (r.description) rows.push(['Requirements', r.description]);
+    const matched = st && st.bySlot;
     effectiveSlots(r).forEach((slot, j) => {
-        const i = st ? st.bySlot[j] : -1;
+        const i = matched ? st.bySlot[j] : -1;
         rows.push(['Approver ' + (j + 1), h('span', {}, slotText(slot),
-            st ? (i >= 0 ? tag('ok', icon('check'), st.live[i].name) : tag('', 'waiting')) : null)]);
+            matched ? (i >= 0 ? tag('ok', icon('check'), st.live[i].name) : tag('', 'waiting')) : null)]);
     });
+    if (st && st.unmatched) {
+        rows.push(['Approvals so far', 'The agent could not say which of these they meet: ' + st.unmatched]);
+    }
     rows.push(['Run by', slotText(r.executors)]);
     if (r.additional_policy) rows.push(['Further policy', r.additional_policy]);
     rows.push(['Approvals valid', fmtDuration(info.approval_validity_secs) + ' after each approver logs in']);
@@ -724,7 +732,7 @@ async function renderSignedResult(target, result) {
 
     const req = result.bundle;
     const { info } = await requestContext(req.command);
-    const st = requestStatus(req, info);
+    const st = await requestStatus(req, info);
     const counted = st.slots
         ? `${st.bySlot.filter(i => i >= 0).length} of ${st.slots.length} needed`
         : `${req.approvals.length}; the agent's policy decides whether that is enough`;
@@ -1014,7 +1022,7 @@ async function initReviewPage() {
 
 async function renderRequestReview(target, req, rerender) {
     const { problems, warnings, info } = await requestContext(req.command);
-    const st = requestStatus(req, info);
+    const st = await requestStatus(req, info);
     const panel = h('section', { class: 'panel accent' },
         panelTitle(req.command.command, info && info.description));
     problems.forEach(p => panel.append(notice('error', p)));
@@ -1119,7 +1127,7 @@ async function initExecutePage() {
 
 async function renderExecuteDetail(target, req, rerender) {
     const { problems, warnings, info } = await requestContext(req.command);
-    const st = requestStatus(req, info);
+    const st = await requestStatus(req, info);
     const panel = h('section', { class: 'panel accent' },
         panelTitle(req.command.command, info && info.description));
     problems.forEach(p => panel.append(notice('error', p)));

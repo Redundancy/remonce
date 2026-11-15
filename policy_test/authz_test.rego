@@ -41,7 +41,7 @@ test_unpublished_command_denied if {
 test_extra_denial if {
 	inp := object.union(execute("restart-db", [user("alice")], user("alice")), {"host": "web-1"})
 	not authz.allow with input as inp
-		with data.remonce.requirements as {"restart-db": {"approvals": [], "executors": {"any_of": []}}}
+		with data.remonce.requirements as {"restart-db": {"approvals": [], "executors": {"anyone": true}}}
 }
 
 test_third_party_revoke if {
@@ -73,14 +73,9 @@ sufficient(name, doc) if {
 	}
 }
 
-synth(slot, j) := {"sub": sprintf("u%d", [j])} if count(slot.any_of) == 0
+# Claims that satisfy a slot, for the predicates the shipped documents use.
+synth(slot, j) := {"sub": sprintf("u%d", [j])} if slot.anyone
 
-synth(slot, j) := {"sub": sprintf("u%d", [j]), p.claim: [p.value]} if {
-	p := slot.any_of[0]
-	p.op == "contains"
-}
+synth(slot, j) := {"sub": sprintf("u%d", [j]), "groups": [slot.groups_in]} if is_string(slot.groups_in)
 
-synth(slot, j) := {"sub": sprintf("u%d", [j]), p.claim: p.value} if {
-	p := slot.any_of[0]
-	p.op == "equals"
-}
+synth(slot, j) := {"sub": sprintf("u%d", [j]), "groups": slot.groups_in} if is_array(slot.groups_in)
