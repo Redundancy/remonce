@@ -2,8 +2,8 @@
 //! ephemeral key per signature, and the low-S sign + TSA timestamp step.
 
 use p256::ecdsa::SigningKey;
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::EncodePublicKey;
-use rand::rngs::OsRng;
 
 /// A one-signature ephemeral key and the OIDC nonce that binds a login to it.
 pub struct Ephemeral {
@@ -14,7 +14,7 @@ pub struct Ephemeral {
 }
 
 pub fn new_ephemeral() -> Result<Ephemeral, String> {
-    let key = SigningKey::random(&mut OsRng);
+    let key = SigningKey::try_generate().map_err(|e| format!("Failed to generate a signing key: {e}"))?;
     let public_key_pem = key
         .verifying_key()
         .to_public_key_pem(spki::der::pem::LineEnding::LF)

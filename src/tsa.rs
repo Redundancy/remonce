@@ -555,10 +555,10 @@ fn verify_signature_rsa(
     hash_alg: SigHash,
 ) -> Result<(), TsaError> {
     use rsa::pkcs1::DecodeRsaPublicKey;
-    use rsa::{Pkcs1v15Sign, RsaPublicKey};
+    use rsa::{Pkcs1v15Sign, PublicKey};
     use sha2::{Sha384, Sha512};
 
-    let public_key = RsaPublicKey::from_pkcs1_der(spki)
+    let public_key = PublicKey::from_pkcs1_der(spki)
         .map_err(|e| TsaError::Verification(format!("Invalid RSA SPKI: {}", e)))?;
 
     let hash = hash_alg.digest(msg);

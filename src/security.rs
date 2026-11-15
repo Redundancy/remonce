@@ -252,7 +252,7 @@ pub fn key_binding(public_key_pem: &str) -> String {
 /// normalize on its own, so every signer must go through this.
 pub fn sign_low_s(key: &SigningKey, msg: &[u8]) -> Signature {
     let sig: Signature = key.sign(msg);
-    sig.normalize_s().unwrap_or(sig)
+    sig.normalize_s()
 }
 
 /// The `sub` of a JWT, read *without* verifying it — only for early,
@@ -283,7 +283,8 @@ fn decode_canonical_hex(s: &str, what: &str) -> Result<Vec<u8>, ValidationError>
 fn parse_low_s(bytes: &[u8], what: &str) -> Result<Signature, ValidationError> {
     let sig = Signature::from_slice(bytes)
         .map_err(|e| ValidationError::InvalidSignatureFormat(format!("{what}: {e}")))?;
-    if sig.normalize_s().is_some() {
+    // Normalizing changes a signature exactly when it is the high-S form.
+    if sig.normalize_s() != sig {
         return Err(ValidationError::InvalidSignatureFormat(format!(
             "{what}: high-S signature"
         )));

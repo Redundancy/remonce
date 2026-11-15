@@ -12,7 +12,7 @@ pub(crate) mod tests {
     use jsonwebtoken::jwk::{Jwk, JwkSet};
     use p256::ecdsa::{Signature, SigningKey, signature::Signer};
     use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
-    use rand::rngs::OsRng;
+    use p256::elliptic_curve::Generate;
     use rasn::prelude::*;
     use rasn_cms::{
         ContentInfo, EncapsulatedContentInfo, IssuerAndSerialNumber, SignedData, SignerIdentifier,
@@ -40,7 +40,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn setup_keys(kid: &str) -> TestKeys {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
         let public_key_pem = verifying_key
@@ -59,8 +59,8 @@ pub(crate) mod tests {
         let j = serde_json::json!({
             "kty": "EC",
             "crv": "P-256",
-            "x": URL_SAFE_NO_PAD.encode(verifying_key.to_encoded_point(false).x().unwrap()),
-            "y": URL_SAFE_NO_PAD.encode(verifying_key.to_encoded_point(false).y().unwrap()),
+            "x": URL_SAFE_NO_PAD.encode(verifying_key.to_sec1_point(false).x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(verifying_key.to_sec1_point(false).y().unwrap()),
             "kid": keys.kid,
             "use": "sig",
             "alg": "ES256"
@@ -119,7 +119,7 @@ pub(crate) mod tests {
     }
 
     fn generate_tsa_keys() -> TsaKeys {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
         let spki_der = verifying_key.to_public_key_der().unwrap();
 
@@ -675,11 +675,45 @@ pub(crate) mod tests {
 
     #[test]
     fn sign_low_s_always_low() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         for i in 0..64u32 {
             let sig = sign_low_s(&key, &i.to_be_bytes());
-            assert!(sig.normalize_s().is_none(), "signature {i} is high-S");
+            assert!(sig.normalize_s() == sig, "signature {i} is high-S");
         }
+    }
+
+    /// A key, a signature and a public-key PEM made with the crypto crates
+    /// the first release used (p256 0.13). A request approved with an older
+    /// signer has to keep verifying, and signing is deterministic, so it has
+    /// to produce the same bytes: signers and agents on either side of a
+    /// crypto upgrade can then be mixed.
+    #[test]
+    fn signatures_from_the_first_release_still_verify() {
+        use p256::ecdsa::VerifyingKey;
+        use p256::ecdsa::signature::Verifier;
+        use p256::pkcs8::DecodePublicKey;
+
+        const KEY: &str = "c63efcd63ecb3bf4d5be411169be6ab04440459485f4ae8bf19295d949531348";
+        const MSG: &[u8] =
+            br#"{"command":{"command":"ping-test","id":"00000000-0000-4000-8000-000000000000"},"remonce":"request/v2"}"#;
+        const SIG: &str = "4957516e279c9a273bdda53d476f34216b376da28bee5dfd50f3331ad950ef77\
+                           7dd87fe5d8537d07e2f16b29c3dc25d7f10bbcb45e676ee6eedb3e12f9e77983";
+        const PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+                           MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEJlp5TCEHgeGo2KNMLKUDvS8MAo5S\n\
+                           SQhUB5g68dXmS5bdYG/00lNrbPoiO0O5XMVCZgCpVaKJA6TmAWGKA4helw==\n\
+                           -----END PUBLIC KEY-----\n";
+
+        // The old signature verifies against the old public key.
+        let public = VerifyingKey::from_public_key_pem(PEM).unwrap();
+        let sig = Signature::from_slice(&hex::decode(SIG).unwrap()).unwrap();
+        public.verify(MSG, &sig).unwrap();
+        assert!(sig.normalize_s() == sig, "the vector is low-S");
+
+        // And the same key signs, and encodes its public key, as it did.
+        let key = crate::signing::key_from_hex(KEY).unwrap();
+        assert_eq!(hex::encode(sign_low_s(&key, MSG).to_bytes()), SIG);
+        let pem = key.verifying_key().to_public_key_pem(spki::der::pem::LineEnding::LF).unwrap();
+        assert_eq!(pem, PEM);
     }
 
     // --- Re-timestamping and IdP-attested times ---
@@ -1114,7 +1148,7 @@ pub(crate) mod tests {
             "sub": "alice", "iss": ISSUER, "aud": "remonce-viewer",
             "iat": now, "exp": now + 3600,
         });
-        let secret = jsonwebtoken::EncodingKey::from_secret(env.idp.public_key_pem.as_bytes());
+        let secret = jsonwebtoken::EncodingKey::from_secret(env.idp.public_key_pem.as_bytes()).unwrap();
         let token = jsonwebtoken::encode(&header, &claims, &secret).unwrap();
         let err = verify_bearer_token(&token, &env.jwks, ISSUER, "remonce-viewer").unwrap_err();
         assert!(matches!(err, ValidationError::InvalidJwtHeader(_)), "{err}");
