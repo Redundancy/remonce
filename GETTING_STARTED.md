@@ -266,6 +266,6 @@ allow if {
 
 - **A real identity provider**: register two OIDC clients (signing and viewer) with it; see [CONFIGURATION.md](CONFIGURATION.md#identity-oidc) and, for Vault, [docs/idp/VAULT.md](docs/idp/VAULT.md).
 - **Real hosts**: install the agent with its own `config.toml` and `policy/`. Each host decides for itself; nothing central is required. For a certificate without files to manage, use [ACME](CONFIGURATION.md#mode-acme-production).
-- **Other people's machines and networks**: approvals are files, so they can be approved on a desktop that can't reach the host, and run from inside ([readme](readme.md#works-where-your-desktop-cant-reach-the-host)).
+- **Other people's machines and networks**: approvals are files, so they can be approved on a desktop that can't reach the host, and run from inside ([readme](readme.md#hosts-your-desktop-cant-reach)).
 - **From a terminal**: `remonce approve`, `remonce submit` and `remonce revoke` work with the same files ([CONFIGURATION.md](CONFIGURATION.md#cli-remonce-approve-remonce-submit)).
 - **More examples**: [USECASES.md](USECASES.md) — NOC handoff, CI pipelines, cross-team access, two-person rules.
