@@ -11,7 +11,7 @@
 
 use crate::config::OidcConfig;
 use crate::web::OidcMetadata;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use sha2::{Digest, Sha256};
 
 const SCOPES: &str = "openid groups user_profile";
@@ -32,11 +32,20 @@ impl Reauth {
     }
 }
 
+/// Fill `bytes` from the operating system's random source. These values
+/// guard logins (PKCE verifiers, `state`, nonces), so they come straight
+/// from the OS, and a machine that can't supply them can't log anyone in.
+fn fill_from_os(bytes: &mut [u8]) {
+    SysRng
+        .try_fill_bytes(bytes)
+        .expect("the operating system's random source is unavailable");
+}
+
 /// A PKCE `(challenge, verifier)` pair (S256).
 pub fn pkce_pair() -> (String, String) {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    fill_from_os(&mut bytes);
     let verifier = URL_SAFE_NO_PAD.encode(bytes);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     (challenge, verifier)
@@ -45,7 +54,7 @@ pub fn pkce_pair() -> (String, String) {
 /// 32 random bytes, hex-encoded: OIDC `state` and viewer-login nonces.
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    fill_from_os(&mut bytes);
     hex::encode(bytes)
 }
 
