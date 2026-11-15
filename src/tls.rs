@@ -1,6 +1,7 @@
 use crate::config::TlsConfig;
 use axum::Router;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -38,31 +39,28 @@ impl ResolvesServerCert for DynamicCertResolver {
     }
 }
 
-pub fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    rustls_pemfile::certs(&mut reader).collect()
+/// A PEM reading failure as an I/O error: the underlying one if reading
+/// the file failed, otherwise what was wrong with its contents.
+fn pem_error(e: rustls::pki_types::pem::Error, nothing_found: &'static str) -> std::io::Error {
+    use rustls::pki_types::pem::Error;
+    match e {
+        Error::Io(e) => e,
+        Error::NoItemsFound => std::io::Error::new(std::io::ErrorKind::InvalidData, nothing_found),
+        other => std::io::Error::new(std::io::ErrorKind::InvalidData, other.to_string()),
+    }
 }
 
-pub fn load_private_key(path: &str) -> std::io::Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    
-    // Try to read the first item
-    loop {
-        match rustls_pemfile::read_one(&mut reader)? {
-            Some(rustls_pemfile::Item::Pkcs1Key(key)) => return Ok(key.into()),
-            Some(rustls_pemfile::Item::Pkcs8Key(key)) => return Ok(key.into()),
-            Some(rustls_pemfile::Item::Sec1Key(key)) => return Ok(key.into()),
-            None => break,
-            _ => {} // Ignore certs/exposed keys mixed in if any
-        }
-    }
+/// Every certificate in a PEM file, in order. Other sections are skipped.
+pub fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
+    CertificateDer::pem_file_iter(path)
+        .and_then(|certs| certs.collect())
+        .map_err(|e| pem_error(e, "No certificate found in file"))
+}
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "No private key found in file",
-    ))
+/// The first private key in a PEM file (PKCS#1, PKCS#8 or SEC1). Other
+/// sections, such as certificates in the same file, are skipped.
+pub fn load_private_key(path: &str) -> std::io::Result<PrivateKeyDer<'static>> {
+    PrivateKeyDer::from_pem_file(path).map_err(|e| pem_error(e, "No private key found in file"))
 }
 
 pub fn create_certified_key(cert_path: &str, key_path: &str) -> std::io::Result<Arc<CertifiedKey>> {

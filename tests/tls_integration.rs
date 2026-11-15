@@ -5,23 +5,13 @@ async fn test_dynamic_cert_resolver_reloads() -> Result<(), Box<dyn std::error::
     use std::sync::Arc;
     use remonce::tls::DynamicCertResolver;
     use rustls::sign::CertifiedKey;
-    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     // Helper to create CertifiedKey from in-memory PEMs
     fn create_key_from_mem(cert_pem: &str, key_pem: &str) -> Result<Arc<CertifiedKey>, Box<dyn std::error::Error>> {
-        let mut cert_reader = std::io::Cursor::new(cert_pem.as_bytes());
-        let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
-        
-        let mut key_reader = std::io::Cursor::new(key_pem.as_bytes());
-        let key = loop {
-            match rustls_pemfile::read_one(&mut key_reader)? {
-                Some(rustls_pemfile::Item::Pkcs1Key(key)) => break PrivateKeyDer::from(key),
-                Some(rustls_pemfile::Item::Pkcs8Key(key)) => break PrivateKeyDer::from(key),
-                Some(rustls_pemfile::Item::Sec1Key(key)) => break PrivateKeyDer::from(key),
-                None => return Err("No private key found".into()),
-                _ => {}
-            }
-        };
+        let certs = CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
 
         let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
             .map_err(|e| format!("Invalid private key: {:?}", e))?;
